@@ -1491,10 +1491,14 @@ fn json_object_to_env_toml_table(
     object: &serde_json::Map<String, JsonValue>,
 ) -> toml::map::Map<String, TomlValue> {
     let mut table = toml::map::Map::new();
-    for (key, value) in object {
-        if let Some(value) = json_env_value_to_string(value) {
-            table.insert(key.clone(), TomlValue::String(value));
-        }
+    let mut entries = object
+        .iter()
+        .filter_map(|(key, value)| json_env_value_to_string(value).map(|value| (key, value)))
+        .collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    for (key, value) in entries {
+        table.insert(key.clone(), TomlValue::String(value));
     }
     table
 }
