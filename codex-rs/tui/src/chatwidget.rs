@@ -6754,6 +6754,12 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn ambient_pet_image_enabled(&self) -> bool {
+        self.ambient_pet
+            .as_ref()
+            .is_some_and(crate::pets::AmbientPet::image_enabled)
+    }
+
     pub(crate) fn ambient_pet_draw(&self, area: Rect) -> Option<crate::pets::AmbientPetDraw> {
         self.bottom_pane.no_modal_or_popup_active().then(|| {
             self.ambient_pet
