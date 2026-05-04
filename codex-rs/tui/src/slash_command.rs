@@ -58,6 +58,7 @@ pub enum SlashCommand {
     Feedback,
     Rollout,
     Ps,
+    Upload,
     #[strum(to_string = "stop", serialize = "clean")]
     Stop,
     Clear,
@@ -100,6 +101,7 @@ impl SlashCommand {
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
             SlashCommand::Ps => "list background terminals",
+            SlashCommand::Upload => "upload a local file to the app-server host",
             SlashCommand::Stop => "stop all background terminals",
             SlashCommand::MemoryDrop => "DO NOT USE",
             SlashCommand::MemoryUpdate => "DO NOT USE",
@@ -159,6 +161,7 @@ impl SlashCommand {
                 | SlashCommand::Side
                 | SlashCommand::Resume
                 | SlashCommand::SandboxReadRoot
+                | SlashCommand::Upload
         )
     }
 
@@ -209,6 +212,7 @@ impl SlashCommand {
             | SlashCommand::Status
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
+            | SlashCommand::Upload
             | SlashCommand::Stop
             | SlashCommand::Goal
             | SlashCommand::Mcp

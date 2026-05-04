@@ -33,6 +33,7 @@ const SIDE_SLASH_COMMAND_UNAVAILABLE_HINT: &str = "Press Esc to return to the ma
 const GOAL_USAGE: &str = "Usage: /goal <objective>";
 const GOAL_USAGE_HINT: &str = "Example: /goal improve benchmark coverage";
 const RAW_USAGE: &str = "Usage: /raw [on|off]";
+const UPLOAD_USAGE: &str = "Usage: /upload <local-path>";
 
 impl ChatWidget {
     /// Dispatch a bare slash command and record its staged local-history entry.
@@ -383,6 +384,9 @@ impl ChatWidget {
             }
             SlashCommand::Ps => {
                 self.add_ps_output();
+            }
+            SlashCommand::Upload => {
+                self.add_info_message(UPLOAD_USAGE.to_string(), /*hint*/ None);
             }
             SlashCommand::Stop => {
                 self.clean_background_terminals();
@@ -767,6 +771,11 @@ impl ChatWidget {
                 self.app_event_tx
                     .send(AppEvent::BeginWindowsSandboxGrantReadRoot { path: args });
             }
+            SlashCommand::Upload if !trimmed.is_empty() => {
+                self.app_event_tx.send(AppEvent::UploadLocalFile {
+                    path: PathBuf::from(trimmed),
+                });
+            }
             _ => self.dispatch_command(cmd),
         }
         if source == SlashCommandDispatchSource::Live && cmd != SlashCommand::Goal {
@@ -891,6 +900,7 @@ impl ChatWidget {
             | SlashCommand::Status
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
+            | SlashCommand::Upload
             | SlashCommand::Stop
             | SlashCommand::MemoryDrop
             | SlashCommand::MemoryUpdate
