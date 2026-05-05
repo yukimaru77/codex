@@ -19,6 +19,7 @@ use codex_app_server_protocol::MarketplaceUpgradeResponse;
 use codex_app_server_protocol::RequestId;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
+use tokio::io::AsyncReadExt;
 
 impl App {
     pub(super) fn fetch_mcp_inventory(
@@ -570,8 +571,16 @@ pub(super) async fn upload_local_file_request(
         .ok_or_else(|| color_eyre::eyre::eyre!("Upload path must name a file."))?
         .to_string();
     let metadata = tokio::fs::metadata(local_path).await?;
+    if !metadata.is_file() {
+        color_eyre::eyre::bail!("Upload path must name a regular file.");
+    }
     ensure_upload_file_size(metadata.len())?;
-    let bytes = tokio::fs::read(local_path).await?;
+    let file = tokio::fs::File::open(local_path).await?;
+    let mut bytes = Vec::new();
+    file.take(MAX_UPLOAD_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    ensure_upload_file_size(bytes.len() as u64)?;
     let request_id = RequestId::String(format!("upload-local-file-{}", Uuid::new_v4()));
     let response: FsUploadFileResponse = request_handle
         .request_typed(ClientRequest::FsUploadFile {
