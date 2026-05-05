@@ -31,8 +31,10 @@ pub enum ConfigEdit {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     },
-    /// Update the service tier preference for future turns.
+    /// Update the legacy service tier preference for future turns.
     SetServiceTier { service_tier: Option<ServiceTier> },
+    /// Update the service tier id preference for future turns.
+    SetServiceTierId { service_tier_id: Option<String> },
     /// Update the active (or default) model personality.
     SetModelPersonality { personality: Option<Personality> },
     /// Toggle the acknowledgement flag under `[notice]`.
@@ -528,6 +530,12 @@ impl ConfigDocument {
             ConfigEdit::SetServiceTier { service_tier } => Ok(self.write_profile_value(
                 &["service_tier"],
                 service_tier.map(|service_tier| value(service_tier.to_string())),
+            )),
+            ConfigEdit::SetServiceTierId { service_tier_id } => Ok(self.write_profile_value(
+                &["service_tier_id"],
+                service_tier_id
+                    .as_ref()
+                    .map(|service_tier_id| value(service_tier_id.clone())),
             )),
             ConfigEdit::SetModelPersonality { personality } => Ok(self.write_profile_value(
                 &["personality"],
@@ -1102,6 +1110,12 @@ impl ConfigEditsBuilder {
             model: model.map(ToOwned::to_owned),
             effort,
         });
+        self
+    }
+
+    pub fn set_service_tier_id(mut self, service_tier_id: Option<String>) -> Self {
+        self.edits
+            .push(ConfigEdit::SetServiceTierId { service_tier_id });
         self
     }
 

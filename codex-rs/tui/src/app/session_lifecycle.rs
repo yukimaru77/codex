@@ -617,10 +617,12 @@ impl App {
 
     pub(super) fn fresh_session_config(&self) -> Config {
         let mut config = self.config.clone();
-        config.service_tier = self
-            .chat_widget
-            .configured_service_tier()
-            .map(|service_tier| service_tier.request_value().to_string());
+        config.service_tier = self.chat_widget.configured_service_tier();
+        config.service_tier_id = self.config.service_tier_id.clone().or_else(|| {
+            config
+                .service_tier
+                .map(|service_tier| service_tier.request_value().to_string())
+        });
         config.notices.fast_default_opt_out = self.chat_widget.fast_default_opt_out();
         config
     }

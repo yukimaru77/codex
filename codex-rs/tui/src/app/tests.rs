@@ -4397,12 +4397,25 @@ async fn fresh_session_config_uses_current_service_tier() {
     let config = app.fresh_session_config();
 
     assert_eq!(
-        config.service_tier,
+        config.service_tier_id,
         Some(
             codex_protocol::config_types::ServiceTier::Fast
                 .request_value()
                 .to_string()
         )
+    );
+}
+
+#[tokio::test]
+async fn fresh_session_config_preserves_custom_service_tier_id() {
+    let mut app = make_test_app().await;
+    app.config.service_tier_id = Some("experimental-tier-id".to_string());
+
+    let config = app.fresh_session_config();
+
+    assert_eq!(
+        (config.service_tier, config.service_tier_id),
+        (None, Some("experimental-tier-id".to_string()))
     );
 }
 

@@ -157,6 +157,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         startup_warnings: Vec::new(),
         model,
         service_tier: None,
+        service_tier_id: None,
         review_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,

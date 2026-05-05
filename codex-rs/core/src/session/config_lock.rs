@@ -98,6 +98,7 @@ fn save_session_resolved_fields(sc: &SessionConfiguration, lock_config: &mut Con
         .service_tier
         .as_deref()
         .and_then(codex_protocol::config_types::ServiceTier::from_request_value);
+    lock_config.service_tier_id = sc.service_tier.clone();
     lock_config.instructions = Some(sc.base_instructions.clone());
     lock_config.developer_instructions = sc.developer_instructions.clone();
     lock_config.compact_prompt = sc.compact_prompt.clone();
@@ -210,13 +211,31 @@ mod tests {
         assert_eq!(lock.model, None);
         assert_eq!(lock.model_reasoning_effort, None);
         assert_eq!(lock.model_reasoning_summary, None);
-        assert_eq!(lock.service_tier, None);
+        assert_eq!(lock.service_tier_id, None);
         assert_eq!(lock.instructions, None);
         assert_eq!(lock.developer_instructions, None);
         assert_eq!(lock.compact_prompt, None);
         assert_eq!(lock.personality, None);
         assert_eq!(lock.approval_policy, None);
         assert_eq!(lock.approvals_reviewer, None);
+    }
+
+    #[tokio::test]
+    async fn lock_clears_legacy_service_tier_when_session_tier_is_cleared() {
+        let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
+        let mut config = (*sc.original_config_do_not_use).clone();
+        config.service_tier = Some(codex_protocol::config_types::ServiceTier::Fast);
+        config.service_tier_id = Some("priority".to_string());
+        sc.original_config_do_not_use = Arc::new(config);
+        sc.service_tier = None;
+
+        let lockfile = sc.to_config_lockfile_toml().expect("lock should serialize");
+        let lock = &lockfile.config;
+
+        assert_eq!(
+            (lock.service_tier, lock.service_tier_id.clone()),
+            (None, None)
+        );
     }
 
     #[tokio::test]

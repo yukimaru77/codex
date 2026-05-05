@@ -4642,6 +4642,34 @@ async fn set_model_updates_profile() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn clearing_service_tier_id_also_clears_legacy_service_tier() -> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+    tokio::fs::write(
+        &config_path,
+        r#"
+service_tier = "fast"
+service_tier_id = "priority"
+"#,
+    )
+    .await?;
+
+    ConfigEditsBuilder::new(codex_home.path())
+        .set_service_tier(/*service_tier*/ None)
+        .set_service_tier_id(/*service_tier_id*/ None)
+        .apply()
+        .await?;
+
+    let serialized = tokio::fs::read_to_string(config_path).await?;
+    let parsed: ConfigToml = toml::from_str(&serialized)?;
+
+    assert_eq!((parsed.service_tier, parsed.service_tier_id), (None, None));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn set_model_updates_existing_profile() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
     let config_path = codex_home.path().join(CONFIG_TOML_FILE);
@@ -6349,6 +6377,7 @@ async fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             model_context_window: None,
             model_auto_compact_token_limit: None,
             service_tier: None,
+            service_tier_id: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             permissions: Permissions {
@@ -6494,15 +6523,43 @@ async fn explicit_null_service_tier_override_sets_fast_default_opt_out() -> std:
         fixture.cfg.clone(),
         ConfigOverrides {
             cwd: Some(fixture.cwd_path()),
-            service_tier: Some(None),
+            service_tier_id: Some(None),
             ..Default::default()
         },
         fixture.codex_home(),
     )
     .await?;
 
-    assert_eq!(config.service_tier, None);
+    assert_eq!(config.service_tier_id, None);
     assert_eq!(config.notices.fast_default_opt_out, Some(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_tier_id_takes_precedence_over_service_tier() -> std::io::Result<()> {
+    let fixture = create_test_fixture()?;
+    let mut cfg = fixture.cfg.clone();
+    cfg.service_tier = Some(ServiceTier::Fast);
+    cfg.service_tier_id = Some("flex".to_string());
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides {
+            cwd: Some(fixture.cwd_path()),
+            ..Default::default()
+        },
+        fixture.codex_home(),
+    )
+    .await?;
+
+    assert_eq!(
+        config,
+        Config {
+            service_tier: Some(ServiceTier::Fast),
+            service_tier_id: Some("flex".to_string()),
+            ..config.clone()
+        }
+    );
     Ok(())
 }
 
@@ -6525,7 +6582,7 @@ async fn fast_default_opt_out_notice_config_is_respected() -> std::io::Result<()
     )
     .await?;
 
-    assert_eq!(config.service_tier, None);
+    assert_eq!(config.service_tier_id, None);
     assert_eq!(config.notices.fast_default_opt_out, Some(true));
     Ok(())
 }
@@ -6551,6 +6608,7 @@ async fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
+        service_tier_id: None,
         model_provider_id: "openai-custom".to_string(),
         model_provider: fixture.openai_custom_provider.clone(),
         permissions: Permissions {
@@ -6707,6 +6765,7 @@ async fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
+        service_tier_id: None,
         model_provider_id: "openai".to_string(),
         model_provider: fixture.openai_provider.clone(),
         permissions: Permissions {
@@ -6848,6 +6907,7 @@ async fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
+        service_tier_id: None,
         model_provider_id: "openai".to_string(),
         model_provider: fixture.openai_provider.clone(),
         permissions: Permissions {

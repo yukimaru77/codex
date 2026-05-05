@@ -307,6 +307,10 @@ pub struct ConfigToml {
     /// Optional explicit service tier preference for new turns (`fast` or `flex`).
     pub service_tier: Option<ServiceTier>,
 
+    /// Optional explicit service tier id preference for new turns. Takes precedence over
+    /// `service_tier` when both are set.
+    pub service_tier_id: Option<String>,
+
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: Option<String>,
 

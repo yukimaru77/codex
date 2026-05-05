@@ -668,6 +668,10 @@
           ],
           "description": "Optional explicit service tier preference for new turns (`fast` or `flex`)."
         },
+        "service_tier_id": {
+          "description": "Optional explicit service tier id preference for new turns. Takes precedence over `service_tier` when both are set.",
+          "type": "string"
+        },
         "tools": {
           "$ref": "#/definitions/ToolsToml"
         },
@@ -4421,6 +4425,10 @@
         }
       ],
       "description": "Optional explicit service tier preference for new turns (`fast` or `flex`)."
+    },
+    "service_tier_id": {
+      "description": "Optional explicit service tier id preference for new turns. Takes precedence over `service_tier` when both are set.",
+      "type": "string"
     },
     "shell_environment_policy": {
       "allOf": [

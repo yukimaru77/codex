@@ -25,6 +25,9 @@ pub struct ConfigProfile {
     pub model: Option<String>,
     /// Optional explicit service tier preference for new turns (`fast` or `flex`).
     pub service_tier: Option<ServiceTier>,
+    /// Optional explicit service tier id preference for new turns. Takes precedence over
+    /// `service_tier` when both are set.
+    pub service_tier_id: Option<String>,
     /// The key in the `model_providers` map identifying the
     /// [`ModelProviderInfo`] to use.
     pub model_provider: Option<String>,

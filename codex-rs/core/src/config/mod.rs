@@ -400,8 +400,12 @@ pub struct Config {
     /// Optional override of model selection.
     pub model: Option<String>,
 
-    /// Effective service tier request id preference for new turns.
-    pub service_tier: Option<String>,
+    /// Effective legacy service tier preference for new turns.
+    pub service_tier: Option<ServiceTier>,
+
+    /// Effective service tier id preference for new turns. Takes precedence over
+    /// `service_tier` when both are set.
+    pub service_tier_id: Option<String>,
 
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
@@ -1789,7 +1793,8 @@ pub struct ConfigOverrides {
     pub permission_profile: Option<PermissionProfile>,
     pub default_permissions: Option<String>,
     pub model_provider: Option<String>,
-    pub service_tier: Option<Option<String>>,
+    pub service_tier: Option<Option<ServiceTier>>,
+    pub service_tier_id: Option<Option<String>>,
     pub config_profile: Option<String>,
     pub codex_self_exe: Option<PathBuf>,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
@@ -2115,6 +2120,7 @@ impl Config {
             default_permissions: default_permissions_override,
             model_provider,
             service_tier: service_tier_override,
+            service_tier_id: service_tier_id_override,
             config_profile: config_profile_key,
             codex_self_exe,
             codex_linux_sandbox_exe,
@@ -2709,22 +2715,39 @@ impl Config {
         let service_tier = match service_tier_override {
             Some(Some(service_tier)) => Some(service_tier),
             Some(None) => {
-                // Preserve explicit standard/clear intent after the nested override
-                // collapses into `Config.service_tier = None`.
                 notices.fast_default_opt_out = Some(true);
                 None
             }
-            None => config_profile
-                .service_tier
-                .or(cfg.service_tier)
-                .map(|service_tier| service_tier.request_value().to_string()),
+            None => config_profile.service_tier.or(cfg.service_tier),
         };
         let service_tier = match service_tier {
-            Some(service_tier) if service_tier == ServiceTier::Fast.request_value() => {
-                features.enabled(Feature::FastMode).then_some(service_tier)
+            Some(ServiceTier::Fast) if features.enabled(Feature::FastMode) => {
+                Some(ServiceTier::Fast)
             }
-            service_tier => service_tier,
+            Some(ServiceTier::Fast) => None,
+            Some(ServiceTier::Flex) => Some(ServiceTier::Flex),
+            None => None,
         };
+        let service_tier_id = match service_tier_id_override {
+            Some(Some(service_tier_id)) => Some(service_tier_id),
+            Some(None) => {
+                // Preserve explicit standard/clear intent after the nested override
+                // collapses into `Config.service_tier_id = None`.
+                notices.fast_default_opt_out = Some(true);
+                None
+            }
+            None => config_profile.service_tier_id.or(cfg.service_tier_id).or_else(|| {
+                service_tier
+                    .as_ref()
+                    .map(|service_tier| service_tier.request_value().to_string())
+            }),
+        };
+        let service_tier_id =
+            match service_tier_id.as_deref() {
+                Some("priority") if features.enabled(Feature::FastMode) => service_tier_id,
+                Some("priority") => None,
+                Some(_) | None => service_tier_id,
+            };
 
         let compact_prompt = compact_prompt.or(cfg.compact_prompt).and_then(|value| {
             let trimmed = value.trim();
@@ -2954,6 +2977,7 @@ impl Config {
         let config = Self {
             model,
             service_tier,
+            service_tier_id,
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
