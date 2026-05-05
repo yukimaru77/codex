@@ -223,6 +223,8 @@ pub enum Feature {
     PreventIdleSleep,
     /// Enable workspace-specific owner nudge copy and prompts in the TUI.
     WorkspaceOwnerUsageNudge,
+    /// Enable workspace headline and announcement message polling.
+    WorkspaceMessages,
     /// Legacy rollout flag for Responses API WebSocket transport experiments.
     ResponsesWebsockets,
     /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
@@ -1108,6 +1110,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::WorkspaceOwnerUsageNudge,
         key: "workspace_owner_usage_nudge",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WorkspaceMessages,
+        key: "workspace_messages",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

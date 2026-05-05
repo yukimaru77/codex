@@ -2104,7 +2104,6 @@ name = "codex-backend-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "chrono",
  "codex-api",
  "codex-backend-openapi-models",
  "codex-client",

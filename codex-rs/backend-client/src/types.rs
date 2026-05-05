@@ -8,8 +8,6 @@ pub use codex_backend_openapi_models::models::RateLimitStatusPayload;
 pub use codex_backend_openapi_models::models::RateLimitWindowSnapshot;
 pub use codex_backend_openapi_models::models::TaskListItem;
 
-use chrono::DateTime;
-use chrono::Utc;
 use serde::Deserialize;
 use serde::de::Deserializer;
 use serde_json::Value;
@@ -26,8 +24,7 @@ pub struct CodexWorkspaceMessage {
     pub message_id: String,
     pub message_type: CodexWorkspaceMessageType,
     pub message_body: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
