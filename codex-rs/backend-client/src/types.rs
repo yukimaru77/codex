@@ -24,7 +24,6 @@ pub struct CodexWorkspaceMessage {
     pub message_id: String,
     pub message_type: CodexWorkspaceMessageType,
     pub message_body: String,
-    pub created_at: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
