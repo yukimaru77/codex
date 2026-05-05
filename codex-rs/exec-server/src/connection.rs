@@ -24,7 +24,7 @@ pub(crate) enum JsonRpcConnectionEvent {
     Disconnected { reason: Option<String> },
 }
 
-enum JsonRpcTransport {
+pub(crate) enum JsonRpcTransport {
     Plain,
     Stdio(StdioTransport),
 }
@@ -35,21 +35,14 @@ impl JsonRpcTransport {
             child_process: Some(child_process),
         })
     }
-
-    fn shutdown(&mut self) {
-        match self {
-            Self::Plain => {}
-            Self::Stdio(transport) => transport.shutdown(),
-        }
-    }
 }
 
-struct StdioTransport {
+pub(crate) struct StdioTransport {
     child_process: Option<Child>,
 }
 
-impl StdioTransport {
-    fn shutdown(&mut self) {
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
         let Some(mut child_process) = self.child_process.take() else {
             return;
         };
@@ -72,29 +65,19 @@ impl StdioTransport {
     }
 }
 
-struct JsonRpcConnectionRuntime {
-    outgoing_tx: mpsc::Sender<JSONRPCMessage>,
-    incoming_rx: mpsc::Receiver<JsonRpcConnectionEvent>,
-    disconnected_rx: watch::Receiver<bool>,
-    task_handles: Vec<tokio::task::JoinHandle<()>>,
+pub(crate) struct JsonRpcConnectionRuntime {
+    pub(crate) outgoing_tx: mpsc::Sender<JSONRPCMessage>,
+    pub(crate) incoming_rx: mpsc::Receiver<JsonRpcConnectionEvent>,
+    pub(crate) disconnected_rx: watch::Receiver<bool>,
+    pub(crate) task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) struct JsonRpcConnection {
-    runtime: Option<JsonRpcConnectionRuntime>,
-    transport: JsonRpcTransport,
-}
-
-impl Drop for JsonRpcConnection {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
+    pub(crate) runtime: JsonRpcConnectionRuntime,
+    pub(crate) transport: JsonRpcTransport,
 }
 
 impl JsonRpcConnection {
-    pub(crate) fn shutdown(&mut self) {
-        self.transport.shutdown();
-    }
-
     pub(crate) fn from_stdio<R, W>(reader: R, writer: W, connection_label: String) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -178,12 +161,12 @@ impl JsonRpcConnection {
         });
 
         Self {
-            runtime: Some(JsonRpcConnectionRuntime {
+            runtime: JsonRpcConnectionRuntime {
                 outgoing_tx,
                 incoming_rx,
                 disconnected_rx,
                 task_handles: vec![reader_task, writer_task],
-            }),
+            },
             transport: JsonRpcTransport::Plain,
         }
     }
@@ -315,59 +298,19 @@ impl JsonRpcConnection {
         });
 
         Self {
-            runtime: Some(JsonRpcConnectionRuntime {
+            runtime: JsonRpcConnectionRuntime {
                 outgoing_tx,
                 incoming_rx,
                 disconnected_rx,
                 task_handles: vec![reader_task, writer_task],
-            }),
+            },
             transport: JsonRpcTransport::Plain,
         }
-    }
-
-    pub(crate) fn take_runtime(
-        &mut self,
-    ) -> (
-        mpsc::Sender<JSONRPCMessage>,
-        mpsc::Receiver<JsonRpcConnectionEvent>,
-        Vec<tokio::task::JoinHandle<()>>,
-    ) {
-        let JsonRpcConnectionRuntime {
-            outgoing_tx,
-            incoming_rx,
-            disconnected_rx: _,
-            task_handles,
-        } = self.take_runtime_or_panic("JSON-RPC connection runtime already taken");
-        (outgoing_tx, incoming_rx, task_handles)
-    }
-
-    pub(crate) fn into_parts(
-        mut self,
-    ) -> (
-        mpsc::Sender<JSONRPCMessage>,
-        mpsc::Receiver<JsonRpcConnectionEvent>,
-        watch::Receiver<bool>,
-        Vec<tokio::task::JoinHandle<()>>,
-    ) {
-        let JsonRpcConnectionRuntime {
-            outgoing_tx,
-            incoming_rx,
-            disconnected_rx,
-            task_handles,
-        } = self.take_runtime_or_panic("JSON-RPC connection runtime already taken");
-        (outgoing_tx, incoming_rx, disconnected_rx, task_handles)
     }
 
     pub(crate) fn with_child_process(mut self, child_process: Child) -> Self {
         self.transport = JsonRpcTransport::from_child_process(child_process);
         self
-    }
-
-    fn take_runtime_or_panic(&mut self, message: &'static str) -> JsonRpcConnectionRuntime {
-        match self.runtime.take() {
-            Some(runtime) => runtime,
-            None => panic!("{message}"),
-        }
     }
 }
 

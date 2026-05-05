@@ -152,8 +152,6 @@ pub(crate) struct Session {
 }
 
 struct Inner {
-    // Keep the underlying transport connection alive for the client lifetime.
-    connection: JsonRpcConnection,
     client: RpcClient,
     // The remote transport delivers one shared notification stream for every
     // process on the connection. Keep a local process_id -> session registry so
@@ -183,7 +181,6 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.reader_task.abort();
-        self.connection.shutdown();
     }
 }
 
@@ -428,10 +425,10 @@ impl ExecServerClient {
     }
 
     pub(crate) async fn connect(
-        mut connection: JsonRpcConnection,
+        connection: JsonRpcConnection,
         options: ExecServerClientConnectOptions,
     ) -> Result<Self, ExecServerError> {
-        let (rpc_client, mut events_rx) = RpcClient::new(&mut connection);
+        let (rpc_client, mut events_rx) = RpcClient::new(connection);
         let inner = Arc::new_cyclic(|weak| {
             let weak = weak.clone();
             let reader_task = tokio::spawn(async move {
@@ -465,7 +462,6 @@ impl ExecServerClient {
             });
 
             Inner {
-                connection,
                 client: rpc_client,
                 sessions: ArcSwap::from_pointee(HashMap::new()),
                 sessions_write_lock: Mutex::new(()),
