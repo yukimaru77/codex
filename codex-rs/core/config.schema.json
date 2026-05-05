@@ -598,6 +598,9 @@
             "workspace_dependencies": {
               "type": "boolean"
             },
+            "workspace_messages": {
+              "type": "boolean"
+            },
             "workspace_owner_usage_nudge": {
               "type": "boolean"
             }
@@ -4103,6 +4106,9 @@
           "type": "boolean"
         },
         "workspace_dependencies": {
+          "type": "boolean"
+        },
+        "workspace_messages": {
           "type": "boolean"
         },
         "workspace_owner_usage_nudge": {
