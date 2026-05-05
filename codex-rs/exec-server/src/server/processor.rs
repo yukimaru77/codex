@@ -47,8 +47,7 @@ async fn run_connection(
     runtime_paths: ExecServerRuntimePaths,
 ) {
     let router = Arc::new(build_router());
-    let (json_outgoing_tx, mut incoming_rx, mut disconnected_rx, connection_tasks) =
-        connection.into_parts();
+    let (json_outgoing_tx, mut incoming_rx, connection_tasks) = connection.into_parts();
     let (outgoing_tx, mut outgoing_rx) =
         mpsc::channel::<RpcServerOutboundMessage>(CHANNEL_CAPACITY);
     let notifications = RpcNotificationSender::new(outgoing_tx.clone());
@@ -96,13 +95,7 @@ async fn run_connection(
             JsonRpcConnectionEvent::Message(message) => match message {
                 codex_app_server_protocol::JSONRPCMessage::Request(request) => {
                     if let Some(route) = router.request_route(request.method.as_str()) {
-                        let message = tokio::select! {
-                            message = route(Arc::clone(&handler), request) => message,
-                            _ = disconnected_rx.changed() => {
-                                debug!("exec-server transport disconnected while handling request");
-                                break;
-                            }
-                        };
+                        let message = route(Arc::clone(&handler), request).await;
                         if let Some(message) = message
                             && outgoing_tx.send(message).await.is_err()
                         {
@@ -131,15 +124,7 @@ async fn run_connection(
                         );
                         break;
                     };
-                    let result = tokio::select! {
-                        result = route(Arc::clone(&handler), notification) => result,
-                        _ = disconnected_rx.changed() => {
-                            debug!(
-                                "exec-server transport disconnected while handling notification"
-                            );
-                            break;
-                        }
-                    };
+                    let result = route(Arc::clone(&handler), notification).await;
                     if let Err(err) = result {
                         warn!("closing exec-server connection after protocol error: {err}");
                         break;
