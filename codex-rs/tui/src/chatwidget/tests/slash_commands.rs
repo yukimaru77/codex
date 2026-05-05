@@ -1978,11 +1978,41 @@ async fn queued_upload_resumes_follow_up_prompt_after_upload_succeeds() {
         Op::UserTurn { items, .. } => assert_eq!(
             items,
             vec![UserInput::Text {
-                text: "use the upload".to_string(),
+                text: "use the upload /tmp/.codex/uploads/demo.txt".to_string(),
                 text_elements: Vec::new(),
             }]
         ),
         other => panic!("expected queued follow-up prompt to submit, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn queued_upload_without_args_keeps_draining() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+
+    queue_composer_text_with_tab(&mut chat, "/upload");
+    queue_composer_text_with_tab(&mut chat, "after upload help");
+
+    complete_turn_with_message(&mut chat, "turn-1", Some("done"));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UploadLocalFile { .. })),
+        "bare queued /upload should not start an upload; events: {events:?}"
+    );
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "after upload help".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected follow-up prompt after bare /upload, got {other:?}"),
     }
 }
 

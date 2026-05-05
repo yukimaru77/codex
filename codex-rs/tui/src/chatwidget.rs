@@ -10433,10 +10433,23 @@ impl ChatWidget {
     }
 
     pub(crate) fn insert_uploaded_file_path(&mut self, path: &Path) {
+        let path = path.to_string_lossy();
+        if let Some(queued_message) = self
+            .queued_user_messages
+            .front_mut()
+            .filter(|queued_message| queued_message.action == QueuedInputAction::Plain)
+        {
+            if !queued_message.user_message.text.is_empty() {
+                queued_message.user_message.text.push(' ');
+            }
+            queued_message.user_message.text.push_str(&path);
+            self.refresh_pending_input_preview();
+            return;
+        }
         if !self.bottom_pane.composer_text().is_empty() {
             self.bottom_pane.insert_str(" ");
         }
-        self.bottom_pane.insert_str(&path.to_string_lossy());
+        self.bottom_pane.insert_str(&path);
     }
 
     /// Replace the composer content with the provided text and reset cursor.

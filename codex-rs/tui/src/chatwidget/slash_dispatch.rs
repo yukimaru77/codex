@@ -826,6 +826,9 @@ impl ChatWidget {
 
         if rest.is_empty() {
             self.dispatch_command(cmd);
+            if cmd == SlashCommand::Upload {
+                return QueueDrain::Continue;
+            }
             return self.queued_command_drain_result(cmd);
         }
 
