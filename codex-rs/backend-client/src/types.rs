@@ -8,10 +8,50 @@ pub use codex_backend_openapi_models::models::RateLimitStatusPayload;
 pub use codex_backend_openapi_models::models::RateLimitWindowSnapshot;
 pub use codex_backend_openapi_models::models::TaskListItem;
 
+use chrono::DateTime;
+use chrono::Utc;
 use serde::Deserialize;
 use serde::de::Deserializer;
 use serde_json::Value;
 use std::collections::HashMap;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CodexWorkspaceMessagesResponse {
+    #[serde(default)]
+    pub messages: Vec<CodexWorkspaceMessage>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CodexWorkspaceMessage {
+    pub message_id: String,
+    pub message_type: CodexWorkspaceMessageType,
+    pub message_body: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexWorkspaceMessageType {
+    Headline,
+    Announcement,
+    #[serde(other)]
+    Unknown,
+}
+
+impl CodexWorkspaceMessagesResponse {
+    pub fn headlines(&self) -> impl Iterator<Item = &CodexWorkspaceMessage> {
+        self.messages
+            .iter()
+            .filter(|message| message.message_type == CodexWorkspaceMessageType::Headline)
+    }
+
+    pub fn announcements(&self) -> impl Iterator<Item = &CodexWorkspaceMessage> {
+        self.messages
+            .iter()
+            .filter(|message| message.message_type == CodexWorkspaceMessageType::Announcement)
+    }
+}
 
 /// Hand-rolled models for the Cloud Tasks task-details response.
 /// The generated OpenAPI models are pretty bad. This is a half-step

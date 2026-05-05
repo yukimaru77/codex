@@ -1,4 +1,5 @@
 use crate::types::CodeTaskDetailsResponse;
+use crate::types::CodexWorkspaceMessagesResponse;
 use crate::types::ConfigFileResponse;
 use crate::types::PaginatedListTaskListItem;
 use crate::types::RateLimitReachedKind as BackendRateLimitReachedKind;
@@ -408,6 +409,16 @@ impl Client {
             .map_err(RequestError::from)
     }
 
+    pub async fn list_workspace_messages(
+        &self,
+    ) -> std::result::Result<CodexWorkspaceMessagesResponse, RequestError> {
+        let url = self.workspace_messages_url();
+        let req = self.http.get(&url).headers(self.headers());
+        let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
+        self.decode_json::<CodexWorkspaceMessagesResponse>(&url, &ct, &body)
+            .map_err(RequestError::from)
+    }
+
     /// Create a new task (user turn) by POSTing to the appropriate backend path
     /// based on `path_style`. Returns the created task id.
     pub async fn create_task(&self, request_body: serde_json::Value) -> Result<String> {
@@ -536,6 +547,13 @@ impl Client {
                     self.base_url
                 )
             }
+        }
+    }
+
+    fn workspace_messages_url(&self) -> String {
+        match self.path_style {
+            PathStyle::CodexApi => format!("{}/api/codex/workspace-messages", self.base_url),
+            PathStyle::ChatGptApi => format!("{}/wham/workspace-messages", self.base_url),
         }
     }
 
@@ -860,6 +878,37 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({ "credit_type": "usage_limit" })
+        );
+    }
+
+    #[test]
+    fn workspace_messages_uses_expected_paths() {
+        let codex_client = Client {
+            base_url: "https://example.test".to_string(),
+            http: reqwest::Client::new(),
+            auth_provider: codex_model_provider::unauthenticated_auth_provider(),
+            user_agent: None,
+            chatgpt_account_id: None,
+            chatgpt_account_is_fedramp: false,
+            path_style: PathStyle::CodexApi,
+        };
+        assert_eq!(
+            codex_client.workspace_messages_url(),
+            "https://example.test/api/codex/workspace-messages"
+        );
+
+        let chatgpt_client = Client {
+            base_url: "https://chatgpt.com/backend-api".to_string(),
+            http: reqwest::Client::new(),
+            auth_provider: codex_model_provider::unauthenticated_auth_provider(),
+            user_agent: None,
+            chatgpt_account_id: None,
+            chatgpt_account_is_fedramp: false,
+            path_style: PathStyle::ChatGptApi,
+        };
+        assert_eq!(
+            chatgpt_client.workspace_messages_url(),
+            "https://chatgpt.com/backend-api/wham/workspace-messages"
         );
     }
 }

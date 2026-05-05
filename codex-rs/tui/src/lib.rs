@@ -190,6 +190,7 @@ mod version;
 mod voice;
 mod width;
 mod workspace_command;
+mod workspace_messages;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 mod voice {
@@ -1104,6 +1105,7 @@ async fn run_ratatui_app(
     color_eyre::install()?;
 
     tooltips::announcement::prewarm();
+    workspace_messages::prewarm_headline(&initial_config);
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.

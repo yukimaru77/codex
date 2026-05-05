@@ -2104,6 +2104,7 @@ name = "codex-backend-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "codex-api",
  "codex-backend-openapi-models",
  "codex-client",
@@ -3634,6 +3635,7 @@ dependencies = [
  "codex-app-server-client",
  "codex-app-server-protocol",
  "codex-arg0",
+ "codex-backend-client",
  "codex-chatgpt",
  "codex-cli",
  "codex-cloud-requirements",
