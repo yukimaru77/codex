@@ -10434,10 +10434,11 @@ impl ChatWidget {
 
     pub(crate) fn insert_uploaded_file_path(&mut self, path: &Path) {
         let path = path.to_string_lossy();
-        if let Some(queued_message) = self
-            .queued_user_messages
-            .front_mut()
-            .filter(|queued_message| queued_message.action == QueuedInputAction::Plain)
+        let queued_message_index = self.queued_user_messages.iter().position(|queued_message| {
+            self.queued_message_accepts_uploaded_file_path(queued_message)
+        });
+        if let Some(queued_message) =
+            queued_message_index.and_then(|index| self.queued_user_messages.get_mut(index))
         {
             if !queued_message.user_message.text.is_empty() {
                 queued_message.user_message.text.push(' ');

@@ -772,8 +772,13 @@ impl ChatWidget {
                     .send(AppEvent::BeginWindowsSandboxGrantReadRoot { path: args });
             }
             SlashCommand::Upload if !trimmed.is_empty() => {
+                let path = PathBuf::from(trimmed);
                 self.app_event_tx.send(AppEvent::UploadLocalFile {
-                    path: PathBuf::from(trimmed),
+                    path: if path.is_absolute() {
+                        path
+                    } else {
+                        self.config.cwd.join(path).to_path_buf()
+                    },
                 });
             }
             _ => self.dispatch_command(cmd),
@@ -890,6 +895,35 @@ impl ChatWidget {
             audio_device_selection_enabled: self.realtime_audio_device_selection_enabled(),
             allow_elevate_sandbox,
             side_conversation_active: self.active_side_conversation,
+        }
+    }
+
+    pub(super) fn queued_message_accepts_uploaded_file_path(
+        &self,
+        queued_message: &QueuedUserMessage,
+    ) -> bool {
+        match queued_message.action {
+            QueuedInputAction::Plain => true,
+            QueuedInputAction::RunShell => false,
+            QueuedInputAction::ParseSlash => {
+                let Some((name, rest, _rest_offset)) = parse_slash_name(&queued_message.text)
+                else {
+                    return true;
+                };
+                if name.contains('/') {
+                    return true;
+                }
+                let Some(cmd) =
+                    slash_commands::find_builtin_command(name, self.builtin_command_flags())
+                else {
+                    return false;
+                };
+                if rest.trim().is_empty() {
+                    return false;
+                }
+                matches!(cmd, SlashCommand::Plan | SlashCommand::Side)
+                    || !cmd.supports_inline_args()
+            }
         }
     }
 
