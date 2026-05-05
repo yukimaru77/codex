@@ -1533,8 +1533,12 @@ impl ThreadRequestProcessor {
             .await
             .map_err(|err| thread_store_archive_error("unarchive", err))
             .map(|stored_thread| {
-                let summary = summary_from_stored_thread(stored_thread, fallback_provider.as_str());
-                summary_to_thread(summary, &self.config.cwd)
+                let (thread, _) = thread_from_stored_thread(
+                    stored_thread,
+                    fallback_provider.as_str(),
+                    &self.config.cwd,
+                );
+                thread
             })?;
 
         thread.status = resolve_thread_status(
