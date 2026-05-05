@@ -1830,9 +1830,9 @@ async fn fast_keybinding_toggle_uses_same_events_as_fast_slash_command() {
         events.iter().any(|event| matches!(
             event,
             AppEvent::CodexOp(Op::OverrideTurnContext {
-                service_tier: Some(Some(ServiceTier::Fast)),
+                service_tier: Some(Some(service_tier)),
                 ..
-            })
+            }) if service_tier == ServiceTier::Fast.request_value()
         )),
         "expected fast-mode override app event; events: {events:?}"
     );
