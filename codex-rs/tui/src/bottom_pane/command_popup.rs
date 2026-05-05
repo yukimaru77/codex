@@ -10,6 +10,7 @@ use super::selection_popup_common::GenericDisplayRow;
 use super::selection_popup_common::measure_rows_height_with_col_width_mode;
 use super::selection_popup_common::render_rows_with_col_width_mode;
 use super::slash_commands;
+use super::slash_commands::ServiceTierCommand;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::slash_command::SlashCommand;
@@ -23,14 +24,16 @@ const COMMAND_COLUMN_WIDTH: ColumnWidthConfig = ColumnWidthConfig::new(
 );
 
 /// A selectable item in the popup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommandItem {
     Builtin(SlashCommand),
+    ServiceTier(ServiceTierCommand),
 }
 
 pub(crate) struct CommandPopup {
     command_filter: String,
     builtins: Vec<(&'static str, SlashCommand)>,
+    service_tiers: Vec<ServiceTierCommand>,
     state: ScrollState,
 }
 
@@ -39,7 +42,6 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) collaboration_modes_enabled: bool,
     pub(crate) connectors_enabled: bool,
     pub(crate) plugins_command_enabled: bool,
-    pub(crate) fast_command_enabled: bool,
     pub(crate) goal_command_enabled: bool,
     pub(crate) personality_command_enabled: bool,
     pub(crate) realtime_conversation_enabled: bool,
@@ -54,7 +56,6 @@ impl From<CommandPopupFlags> for slash_commands::BuiltinCommandFlags {
             collaboration_modes_enabled: value.collaboration_modes_enabled,
             connectors_enabled: value.connectors_enabled,
             plugins_command_enabled: value.plugins_command_enabled,
-            fast_command_enabled: value.fast_command_enabled,
             goal_command_enabled: value.goal_command_enabled,
             personality_command_enabled: value.personality_command_enabled,
             realtime_conversation_enabled: value.realtime_conversation_enabled,
@@ -66,7 +67,7 @@ impl From<CommandPopupFlags> for slash_commands::BuiltinCommandFlags {
 }
 
 impl CommandPopup {
-    pub(crate) fn new(flags: CommandPopupFlags) -> Self {
+    pub(crate) fn new(flags: CommandPopupFlags, service_tiers: Vec<ServiceTierCommand>) -> Self {
         // Keep built-in availability in sync with the composer.
         let builtins: Vec<(&'static str, SlashCommand)> =
             slash_commands::builtins_for_input(flags.into())
@@ -77,6 +78,7 @@ impl CommandPopup {
         Self {
             command_filter: String::new(),
             builtins,
+            service_tiers,
             state: ScrollState::new(),
         }
     }
@@ -139,6 +141,12 @@ impl CommandPopup {
                 }
                 out.push((CommandItem::Builtin(*cmd), None));
             }
+            out.extend(
+                self.service_tiers
+                    .iter()
+                    .cloned()
+                    .map(|command| (CommandItem::ServiceTier(command), None)),
+            );
             return out;
         }
 
@@ -172,6 +180,14 @@ impl CommandPopup {
         for (_, cmd) in self.builtins.iter() {
             push_match(CommandItem::Builtin(*cmd), cmd.command(), None, 0);
         }
+        for service_tier in self.service_tiers.iter() {
+            push_match(
+                CommandItem::ServiceTier(service_tier.clone()),
+                &service_tier.command,
+                None,
+                0,
+            );
+        }
 
         out.extend(exact);
         out.extend(prefix);
@@ -189,9 +205,14 @@ impl CommandPopup {
         matches
             .into_iter()
             .map(|(item, indices)| {
-                let CommandItem::Builtin(cmd) = item;
-                let name = format!("/{}", cmd.command());
-                let description = cmd.description().to_string();
+                let (name, description) = match item {
+                    CommandItem::Builtin(cmd) => {
+                        (format!("/{}", cmd.command()), cmd.description().to_string())
+                    }
+                    CommandItem::ServiceTier(command) => {
+                        (format!("/{}", command.command), command.description)
+                    }
+                };
                 GenericDisplayRow {
                     name,
                     name_prefix_spans: Vec::new(),
@@ -227,7 +248,7 @@ impl CommandPopup {
         let matches = self.filtered_items();
         self.state
             .selected_idx
-            .and_then(|idx| matches.get(idx).copied())
+            .and_then(|idx| matches.get(idx).cloned())
     }
 }
 
@@ -253,9 +274,24 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    fn popup(flags: CommandPopupFlags) -> CommandPopup {
+        CommandPopup::new(flags, Vec::new())
+    }
+
+    fn builtin_names(popup: &CommandPopup) -> Vec<&'static str> {
+        popup
+            .filtered_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                CommandItem::Builtin(cmd) => Some(cmd.command()),
+                CommandItem::ServiceTier(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn filter_includes_init_when_typing_prefix() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default());
+        let mut popup = popup(CommandPopupFlags::default());
         // Simulate the composer line starting with '/in' so the popup filters
         // matching commands by prefix.
         popup.on_composer_text_change("/in".to_string());
@@ -263,9 +299,9 @@ mod tests {
         // Access the filtered list via the selected command and ensure that
         // one of the matches is the new "init" command.
         let matches = popup.filtered_items();
-        let has_init = matches.iter().any(|item| match item {
-            CommandItem::Builtin(cmd) => cmd.command() == "init",
-        });
+        let has_init = matches
+            .iter()
+            .any(|item| matches!(item, CommandItem::Builtin(cmd) if cmd.command() == "init"));
         assert!(
             has_init,
             "expected '/init' to appear among filtered commands"
@@ -274,7 +310,7 @@ mod tests {
 
     #[test]
     fn selecting_init_by_exact_match() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default());
+        let mut popup = popup(CommandPopupFlags::default());
         popup.on_composer_text_change("/init".to_string());
 
         // When an exact match exists, the selected command should be that
@@ -282,48 +318,72 @@ mod tests {
         let selected = popup.selected_item();
         match selected {
             Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "init"),
-            None => panic!("expected a selected command for exact match"),
+            other => panic!("expected init selected for exact match, got {other:?}"),
         }
     }
 
     #[test]
     fn model_is_first_suggestion_for_mo() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default());
+        let mut popup = popup(CommandPopupFlags::default());
         popup.on_composer_text_change("/mo".to_string());
         let matches = popup.filtered_items();
         match matches.first() {
             Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "model"),
-            None => panic!("expected at least one match for '/mo'"),
+            other => panic!("expected model as first match for '/mo', got {other:?}"),
         }
     }
 
     #[test]
+    fn service_tier_command_is_suggested_from_model_metadata() {
+        let mut popup = CommandPopup::new(
+            CommandPopupFlags::default(),
+            vec![
+                ServiceTierCommand::new(
+                    "priority",
+                    "priority-id".to_string(),
+                    "fastest inference".to_string(),
+                )
+                .expect("valid service tier command"),
+            ],
+        );
+        popup.on_composer_text_change("/pri".to_string());
+
+        assert_eq!(
+            popup.selected_item(),
+            Some(CommandItem::ServiceTier(ServiceTierCommand {
+                command: "priority".to_string(),
+                id: "priority-id".to_string(),
+                description: "fastest inference".to_string(),
+            }))
+        );
+        let rows = popup.rows_from_matches(popup.filtered());
+        assert_eq!(
+            rows.into_iter()
+                .map(|row| (row.name, row.match_indices, row.description))
+                .collect::<Vec<_>>(),
+            vec![(
+                "/priority".to_string(),
+                Some(vec![1, 2, 3]),
+                Some("fastest inference".to_string()),
+            )]
+        );
+    }
+
+    #[test]
     fn filtered_commands_keep_presentation_order_for_prefix() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default());
+        let mut popup = popup(CommandPopupFlags::default());
         popup.on_composer_text_change("/m".to_string());
 
-        let cmds: Vec<&str> = popup
-            .filtered_items()
-            .into_iter()
-            .map(|item| match item {
-                CommandItem::Builtin(cmd) => cmd.command(),
-            })
-            .collect();
+        let cmds = builtin_names(&popup);
         assert_eq!(cmds, vec!["model", "memories", "mention", "mcp"]);
     }
 
     #[test]
     fn prefix_filter_limits_matches_for_ac() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default());
+        let mut popup = popup(CommandPopupFlags::default());
         popup.on_composer_text_change("/ac".to_string());
 
-        let cmds: Vec<&str> = popup
-            .filtered_items()
-            .into_iter()
-            .map(|item| match item {
-                CommandItem::Builtin(cmd) => cmd.command(),
-            })
-            .collect();
+        let cmds = builtin_names(&popup);
         assert!(
             !cmds.contains(&"compact"),
             "expected prefix search for '/ac' to exclude 'compact', got {cmds:?}"
@@ -332,7 +392,7 @@ mod tests {
 
     #[test]
     fn quit_hidden_in_empty_filter_but_shown_for_prefix() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default());
+        let mut popup = popup(CommandPopupFlags::default());
         popup.on_composer_text_change("/".to_string());
         let items = popup.filtered_items();
         assert!(!items.contains(&CommandItem::Builtin(SlashCommand::Quit)));
@@ -344,16 +404,10 @@ mod tests {
 
     #[test]
     fn collab_command_hidden_when_collaboration_modes_disabled() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default());
+        let mut popup = popup(CommandPopupFlags::default());
         popup.on_composer_text_change("/".to_string());
 
-        let cmds: Vec<&str> = popup
-            .filtered_items()
-            .into_iter()
-            .map(|item| match item {
-                CommandItem::Builtin(cmd) => cmd.command(),
-            })
-            .collect();
+        let cmds = builtin_names(&popup);
         assert!(
             !cmds.contains(&"collab"),
             "expected '/collab' to be hidden when collaboration modes are disabled, got {cmds:?}"
@@ -366,11 +420,10 @@ mod tests {
 
     #[test]
     fn collab_command_visible_when_collaboration_modes_enabled() {
-        let mut popup = CommandPopup::new(CommandPopupFlags {
+        let mut popup = popup(CommandPopupFlags {
             collaboration_modes_enabled: true,
             connectors_enabled: false,
             plugins_command_enabled: false,
-            fast_command_enabled: false,
             goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
@@ -388,11 +441,10 @@ mod tests {
 
     #[test]
     fn plan_command_visible_when_collaboration_modes_enabled() {
-        let mut popup = CommandPopup::new(CommandPopupFlags {
+        let mut popup = popup(CommandPopupFlags {
             collaboration_modes_enabled: true,
             connectors_enabled: false,
             plugins_command_enabled: false,
-            fast_command_enabled: false,
             goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
@@ -410,11 +462,10 @@ mod tests {
 
     #[test]
     fn personality_command_hidden_when_disabled() {
-        let mut popup = CommandPopup::new(CommandPopupFlags {
+        let mut popup = popup(CommandPopupFlags {
             collaboration_modes_enabled: true,
             connectors_enabled: false,
             plugins_command_enabled: false,
-            fast_command_enabled: false,
             goal_command_enabled: false,
             personality_command_enabled: false,
             realtime_conversation_enabled: false,
@@ -424,13 +475,7 @@ mod tests {
         });
         popup.on_composer_text_change("/pers".to_string());
 
-        let cmds: Vec<&str> = popup
-            .filtered_items()
-            .into_iter()
-            .map(|item| match item {
-                CommandItem::Builtin(cmd) => cmd.command(),
-            })
-            .collect();
+        let cmds = builtin_names(&popup);
         assert!(
             !cmds.contains(&"personality"),
             "expected '/personality' to be hidden when disabled, got {cmds:?}"
@@ -439,11 +484,10 @@ mod tests {
 
     #[test]
     fn personality_command_visible_when_enabled() {
-        let mut popup = CommandPopup::new(CommandPopupFlags {
+        let mut popup = popup(CommandPopupFlags {
             collaboration_modes_enabled: true,
             connectors_enabled: false,
             plugins_command_enabled: false,
-            fast_command_enabled: false,
             goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
@@ -461,11 +505,10 @@ mod tests {
 
     #[test]
     fn settings_command_hidden_when_audio_device_selection_is_disabled() {
-        let mut popup = CommandPopup::new(CommandPopupFlags {
+        let mut popup = popup(CommandPopupFlags {
             collaboration_modes_enabled: false,
             connectors_enabled: false,
             plugins_command_enabled: false,
-            fast_command_enabled: false,
             goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: true,
@@ -475,13 +518,7 @@ mod tests {
         });
         popup.on_composer_text_change("/aud".to_string());
 
-        let cmds: Vec<&str> = popup
-            .filtered_items()
-            .into_iter()
-            .map(|item| match item {
-                CommandItem::Builtin(cmd) => cmd.command(),
-            })
-            .collect();
+        let cmds = builtin_names(&popup);
 
         assert!(
             !cmds.contains(&"settings"),
@@ -491,14 +528,8 @@ mod tests {
 
     #[test]
     fn debug_commands_are_hidden_from_popup() {
-        let popup = CommandPopup::new(CommandPopupFlags::default());
-        let cmds: Vec<&str> = popup
-            .filtered_items()
-            .into_iter()
-            .map(|item| match item {
-                CommandItem::Builtin(cmd) => cmd.command(),
-            })
-            .collect();
+        let popup = popup(CommandPopupFlags::default());
+        let cmds = builtin_names(&popup);
 
         assert!(
             !cmds.iter().any(|name| name.starts_with("debug")),

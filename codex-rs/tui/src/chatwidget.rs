@@ -57,6 +57,7 @@ use crate::bottom_pane::StatusSurfacePreviewData;
 use crate::bottom_pane::StatusSurfacePreviewItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::bottom_pane::TerminalTitleSetupView;
+use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use crate::diff_model::FileChange;
 use crate::legacy_core::DEFAULT_AGENTS_MD_FILENAME;
 use crate::legacy_core::config::Config;
@@ -158,6 +159,7 @@ use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::local_image_label_text;
+use codex_protocol::openai_models::SPEED_TIER_FAST;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::plan_tool::PlanItemArg as UpdatePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as UpdatePlanItemStatus;
@@ -2108,7 +2110,7 @@ impl ChatWidget {
         }
         self.refresh_model_display();
         self.refresh_status_surfaces();
-        self.sync_fast_command_enabled();
+        self.sync_service_tier_commands();
         self.sync_personality_command_enabled();
         self.sync_plugins_command_enabled();
         self.sync_goal_command_enabled();
@@ -5055,7 +5057,7 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_collaboration_modes_enabled(/*enabled*/ true);
-        widget.sync_fast_command_enabled();
+        widget.sync_service_tier_commands();
         widget.sync_personality_command_enabled();
         widget.sync_plugins_command_enabled();
         widget.sync_goal_command_enabled();
@@ -5294,6 +5296,9 @@ impl ChatWidget {
                     }
                     InputResult::Command(cmd) => {
                         self.handle_slash_command_dispatch(cmd);
+                    }
+                    InputResult::ServiceTierCommand(command) => {
+                        self.handle_service_tier_slash_command(command);
                     }
                     InputResult::CommandWithArgs(cmd, args, text_elements) => {
                         self.handle_slash_command_with_args_dispatch(cmd, args, text_elements);
@@ -9146,7 +9151,7 @@ impl ChatWidget {
             }
         }
         if feature == Feature::FastMode {
-            self.sync_fast_command_enabled();
+            self.sync_service_tier_commands();
         }
         if feature == Feature::Personality {
             self.sync_personality_command_enabled();
@@ -9262,11 +9267,21 @@ impl ChatWidget {
     }
 
     /// Set Fast mode in the widget's config copy.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_service_tier(&mut self, service_tier: Option<ServiceTier>) {
         self.config.service_tier = service_tier;
         self.config.service_tier_id =
             service_tier.map(|service_tier| service_tier.request_value().to_string());
         self.effective_service_tier = service_tier;
+    }
+
+    pub(crate) fn set_service_tier_id(&mut self, service_tier_id: Option<String>) {
+        self.config.service_tier_id = service_tier_id.clone();
+        self.config.service_tier = service_tier_id.as_deref().and_then(|service_tier_id| {
+            ServiceTier::from_request_value(service_tier_id)
+                .or_else(|| (service_tier_id == SPEED_TIER_FAST).then_some(ServiceTier::Fast))
+        });
+        self.effective_service_tier = self.config.service_tier;
     }
 
     pub(crate) fn current_service_tier(&self) -> Option<ServiceTier> {
@@ -9277,7 +9292,10 @@ impl ChatWidget {
         self.config
             .service_tier_id
             .as_deref()
-            .and_then(ServiceTier::from_request_value)
+            .and_then(|service_tier_id| {
+                ServiceTier::from_request_value(service_tier_id)
+                    .or_else(|| (service_tier_id == SPEED_TIER_FAST).then_some(ServiceTier::Fast))
+            })
             .or(self.config.service_tier)
     }
 
@@ -9370,11 +9388,17 @@ impl ChatWidget {
         self.refresh_model_dependent_surfaces();
     }
 
-    fn set_service_tier_selection(&mut self, service_tier: Option<ServiceTier>) {
-        if service_tier.is_none() {
+    fn set_service_tier_selection(
+        &mut self,
+        service_tier: Option<ServiceTier>,
+        service_tier_id: Option<String>,
+    ) {
+        if service_tier_id.is_none() && service_tier.is_none() {
             self.config.notices.fast_default_opt_out = Some(true);
         }
-        self.set_service_tier(service_tier);
+        let next_service_tier_id = service_tier_id
+            .or_else(|| service_tier.map(|service_tier| service_tier.request_value().to_string()));
+        self.set_service_tier_id(next_service_tier_id.clone());
         self.app_event_tx
             .send(AppEvent::CodexOp(AppCommand::override_turn_context(
                 /*cwd*/ None,
@@ -9385,12 +9409,39 @@ impl ChatWidget {
                 /*model*/ None,
                 /*effort*/ None,
                 /*summary*/ None,
-                Some(service_tier.map(|service_tier| service_tier.request_value().to_string())),
+                Some(next_service_tier_id.clone()),
                 /*collaboration_mode*/ None,
                 /*personality*/ None,
             )));
         self.app_event_tx
-            .send(AppEvent::PersistServiceTierSelection { service_tier });
+            .send(AppEvent::PersistServiceTierSelection {
+                service_tier,
+                service_tier_id: next_service_tier_id,
+            });
+    }
+
+    fn handle_service_tier_slash_command(&mut self, command: ServiceTierCommand) {
+        let active_service_tier_id_matches_command = self
+            .config
+            .service_tier_id
+            .as_deref()
+            .is_some_and(|service_tier_id| service_tier_id == command.id)
+            || self.effective_service_tier.is_some_and(|service_tier| {
+                ServiceTier::from_request_value(&command.id) == Some(service_tier)
+                    || (matches!(service_tier, ServiceTier::Fast) && command.id == SPEED_TIER_FAST)
+            });
+        let next_service_tier_id = if active_service_tier_id_matches_command {
+            None
+        } else {
+            Some(command.id)
+        };
+        self.set_service_tier_selection(
+            next_service_tier_id
+                .as_deref()
+                .and_then(ServiceTier::from_request_value),
+            next_service_tier_id,
+        );
+        self.bottom_pane.record_pending_slash_command_history();
     }
 
     pub(crate) fn toggle_fast_mode_from_ui(&mut self) {
@@ -9428,9 +9479,40 @@ impl ChatWidget {
             .unwrap_or_else(|| "System default".to_string())
     }
 
-    fn sync_fast_command_enabled(&mut self) {
-        self.bottom_pane
-            .set_fast_command_enabled(self.fast_mode_enabled());
+    fn sync_service_tier_commands(&mut self) {
+        let commands = self.current_model_service_tier_commands();
+        self.bottom_pane.set_service_tier_commands(commands);
+    }
+
+    fn current_model_service_tier_commands(&self) -> Vec<ServiceTierCommand> {
+        if !self.fast_mode_enabled() {
+            return Vec::new();
+        }
+        let model = self.current_model();
+        self.model_catalog
+            .try_list_models()
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|preset| preset.model == model)
+                    .map(|preset| {
+                        preset
+                            .service_tiers
+                            .into_iter()
+                            .filter_map(|tier| {
+                                ServiceTierCommand::new(&tier.name, tier.id, tier.description)
+                            })
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    fn current_model_service_tier_command(&self, name: &str) -> Option<ServiceTierCommand> {
+        self.current_model_service_tier_commands()
+            .into_iter()
+            .find(|command| command.command == name)
     }
 
     fn sync_personality_command_enabled(&mut self) {
@@ -9626,6 +9708,7 @@ impl ChatWidget {
     /// header/title (`refresh_model_display`) but forget the footer status line
     /// (`refresh_status_line`).
     fn refresh_model_dependent_surfaces(&mut self) {
+        self.sync_service_tier_commands();
         self.refresh_model_display();
         self.refresh_status_line();
     }

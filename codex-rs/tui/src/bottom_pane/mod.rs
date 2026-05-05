@@ -176,6 +176,7 @@ pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::QueuedInputAction;
+use slash_commands::ServiceTierCommand;
 
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::status_indicator_widget::StatusIndicatorWidget;
@@ -390,13 +391,13 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub fn set_fast_command_enabled(&mut self, enabled: bool) {
-        self.composer.set_fast_command_enabled(enabled);
+    pub fn set_goal_command_enabled(&mut self, enabled: bool) {
+        self.composer.set_goal_command_enabled(enabled);
         self.request_redraw();
     }
 
-    pub fn set_goal_command_enabled(&mut self, enabled: bool) {
-        self.composer.set_goal_command_enabled(enabled);
+    pub(crate) fn set_service_tier_commands(&mut self, commands: Vec<ServiceTierCommand>) {
+        self.composer.set_service_tier_commands(commands);
         self.request_redraw();
     }
 

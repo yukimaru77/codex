@@ -183,6 +183,7 @@ use super::skill_popup::MentionItem;
 use super::skill_popup::SkillPopup;
 use super::slash_commands;
 use super::slash_commands::BuiltinCommandFlags;
+use super::slash_commands::ServiceTierCommand;
 use crate::bottom_pane::paste_burst::FlushResult;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::key_hint::KeyBindingListExt;
@@ -264,6 +265,7 @@ pub enum InputResult {
     /// Callers that dispatch this variant are also responsible for resolving any pending local
     /// command-history entry that the composer staged before clearing the visible input.
     Command(SlashCommand),
+    ServiceTierCommand(ServiceTierCommand),
     /// An inline slash command and its trimmed argument text.
     ///
     /// The `TextElement` ranges are rebased into the argument string, while any pending local
@@ -388,7 +390,6 @@ pub(crate) struct ChatComposer {
     ide_context_active: bool,
     connectors_enabled: bool,
     plugins_command_enabled: bool,
-    fast_command_enabled: bool,
     goal_command_enabled: bool,
     personality_command_enabled: bool,
     realtime_conversation_enabled: bool,
@@ -402,6 +403,7 @@ pub(crate) struct ChatComposer {
     side_conversation_context_label: Option<String>,
     // Agent label injected into the footer's contextual row when multi-agent mode is active.
     active_agent_label: Option<String>,
+    service_tier_commands: Vec<ServiceTierCommand>,
     history_search: Option<HistorySearchSession>,
     submit_keys: Vec<KeyBinding>,
     queue_keys: Vec<KeyBinding>,
@@ -478,7 +480,6 @@ impl ChatComposer {
             collaboration_modes_enabled: self.collaboration_modes_enabled,
             connectors_enabled: self.connectors_enabled,
             plugins_command_enabled: self.plugins_command_enabled,
-            fast_command_enabled: self.fast_command_enabled,
             goal_command_enabled: self.goal_command_enabled,
             personality_command_enabled: self.personality_command_enabled,
             realtime_conversation_enabled: self.realtime_conversation_enabled,
@@ -570,7 +571,6 @@ impl ChatComposer {
             ide_context_active: false,
             connectors_enabled: false,
             plugins_command_enabled: false,
-            fast_command_enabled: false,
             goal_command_enabled: false,
             personality_command_enabled: false,
             realtime_conversation_enabled: false,
@@ -586,6 +586,7 @@ impl ChatComposer {
             status_line_enabled: false,
             side_conversation_context_label: None,
             active_agent_label: None,
+            service_tier_commands: Vec::new(),
             history_search: None,
             submit_keys: vec![key_hint::plain(KeyCode::Enter)],
             queue_keys: vec![key_hint::plain(KeyCode::Tab)],
@@ -683,12 +684,13 @@ impl ChatComposer {
         self.connectors_enabled = enabled;
     }
 
-    pub fn set_fast_command_enabled(&mut self, enabled: bool) {
-        self.fast_command_enabled = enabled;
-    }
-
     pub fn set_goal_command_enabled(&mut self, enabled: bool) {
         self.goal_command_enabled = enabled;
+    }
+
+    pub(crate) fn set_service_tier_commands(&mut self, commands: Vec<ServiceTierCommand>) {
+        self.service_tier_commands = commands;
+        self.sync_popups();
     }
 
     /// Replace composer, editor, and footer-hint key bindings from one runtime snapshot.
@@ -1733,24 +1735,23 @@ impl ChatComposer {
                 // before applying completion.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
                 popup.on_composer_text_change(first_line.to_string());
-                let selected_cmd = popup.selected_item().map(|sel| {
-                    let CommandItem::Builtin(cmd) = sel;
-                    cmd
-                });
-                if let Some(cmd) = selected_cmd {
-                    if cmd == SlashCommand::Skills {
-                        self.stage_selected_slash_command_history(cmd);
+                if let Some(selected) = popup.selected_item() {
+                    let selected_command_text = match &selected {
+                        CommandItem::Builtin(cmd) => format!("/{}", cmd.command()),
+                        CommandItem::ServiceTier(command) => format!("/{}", command.command),
+                    };
+                    if matches!(selected, CommandItem::Builtin(SlashCommand::Skills)) {
+                        self.stage_selected_command_history(&selected);
                         self.textarea.set_text_clearing_elements("");
                         self.is_bash_mode = false;
-                        return (InputResult::Command(cmd), true);
+                        return (InputResult::Command(SlashCommand::Skills), true);
                     }
 
-                    let selected_command_text = format!("/{}", cmd.command());
                     let starts_with_cmd =
                         first_line.trim_start().starts_with(&selected_command_text);
                     if !starts_with_cmd {
                         self.textarea
-                            .set_text_clearing_elements(&format!("/{} ", cmd.command()));
+                            .set_text_clearing_elements(&format!("{selected_command_text} "));
                         if !self.textarea.text().is_empty() {
                             self.textarea.set_cursor(self.textarea.text().len());
                         }
@@ -1771,17 +1772,16 @@ impl ChatComposer {
                 // while the slash-command popup is active.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
                 popup.on_composer_text_change(first_line.to_string());
-                let selected_cmd = popup.selected_item().map(|sel| {
-                    let CommandItem::Builtin(cmd) = sel;
-                    cmd
-                });
-                if let Some(cmd) = selected_cmd {
-                    let starts_with_cmd = first_line
-                        .trim_start()
-                        .starts_with(&format!("/{}", cmd.command()));
+                if let Some(selected) = popup.selected_item() {
+                    let selected_command_text = match selected {
+                        CommandItem::Builtin(cmd) => format!("/{}", cmd.command()),
+                        CommandItem::ServiceTier(command) => format!("/{}", command.command),
+                    };
+                    let starts_with_cmd =
+                        first_line.trim_start().starts_with(&selected_command_text);
                     if !starts_with_cmd {
                         self.textarea
-                            .set_text_clearing_elements(&format!("/{} ", cmd.command()));
+                            .set_text_clearing_elements(&format!("{selected_command_text} "));
                         self.is_bash_mode = false;
                     }
                     if !self.textarea.text().is_empty() {
@@ -1796,11 +1796,18 @@ impl ChatComposer {
                 ..
             } => {
                 if let Some(sel) = popup.selected_item() {
-                    let CommandItem::Builtin(cmd) = sel;
-                    self.stage_selected_slash_command_history(cmd);
+                    self.stage_selected_command_history(&sel);
                     self.textarea.set_text_clearing_elements("");
                     self.is_bash_mode = false;
-                    return (InputResult::Command(cmd), true);
+                    return (
+                        match sel {
+                            CommandItem::Builtin(cmd) => InputResult::Command(cmd),
+                            CommandItem::ServiceTier(command) => {
+                                InputResult::ServiceTierCommand(command)
+                            }
+                        },
+                        true,
+                    );
                 }
                 // Fallback to default newline handling if no command selected.
                 self.handle_key_event_without_popup(key_event)
@@ -2595,10 +2602,11 @@ impl ChatComposer {
         {
             let treat_as_plain_text = input_starts_with_space || name.contains('/');
             if !treat_as_plain_text {
-                let is_builtin =
+                let is_known =
                     slash_commands::find_builtin_command(name, self.builtin_command_flags())
-                        .is_some();
-                if !is_builtin {
+                        .is_some()
+                        || self.find_service_tier_command(name).is_some();
+                if !is_known {
                     let message = format!(
                         r#"Unrecognized command '/{name}'. Type "/" for a list of supported commands."#
                     );
@@ -2676,6 +2684,7 @@ impl ChatComposer {
             InputResult::Submitted { .. }
                 | InputResult::Queued { .. }
                 | InputResult::Command(_)
+                | InputResult::ServiceTierCommand(_)
                 | InputResult::CommandWithArgs(_, _, _)
         ) {
             self.textarea.enter_vim_normal_mode();
@@ -2811,23 +2820,26 @@ impl ChatComposer {
             return None;
         }
         let first_line = self.textarea.text().lines().next().unwrap_or("");
-        if let Some((name, rest, _rest_offset)) = parse_slash_name(first_line)
-            && rest.is_empty()
-            && let Some(cmd) =
-                slash_commands::find_builtin_command(name, self.builtin_command_flags())
-        {
-            if self.reject_slash_command_if_unavailable(cmd) {
-                self.stage_slash_command_history();
-                self.record_pending_slash_command_history();
-                return Some(InputResult::None);
-            }
+        let (name, rest, _rest_offset) = parse_slash_name(first_line)?;
+        if !rest.is_empty() {
+            return None;
+        }
+        if let Some(command) = self.find_service_tier_command(name) {
             self.stage_slash_command_history();
             self.textarea.set_text_clearing_elements("");
             self.is_bash_mode = false;
-            Some(InputResult::Command(cmd))
-        } else {
-            None
+            return Some(InputResult::ServiceTierCommand(command));
         }
+        let cmd = slash_commands::find_builtin_command(name, self.builtin_command_flags())?;
+        if self.reject_slash_command_if_unavailable(cmd) {
+            self.stage_slash_command_history();
+            self.record_pending_slash_command_history();
+            return Some(InputResult::None);
+        }
+        self.stage_slash_command_history();
+        self.textarea.set_text_clearing_elements("");
+        self.is_bash_mode = false;
+        Some(InputResult::Command(cmd))
     }
 
     /// Check if the input is a slash command with args (e.g., /review args) and dispatch it.
@@ -2937,12 +2949,12 @@ impl ChatComposer {
         self.stage_slash_command_history_text(self.textarea.text().trim().to_string());
     }
 
-    /// Stage a popup-selected command using its canonical command text.
-    ///
-    /// Popup filtering text can be partial, so recording the selected command avoids recalling
-    /// `/di` after the user actually accepted `/diff`.
-    fn stage_selected_slash_command_history(&mut self, cmd: SlashCommand) {
-        self.stage_slash_command_history_text(format!("/{}", cmd.command()));
+    fn stage_selected_command_history(&mut self, command: &CommandItem) {
+        let command_text = match command {
+            CommandItem::Builtin(cmd) => format!("/{}", cmd.command()),
+            CommandItem::ServiceTier(command) => format!("/{}", command.command),
+        };
+        self.stage_slash_command_history_text(command_text);
     }
 
     /// Store the provided command text and the current composer adornments in the pending slot.
@@ -3701,6 +3713,7 @@ impl ChatComposer {
 
     fn is_known_slash_name(&self, name: &str) -> bool {
         slash_commands::find_builtin_command(name, self.builtin_command_flags()).is_some()
+            || self.find_service_tier_command(name).is_some()
     }
 
     /// If the cursor is currently within a slash command on the first line,
@@ -3743,6 +3756,17 @@ impl ChatComposer {
         }
 
         slash_commands::has_builtin_prefix(name, self.builtin_command_flags())
+            || self
+                .service_tier_commands
+                .iter()
+                .any(|command| command.command.starts_with(name))
+    }
+
+    fn find_service_tier_command(&self, name: &str) -> Option<ServiceTierCommand> {
+        self.service_tier_commands
+            .iter()
+            .find(|command| command.command == name)
+            .cloned()
     }
 
     /// Synchronize `self.command_popup` with the current text in the
@@ -3788,23 +3812,24 @@ impl ChatComposer {
                     let collaboration_modes_enabled = self.collaboration_modes_enabled;
                     let connectors_enabled = self.connectors_enabled;
                     let plugins_command_enabled = self.plugins_command_enabled;
-                    let fast_command_enabled = self.fast_command_enabled;
                     let goal_command_enabled = self.goal_command_enabled;
                     let personality_command_enabled = self.personality_command_enabled;
                     let realtime_conversation_enabled = self.realtime_conversation_enabled;
                     let audio_device_selection_enabled = self.audio_device_selection_enabled;
-                    let mut command_popup = CommandPopup::new(CommandPopupFlags {
-                        collaboration_modes_enabled,
-                        connectors_enabled,
-                        plugins_command_enabled,
-                        fast_command_enabled,
-                        goal_command_enabled,
-                        personality_command_enabled,
-                        realtime_conversation_enabled,
-                        audio_device_selection_enabled,
-                        windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
-                        side_conversation_active: self.side_conversation_active,
-                    });
+                    let mut command_popup = CommandPopup::new(
+                        CommandPopupFlags {
+                            collaboration_modes_enabled,
+                            connectors_enabled,
+                            plugins_command_enabled,
+                            goal_command_enabled,
+                            personality_command_enabled,
+                            realtime_conversation_enabled,
+                            audio_device_selection_enabled,
+                            windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
+                            side_conversation_active: self.side_conversation_active,
+                        },
+                        self.service_tier_commands.clone(),
+                    );
                     command_popup.on_composer_text_change(first_line.to_string());
                     self.active_popup = ActivePopup::Command(command_popup);
                 }
@@ -7481,7 +7506,7 @@ mod tests {
                 Some(CommandItem::Builtin(cmd)) => {
                     assert_eq!(cmd.command(), "model")
                 }
-                None => panic!("no selected command for '/mo'"),
+                other => panic!("expected model selected for '/mo', got {other:?}"),
             },
             _ => panic!("slash popup not active after typing '/mo'"),
         }
@@ -7534,7 +7559,7 @@ mod tests {
                 Some(CommandItem::Builtin(cmd)) => {
                     assert_eq!(cmd.command(), "resume")
                 }
-                None => panic!("no selected command for '/res'"),
+                other => panic!("expected resume selected for '/res', got {other:?}"),
             },
             _ => panic!("slash popup not active after typing '/res'"),
         }
@@ -7596,6 +7621,9 @@ mod tests {
             }
             InputResult::CommandWithArgs(_, _, _) => {
                 panic!("expected command dispatch without args for '/init'")
+            }
+            InputResult::ServiceTierCommand(_) => {
+                panic!("expected built-in command dispatch for '/init'")
             }
             InputResult::Submitted { text, .. } => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")
@@ -8043,6 +8071,9 @@ mod tests {
             InputResult::CommandWithArgs(_, _, _) => {
                 panic!("expected command dispatch without args for '/diff'")
             }
+            InputResult::ServiceTierCommand(_) => {
+                panic!("expected built-in command dispatch for '/diff'")
+            }
             InputResult::Submitted { text, .. } => {
                 panic!("expected command dispatch after Tab completion, got literal submit: {text}")
             }
@@ -8236,6 +8267,9 @@ mod tests {
             }
             InputResult::CommandWithArgs(_, _, _) => {
                 panic!("expected command dispatch without args for '/mention'")
+            }
+            InputResult::ServiceTierCommand(_) => {
+                panic!("expected built-in command dispatch for '/mention'")
             }
             InputResult::Submitted { text, .. } => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")
