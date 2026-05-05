@@ -23,7 +23,6 @@ use tokio::task::JoinHandle;
 
 use crate::connection::JsonRpcConnection;
 use crate::connection::JsonRpcConnectionEvent;
-use crate::connection::JsonRpcConnectionRuntime;
 use crate::connection::JsonRpcTransport;
 
 #[derive(Debug)]
@@ -234,13 +233,10 @@ pub(crate) struct RpcClient {
 impl RpcClient {
     pub(crate) fn new(connection: JsonRpcConnection) -> (Self, mpsc::Receiver<RpcClientEvent>) {
         let JsonRpcConnection {
-            runtime:
-                JsonRpcConnectionRuntime {
-                    outgoing_tx: write_tx,
-                    incoming_rx: mut incoming_rx,
-                    disconnected_rx: _,
-                    task_handles: transport_tasks,
-                },
+            outgoing_tx: write_tx,
+            incoming_rx: mut incoming_rx,
+            disconnected_rx: _,
+            task_handles: transport_tasks,
             transport,
         } = connection;
         let pending = Arc::new(Mutex::new(HashMap::<RequestId, PendingRequest>::new()));

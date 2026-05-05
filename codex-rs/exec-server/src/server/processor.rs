@@ -8,7 +8,6 @@ use crate::ExecServerRuntimePaths;
 use crate::connection::CHANNEL_CAPACITY;
 use crate::connection::JsonRpcConnection;
 use crate::connection::JsonRpcConnectionEvent;
-use crate::connection::JsonRpcConnectionRuntime;
 use crate::rpc::RpcNotificationSender;
 use crate::rpc::RpcServerOutboundMessage;
 use crate::rpc::encode_server_message;
@@ -49,13 +48,10 @@ async fn run_connection(
 ) {
     let router = Arc::new(build_router());
     let JsonRpcConnection {
-        runtime:
-            JsonRpcConnectionRuntime {
-                outgoing_tx: json_outgoing_tx,
-                incoming_rx: mut incoming_rx,
-                disconnected_rx: mut disconnected_rx,
-                task_handles: connection_tasks,
-            },
+        outgoing_tx: json_outgoing_tx,
+        incoming_rx: mut incoming_rx,
+        disconnected_rx: mut disconnected_rx,
+        task_handles: connection_tasks,
         transport: _transport,
     } = connection;
     let (outgoing_tx, mut outgoing_rx) =

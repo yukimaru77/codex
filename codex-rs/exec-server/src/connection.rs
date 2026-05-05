@@ -65,15 +65,11 @@ impl Drop for StdioTransport {
     }
 }
 
-pub(crate) struct JsonRpcConnectionRuntime {
+pub(crate) struct JsonRpcConnection {
     pub(crate) outgoing_tx: mpsc::Sender<JSONRPCMessage>,
     pub(crate) incoming_rx: mpsc::Receiver<JsonRpcConnectionEvent>,
     pub(crate) disconnected_rx: watch::Receiver<bool>,
     pub(crate) task_handles: Vec<tokio::task::JoinHandle<()>>,
-}
-
-pub(crate) struct JsonRpcConnection {
-    pub(crate) runtime: JsonRpcConnectionRuntime,
     pub(crate) transport: JsonRpcTransport,
 }
 
@@ -161,12 +157,10 @@ impl JsonRpcConnection {
         });
 
         Self {
-            runtime: JsonRpcConnectionRuntime {
-                outgoing_tx,
-                incoming_rx,
-                disconnected_rx,
-                task_handles: vec![reader_task, writer_task],
-            },
+            outgoing_tx,
+            incoming_rx,
+            disconnected_rx,
+            task_handles: vec![reader_task, writer_task],
             transport: JsonRpcTransport::Plain,
         }
     }
@@ -298,12 +292,10 @@ impl JsonRpcConnection {
         });
 
         Self {
-            runtime: JsonRpcConnectionRuntime {
-                outgoing_tx,
-                incoming_rx,
-                disconnected_rx,
-                task_handles: vec![reader_task, writer_task],
-            },
+            outgoing_tx,
+            incoming_rx,
+            disconnected_rx,
+            task_handles: vec![reader_task, writer_task],
             transport: JsonRpcTransport::Plain,
         }
     }
