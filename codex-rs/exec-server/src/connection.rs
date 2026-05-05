@@ -334,10 +334,7 @@ impl JsonRpcConnection {
             incoming_rx,
             disconnected_rx,
             task_handles,
-        } = self
-            .runtime
-            .take()
-            .expect("JSON-RPC client runtime already taken");
+        } = self.take_runtime("JSON-RPC client runtime already taken");
         (outgoing_tx, incoming_rx, disconnected_rx, task_handles)
     }
 
@@ -359,11 +356,15 @@ impl JsonRpcConnection {
             incoming_rx,
             disconnected_rx,
             task_handles,
-        } = self
-            .runtime
-            .take()
-            .expect("JSON-RPC connection parts already taken");
+        } = self.take_runtime("JSON-RPC connection parts already taken");
         (outgoing_tx, incoming_rx, disconnected_rx, task_handles)
+    }
+
+    fn take_runtime(&mut self, message: &'static str) -> JsonRpcConnectionRuntime {
+        match self.runtime.take() {
+            Some(runtime) => runtime,
+            None => panic!("{message}"),
+        }
     }
 }
 

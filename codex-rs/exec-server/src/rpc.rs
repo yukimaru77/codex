@@ -682,4 +682,53 @@ mod tests {
         assert!(matches!(result, Err(super::RpcCallError::Closed)));
         assert_eq!(client.pending_request_count().await, 0);
     }
+
+    #[tokio::test]
+    async fn rpc_client_drains_pending_call_on_transport_eof() {
+        let (client_stdin, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, client_stdout) = tokio::io::duplex(4096);
+        let mut connection =
+            JsonRpcConnection::from_stdio(client_stdout, client_stdin, "test-rpc".to_string());
+        let (client, mut events_rx) = RpcClient::new(&mut connection);
+
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let request = read_jsonrpc_line(&mut lines).await;
+            match request {
+                JSONRPCMessage::Request(request) if request.method == "will-close" => {}
+                other => panic!("expected will-close request, got {other:?}"),
+            }
+            drop(server_writer);
+        });
+
+        let result = timeout(
+            Duration::from_secs(1),
+            client.call::<_, serde_json::Value>("will-close", &serde_json::json!({})),
+        )
+        .await
+        .expect("timed out waiting for closed call");
+        assert!(matches!(result, Err(super::RpcCallError::Closed)));
+
+        let event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("timed out waiting for disconnect event");
+        assert!(matches!(
+            event,
+            Some(RpcClientEvent::Disconnected { reason: None })
+        ));
+        assert_eq!(client.pending_request_count().await, 0);
+
+        let result = timeout(
+            Duration::from_secs(1),
+            client.call::<_, serde_json::Value>("after-close", &serde_json::json!({})),
+        )
+        .await
+        .expect("timed out waiting for fast closed call");
+        assert!(matches!(result, Err(super::RpcCallError::Closed)));
+
+        let notify = client.notify("after-close", &serde_json::json!({})).await;
+        assert!(notify.is_err());
+
+        server.await.expect("server task should finish");
+    }
 }

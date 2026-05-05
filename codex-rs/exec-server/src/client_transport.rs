@@ -24,27 +24,16 @@ impl ExecServerClient {
     pub(crate) async fn connect_for_transport(
         transport_params: crate::client_api::ExecServerTransportParams,
     ) -> Result<Self, ExecServerError> {
-        match transport_params {
-            crate::client_api::ExecServerTransportParams::WebSocketUrl(websocket_url) => {
-                Self::connect_websocket(RemoteExecServerConnectArgs {
-                    websocket_url,
-                    client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
-                    connect_timeout: ENVIRONMENT_CONNECT_TIMEOUT,
-                    initialize_timeout: ENVIRONMENT_INITIALIZE_TIMEOUT,
-                    resume_session_id: None,
-                })
-                .await
-            }
-            crate::client_api::ExecServerTransportParams::StdioCommand(command) => {
-                Self::connect_stdio_command(StdioExecServerConnectArgs {
-                    command,
-                    client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
-                    initialize_timeout: ENVIRONMENT_INITIALIZE_TIMEOUT,
-                    resume_session_id: None,
-                })
-                .await
-            }
-        }
+        let crate::client_api::ExecServerTransportParams::WebSocketUrl(websocket_url) =
+            transport_params;
+        Self::connect_websocket(RemoteExecServerConnectArgs {
+            websocket_url,
+            client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
+            connect_timeout: ENVIRONMENT_CONNECT_TIMEOUT,
+            initialize_timeout: ENVIRONMENT_INITIALIZE_TIMEOUT,
+            resume_session_id: None,
+        })
+        .await
     }
 
     pub async fn connect_websocket(

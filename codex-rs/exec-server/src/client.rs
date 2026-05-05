@@ -154,8 +154,7 @@ pub(crate) struct Session {
 struct Inner {
     // Keep the underlying transport connection alive and drop it before the RPC
     // client starts tearing down its channel/task handles.
-    #[allow(dead_code)]
-    connection: JsonRpcConnection,
+    connection: Option<JsonRpcConnection>,
     client: RpcClient,
     // The remote transport delivers one shared notification stream for every
     // process on the connection. Keep a local process_id -> session registry so
@@ -185,6 +184,7 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.reader_task.abort();
+        drop(self.connection.take());
     }
 }
 
@@ -466,7 +466,7 @@ impl ExecServerClient {
             });
 
             Inner {
-                connection,
+                connection: Some(connection),
                 client: rpc_client,
                 sessions: ArcSwap::from_pointee(HashMap::new()),
                 sessions_write_lock: Mutex::new(()),
@@ -890,6 +890,7 @@ mod tests {
     use tokio::io::BufReader;
     use tokio::io::duplex;
     use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
     use tokio::time::Duration;
     #[cfg(unix)]
     use tokio::time::sleep;
@@ -1231,6 +1232,92 @@ mod tests {
         );
 
         drop(notifications_tx);
+        drop(client);
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn transport_disconnect_fails_sessions_and_rejects_new_sessions() {
+        let (client_stdin, server_reader) = duplex(1 << 20);
+        let (mut server_writer, client_stdout) = duplex(1 << 20);
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let initialize = read_jsonrpc_line(&mut lines).await;
+            let request = match initialize {
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
+                other => panic!("expected initialize request, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(InitializeResponse {
+                        session_id: "session-1".to_string(),
+                    })
+                    .expect("initialize response should serialize"),
+                }),
+            )
+            .await;
+
+            let initialized = read_jsonrpc_line(&mut lines).await;
+            match initialized {
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == INITIALIZED_METHOD => {}
+                other => panic!("expected initialized notification, got {other:?}"),
+            }
+
+            let _ = disconnect_rx.await;
+            drop(server_writer);
+        });
+
+        let client = ExecServerClient::connect(
+            JsonRpcConnection::from_stdio(
+                client_stdout,
+                client_stdin,
+                "test-exec-server-client".to_string(),
+            ),
+            ExecServerClientConnectOptions::default(),
+        )
+        .await
+        .expect("client should connect");
+
+        let process_id = ProcessId::from("disconnect");
+        let session = client
+            .register_session(&process_id)
+            .await
+            .expect("session should register");
+        let mut events = session.subscribe_events();
+
+        disconnect_tx.send(()).expect("disconnect should signal");
+
+        let event = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("session failure should not time out")
+            .expect("session event stream should stay open");
+        let ExecProcessEvent::Failed(message) = event else {
+            panic!("expected session failure after disconnect, got {event:?}");
+        };
+        assert_eq!(message, "exec-server transport disconnected");
+
+        let response = session
+            .read(
+                /*after_seq*/ None, /*max_bytes*/ None, /*wait_ms*/ None,
+            )
+            .await
+            .expect("disconnected session read should synthesize a response");
+        assert_eq!(
+            response.failure.as_deref(),
+            Some("exec-server transport disconnected")
+        );
+        assert!(response.closed);
+
+        let new_session = client.register_session(&ProcessId::from("new")).await;
+        assert!(matches!(
+            new_session,
+            Err(super::ExecServerError::Disconnected(_))
+        ));
+
         drop(client);
         server.await.expect("server task should finish");
     }

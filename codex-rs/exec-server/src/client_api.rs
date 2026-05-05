@@ -49,7 +49,6 @@ pub(crate) struct StdioExecServerCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExecServerTransportParams {
     WebSocketUrl(String),
-    StdioCommand(StdioExecServerCommand),
 }
 
 /// Sends HTTP requests through a runtime-selected transport.
