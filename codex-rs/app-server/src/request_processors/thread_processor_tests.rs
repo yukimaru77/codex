@@ -512,7 +512,7 @@ mod thread_processor_behavior_tests {
             path: None,
             model: None,
             model_provider: None,
-            service_tier: Some(Some(codex_protocol::config_types::ServiceTier::Fast)),
+            service_tier: Some(Some("priority".to_string())),
             cwd: None,
             approval_policy: None,
             approvals_reviewer: None,
@@ -528,7 +528,7 @@ mod thread_processor_behavior_tests {
         let config_snapshot = ThreadConfigSnapshot {
             model: "gpt-5".to_string(),
             model_provider_id: "openai".to_string(),
-            service_tier: Some(codex_protocol::config_types::ServiceTier::Flex),
+            service_tier: Some("flex".to_string()),
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             permission_profile: codex_protocol::models::PermissionProfile::Disabled,
@@ -542,7 +542,7 @@ mod thread_processor_behavior_tests {
 
         assert_eq!(
             collect_resume_override_mismatches(&request, &config_snapshot),
-            vec!["service_tier requested=Some(Fast) active=Some(Flex)".to_string()]
+            vec!["service_tier requested=Some(\"priority\") active=Some(\"flex\")".to_string()]
         );
     }
 
