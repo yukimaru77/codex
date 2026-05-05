@@ -320,7 +320,7 @@ async fn fs_upload_file_writes_into_codex_managed_storage() -> Result<()> {
         .await??,
     )?;
 
-    let path = response.path.as_path();
+    let path = std::fs::canonicalize(response.path.as_path())?;
     let canonical_codex_home = std::fs::canonicalize(codex_home.path())?;
     assert!(path.starts_with(canonical_codex_home.join("uploads")));
     assert_eq!(

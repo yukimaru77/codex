@@ -26,6 +26,7 @@ use codex_app_server_protocol::FsWatchResponse;
 use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::FsWriteFileResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::MAX_UPLOAD_FILE_BYTES;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
@@ -36,8 +37,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
-
-const MAX_UPLOAD_FILE_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct FsRequestProcessor {
@@ -238,7 +237,7 @@ fn sanitize_upload_file_name(file_name: &str) -> Result<&str, JSONRPCErrorError>
 }
 
 fn decode_upload_data_base64(data_base64: &str) -> Result<Vec<u8>, JSONRPCErrorError> {
-    decode_upload_data_base64_with_limit(data_base64, MAX_UPLOAD_FILE_BYTES)
+    decode_upload_data_base64_with_limit(data_base64, MAX_UPLOAD_FILE_BYTES as usize)
 }
 
 fn decode_upload_data_base64_with_limit(
@@ -284,7 +283,7 @@ mod tests {
 
     #[test]
     fn upload_decode_rejects_payloads_larger_than_limit() {
-        let err = decode_upload_data_base64_with_limit("QUJDRA==", 3)
+        let err = decode_upload_data_base64_with_limit("QUJDRA==", /*max_bytes*/ 3)
             .expect_err("payload should exceed the 3-byte limit");
 
         assert_eq!(err.message, "fs/uploadFile accepts files up to 3 bytes");
