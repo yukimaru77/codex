@@ -551,7 +551,9 @@ fn mcp_elicitation_response_from_guardian_decision_parts(
         | ReviewDecision::NetworkPolicyAmendment { .. } => ElicitationResponse {
             action: ElicitationAction::Accept,
             content: Some(serde_json::json!({})),
-            meta: None,
+            meta: Some(serde_json::json!({
+                MCP_ELICITATION_APPROVAL_REVIEWER_KEY: MCP_ELICITATION_APPROVAL_REVIEWER_GUARDIAN,
+            })),
         },
         ReviewDecision::Denied => mcp_elicitation_decline_with_message(
             denial_message.unwrap_or_else(|| "Guardian denied this request.".to_string()),

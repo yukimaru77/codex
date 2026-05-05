@@ -163,7 +163,9 @@ fn guardian_decisions_map_to_elicitation_responses_without_session_state() {
         ElicitationResponse {
             action: ElicitationAction::Accept,
             content: Some(json!({})),
-            meta: None,
+            meta: Some(json!({
+                "codex_approval_reviewer": "guardian",
+            })),
         }
     );
     assert_eq!(
