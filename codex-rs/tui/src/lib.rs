@@ -42,7 +42,6 @@ use codex_config::format_config_error_with_source;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::EnvironmentManagerArgs;
 use codex_exec_server::ExecServerRuntimePaths;
-use codex_features::Feature;
 use codex_login::AuthConfig;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::enforce_login_restrictions;
@@ -191,7 +190,6 @@ mod version;
 mod voice;
 mod width;
 mod workspace_command;
-mod workspace_messages;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 mod voice {
@@ -1106,9 +1104,6 @@ async fn run_ratatui_app(
     color_eyre::install()?;
 
     tooltips::announcement::prewarm();
-    if initial_config.features.enabled(Feature::WorkspaceMessages) {
-        workspace_messages::prewarm_headline(&initial_config);
-    }
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.
