@@ -48,11 +48,13 @@ mod app_cmd;
 mod desktop_app;
 mod marketplace_cmd;
 mod mcp_cmd;
+mod team_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
 use crate::marketplace_cmd::MarketplaceCli;
 use crate::mcp_cmd::McpCli;
+use crate::team_cmd::TeamCli;
 
 use codex_core::build_models_manager;
 use codex_core::config::Config;
@@ -122,6 +124,9 @@ enum Subcommand {
 
     /// Manage Codex plugins.
     Plugin(PluginCli),
+
+    /// Manage local agent team workspaces.
+    Team(TeamCli),
 
     /// Start Codex as an MCP server (stdio).
     McpServer,
@@ -895,6 +900,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Subcommand::Team(team_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "team",
+            )?;
+            team_cli.run().await?;
+        }
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
                 subcommand,
@@ -910,8 +923,10 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             match subcommand {
                 None => {
                     let transport = listen;
+                    let registered_app_server_url =
+                        team_cmd::register_app_server_transport(&transport)?;
                     let auth = auth.try_into_settings()?;
-                    codex_app_server::run_main_with_transport(
+                    let result = codex_app_server::run_main_with_transport(
                         arg0_paths.clone(),
                         root_config_overrides,
                         codex_config::LoaderOverrides::default(),
@@ -920,7 +935,11 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                         codex_protocol::protocol::SessionSource::VSCode,
                         auth,
                     )
-                    .await?;
+                    .await;
+                    if let Some(url) = registered_app_server_url {
+                        let _ = team_cmd::clear_app_server_registry_if_matches(&url);
+                    }
+                    result?;
                 }
                 Some(AppServerSubcommand::Daemon(daemon_cli)) => match daemon_cli.subcommand {
                     AppServerDaemonSubcommand::Start => {
