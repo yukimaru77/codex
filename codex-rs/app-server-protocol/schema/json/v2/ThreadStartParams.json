@@ -165,6 +165,14 @@
       ],
       "type": "string"
     },
+    "ThreadSource": {
+      "enum": [
+        "user",
+        "subagent",
+        "memory_consolidation"
+      ],
+      "type": "string"
+    },
     "ThreadStartSource": {
       "enum": [
         "startup",
@@ -294,6 +302,17 @@
           "type": "null"
         }
       ]
+    },
+    "threadSource": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadSource"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional client-supplied analytics source classification for this thread."
     }
   },
   "title": "ThreadStartParams",
