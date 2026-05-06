@@ -549,9 +549,7 @@ impl PluginRequestProcessor {
                 }
             }
             Err(remote_marketplace_name) => {
-                if !config.features.enabled(Feature::Plugins)
-                    || !config.features.enabled(Feature::RemotePlugin)
-                {
+                if !config.features.enabled(Feature::Plugins) {
                     return Err(invalid_request(format!(
                         "remote plugin read is not enabled for marketplace {remote_marketplace_name}"
                     )));
