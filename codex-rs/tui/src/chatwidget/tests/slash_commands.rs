@@ -62,6 +62,44 @@ fn next_add_to_history_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEv
     }
 }
 
+fn next_user_turn_text(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) -> String {
+    let Op::UserTurn { items, .. } = next_submit_op(op_rx) else {
+        unreachable!("next_submit_op only returns UserTurn");
+    };
+    let [UserInput::Text { text, .. }] = items.as_slice() else {
+        panic!("expected single text input, got {items:?}");
+    };
+    text.clone()
+}
+
+#[tokio::test]
+async fn bare_loop_slash_command_submits_default_loop_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.dispatch_command(SlashCommand::Loop);
+
+    let text = next_user_turn_text(&mut op_rx);
+    assert!(text.contains("You are executing Codex `/loop`"));
+    assert!(text.contains("Loop request source: default /loop prompt"));
+    assert!(text.contains("Run a maintenance loop for the current session"));
+    assert!(text.contains("bound to a Codex team secretary"));
+}
+
+#[tokio::test]
+async fn loop_slash_command_with_args_submits_inline_loop_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    submit_composer_text(&mut chat, "/loop every 5m check the deploy");
+
+    let text = next_user_turn_text(&mut op_rx);
+    assert!(text.contains("You are executing Codex `/loop`"));
+    assert!(text.contains("Loop request source: inline /loop arguments"));
+    assert!(text.contains("every 5m check the deploy"));
+    assert!(text.contains("report what you checked"));
+}
+
 #[tokio::test]
 async fn service_tier_commands_lowercase_catalog_names() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
