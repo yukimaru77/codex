@@ -1562,6 +1562,7 @@ fn run_team(root: &Path, mut args: RunArgs) -> Result<()> {
     let (team_id, team_dir) = create_team(root, args.start)?;
     println!("Created team `{team_id}`");
     println!("State: {}", team_dir.display());
+    write_team_run_pid(&team_dir, std::process::id())?;
 
     assign_unowned_tasks_round_robin(&team_dir)?;
     let config = load_config(&team_dir)?;
@@ -1775,6 +1776,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let (team_id, team_dir) = create_team(root, args.start)?;
     println!("Created app-server team `{team_id}`");
     println!("State: {}", team_dir.display());
+    write_team_run_pid(&team_dir, std::process::id())?;
     if let Some(design) = lead_department_design.as_ref() {
         merge_lead_node_metadata(&team_dir, &design.nodes)?;
         append_event(
@@ -5515,6 +5517,22 @@ fn handle_team_ui_request(
                 &[("team", team.as_str()), ("translation", language.as_str())],
             )?;
         }
+        ("POST", "/delete") => {
+            let form = parse_form(&request.body);
+            let team = form_value(&form, "team")?;
+            stop_ui_team_process(root, &team)?;
+            cleanup_team(
+                root,
+                CleanupArgs {
+                    selector: TeamSelector {
+                        team: Some(team.clone()),
+                    },
+                    force: true,
+                },
+            )?;
+            remove_ui_team_pid(root, &team)?;
+            redirect_team_ui(stream, None)?;
+        }
         ("POST", "/new") => {
             let form = parse_form(&request.body);
             let goal = form_value(&form, "goal")?;
@@ -5531,7 +5549,8 @@ fn handle_team_ui_request(
             let team_id = form
                 .get("id")
                 .map(|value| sanitize_id(value))
-                .filter(|value| !value.is_empty());
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("team-{}", Utc::now().format("%Y%m%d%H%M%S")));
             let members = split_ui_lines(form.get("members").map(String::as_str).unwrap_or(""));
             let nodes = split_ui_lines(form.get("nodes").map(String::as_str).unwrap_or(""));
             let discuss_rounds = form
@@ -5546,9 +5565,7 @@ fn handle_team_ui_request(
             let registered_app_server_url = read_registered_app_server_url().unwrap_or(None);
             let mut command = Command::new(std::env::current_exe()?);
             command.arg("team").arg("swarm");
-            if let Some(team_id) = team_id {
-                command.arg("--id").arg(team_id);
-            }
+            command.arg("--id").arg(&team_id);
             for node in nodes {
                 command.arg("--node").arg(node);
             }
@@ -5583,8 +5600,9 @@ fn handle_team_ui_request(
                 .with_context(|| format!("open {}", log_path.display()))?;
             let stderr = log.try_clone()?;
             command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
-            command.spawn().context("spawn team run from UI")?;
-            redirect_team_ui(stream, None)?;
+            let child = command.spawn().context("spawn team run from UI")?;
+            write_ui_team_pid(root, &team_id, child.id())?;
+            redirect_team_ui(stream, Some(&team_id))?;
         }
         _ => {
             write_http_response(stream, "404 Not Found", "text/plain", "not found\n")?;
@@ -5774,12 +5792,15 @@ fn render_team_ui(
         .iter()
         .map(|team| {
             let active = selected_id.as_deref() == Some(team.id.as_str());
+            let run_status = ui_team_run_status(root, team);
             format!(
-                r#"<a class="team {active}" href="/?team={id}"><strong>{id}</strong><span>{goal}</span><small>{updated}</small></a>"#,
+                r#"<div class="team-wrap" data-team="{id}"><a class="team {active}" href="/?team={id}"><strong>{id}</strong><span>{goal}</span><small>{updated}</small><em class="run-state {run_class}">{run_label}</em></a></div>"#,
                 active = if active { "active" } else { "" },
                 id = html_escape(&team.id),
                 goal = html_escape(&team.goal),
                 updated = html_escape(&team.updated_at),
+                run_class = run_status.css_class(),
+                run_label = run_status.label(),
             )
         })
         .collect::<Vec<_>>()
@@ -5897,9 +5918,19 @@ body{{margin:0;font:14px system-ui,sans-serif;background:#f6f7f9;color:#1b1f24}}
 .app{{display:grid;grid-template-columns:320px 1fr;min-height:100vh}}
 aside{{background:#fff;border-right:1px solid #d8dee4;padding:16px;overflow:auto}}
 main{{padding:20px;overflow:auto}}
+.team-wrap{{position:relative}}
 .team{{display:block;padding:10px;border-radius:6px;color:inherit;text-decoration:none;border:1px solid transparent;margin-bottom:8px}}
 .team.active{{background:#eaf2ff;border-color:#8bb8ff}}
 .team span,.team small{{display:block;color:#59636e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.run-state{{display:inline-block;margin-top:7px;padding:1px 7px;border:1px solid #d8dee4;border-radius:999px;font-size:12px;font-style:normal;color:#59636e;background:#f6f8fa}}
+.run-running{{color:#116329;background:#dafbe1;border-color:#4ac26b}}
+.run-stopped{{color:#82071e;background:#ffebe9;border-color:#ff8182}}
+.run-unknown{{color:#59636e;background:#f6f8fa}}
+.context-menu{{display:none;position:fixed;z-index:100;background:#fff;border:1px solid #d8dee4;border-radius:6px;box-shadow:0 8px 24px rgba(27,31,36,.16);padding:6px}}
+.context-menu.open{{display:block}}
+.context-menu form{{margin:0;padding:0;border:0;background:transparent}}
+.context-menu button{{width:170px;text-align:left;background:transparent;border:0;border-radius:4px;padding:8px 10px;color:#82071e}}
+.context-menu button:hover{{background:#ffebe9}}
 form{{display:grid;gap:10px;margin:12px 0;padding:12px;background:#fff;border:1px solid #d8dee4;border-radius:6px}}
 label{{display:grid;gap:4px}} input,textarea{{font:inherit;padding:8px;border:1px solid #c9d1d9;border-radius:4px}} button{{width:max-content;padding:8px 12px}}
 .dir-picker{{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px;margin:10px 0;max-height:260px;overflow:auto}}
@@ -5939,7 +5970,32 @@ code{{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all
 <input type="hidden" name="dangerously_bypass_present" value="1">
 <label class="check"><input type="checkbox" name="dangerously_bypass" checked> Bypass sandbox/approvals</label>
 </details>
-<button type="submit">Start</button></form>{ui_runs_log}</aside><main>{detail}</main></div></body></html>"#,
+<button type="submit">Start</button></form>{ui_runs_log}</aside><main>{detail}</main></div>
+<div id="team-context-menu" class="context-menu">
+<form method="post" action="/delete" onsubmit="return confirm('Delete this team? Running UI-launched team processes will be stopped first.');">
+<input type="hidden" name="team" id="delete-team-id">
+<button type="submit">Delete Team</button>
+</form>
+</div>
+<script>
+const teamMenu = document.getElementById('team-context-menu');
+const deleteTeamInput = document.getElementById('delete-team-id');
+document.querySelectorAll('.team-wrap').forEach((item) => {{
+  item.addEventListener('contextmenu', (event) => {{
+    event.preventDefault();
+    deleteTeamInput.value = item.dataset.team || '';
+    teamMenu.style.left = `${{event.clientX}}px`;
+    teamMenu.style.top = `${{event.clientY}}px`;
+    teamMenu.classList.add('open');
+  }});
+}});
+document.addEventListener('click', () => teamMenu.classList.remove('open'));
+document.addEventListener('keydown', (event) => {{
+  if (event.key === 'Escape') {{
+    teamMenu.classList.remove('open');
+  }}
+}});
+</script></body></html>"#,
         team_links = team_links,
         refresh_href = selected_id
             .as_ref()
@@ -6694,6 +6750,167 @@ fn expand_home(path: String) -> String {
         return format!("{}/{}", default_home(), rest);
     }
     path
+}
+
+#[derive(Clone, Copy)]
+enum UiTeamRunStatus {
+    Running,
+    Stopped,
+    Unknown,
+}
+
+impl UiTeamRunStatus {
+    fn label(self) -> &'static str {
+        match self {
+            UiTeamRunStatus::Running => "running",
+            UiTeamRunStatus::Stopped => "stopped",
+            UiTeamRunStatus::Unknown => "unknown",
+        }
+    }
+
+    fn css_class(self) -> &'static str {
+        match self {
+            UiTeamRunStatus::Running => "run-running",
+            UiTeamRunStatus::Stopped => "run-stopped",
+            UiTeamRunStatus::Unknown => "run-unknown",
+        }
+    }
+}
+
+fn team_run_pid_path(team_dir: &Path) -> PathBuf {
+    team_dir.join("run.pid")
+}
+
+fn write_team_run_pid(team_dir: &Path, pid: u32) -> Result<()> {
+    fs::write(team_run_pid_path(team_dir), format!("{pid}\n"))
+        .with_context(|| format!("write {}", team_run_pid_path(team_dir).display()))
+}
+
+fn ui_team_pids_dir(root: &Path) -> PathBuf {
+    root.join("ui-run-pids")
+}
+
+fn ui_team_pid_path(root: &Path, team: &str) -> PathBuf {
+    ui_team_pids_dir(root).join(format!("{}.pid", sanitize_id(team)))
+}
+
+fn write_ui_team_pid(root: &Path, team: &str, pid: u32) -> Result<()> {
+    let dir = ui_team_pids_dir(root);
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = ui_team_pid_path(root, team);
+    fs::write(&path, format!("{pid}\n")).with_context(|| format!("write {}", path.display()))
+}
+
+fn remove_ui_team_pid(root: &Path, team: &str) -> Result<()> {
+    let path = ui_team_pid_path(root, team);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn read_pid_file(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+}
+
+fn read_ui_team_pid(root: &Path, team: &str) -> Option<u32> {
+    read_pid_file(&ui_team_pid_path(root, team))
+}
+
+fn read_team_run_pid(team_dir: &Path) -> Option<u32> {
+    read_pid_file(&team_run_pid_path(team_dir))
+}
+
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn process_looks_like_codex_team(pid: u32) -> bool {
+    let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
+    let Ok(raw) = fs::read(&path) else {
+        return true;
+    };
+    let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+    cmdline.contains("codex") && cmdline.contains("team")
+}
+
+fn stop_process(pid: u32) {
+    if !process_alive(pid) || !process_looks_like_codex_team(pid) {
+        return;
+    }
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status();
+    for _ in 0..20 {
+        if !process_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if process_looks_like_codex_team(pid) {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+    }
+}
+
+fn stop_ui_team_process(root: &Path, team: &str) -> Result<()> {
+    let team_dir = resolve_team_dir(root, Some(team))?;
+    let mut pids = Vec::new();
+    if let Some(pid) = read_ui_team_pid(root, team) {
+        pids.push(pid);
+    }
+    if let Some(pid) = read_team_run_pid(&team_dir)
+        && !pids.contains(&pid)
+    {
+        pids.push(pid);
+    }
+    for pid in pids {
+        stop_process(pid);
+    }
+    Ok(())
+}
+
+fn ui_team_run_status(root: &Path, team: &TeamConfig) -> UiTeamRunStatus {
+    let team_dir = root.join(&team.id);
+    let mut saw_pid = false;
+    for pid in [
+        read_ui_team_pid(root, &team.id),
+        read_team_run_pid(&team_dir),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        saw_pid = true;
+        if process_alive(pid) && process_looks_like_codex_team(pid) {
+            return UiTeamRunStatus::Running;
+        }
+    }
+    if saw_pid {
+        return UiTeamRunStatus::Stopped;
+    }
+    let Ok(events) = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")) else {
+        return UiTeamRunStatus::Unknown;
+    };
+    for event in events.into_iter().rev().take(20) {
+        match event.event.as_str() {
+            "app_server_keep_alive_stopped" => return UiTeamRunStatus::Stopped,
+            "app_server_keep_alive_idle" => return UiTeamRunStatus::Unknown,
+            _ => {}
+        }
+    }
+    UiTeamRunStatus::Unknown
 }
 
 fn cleanup_team(root: &Path, args: CleanupArgs) -> Result<()> {
