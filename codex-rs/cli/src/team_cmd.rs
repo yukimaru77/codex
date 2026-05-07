@@ -41,6 +41,7 @@ use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
+use std::time::Instant;
 
 const CODEX_TEAM_HELPER_URL: &str =
     "https://raw.githubusercontent.com/yukimaru77/codex-team-tools/main/bin/codex-team";
@@ -179,6 +180,10 @@ struct RunArgs {
     /// Poll interval for app-server reactive team messages, in milliseconds.
     #[arg(long, default_value_t = 1500)]
     reactive_poll_ms: u64,
+
+    /// Periodically resync Codex config/skills/rules/memories/plugins to active remote nodes, in seconds. Use 0 to disable.
+    #[arg(long, default_value_t = 300)]
+    node_sync_interval_sec: u64,
 
     /// Do not keep the app-server team alive after tasks complete.
     #[arg(long, default_value_t = false)]
@@ -2202,6 +2207,12 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
 
     let mut mailbox_counts = current_mailbox_counts(&team_dir, &config.members)?;
     let poll_interval = Duration::from_millis(args.reactive_poll_ms.max(250));
+    let node_sync_interval = if args.node_sync_interval_sec == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(args.node_sync_interval_sec.max(30)))
+    };
+    let mut last_node_asset_sync = HashMap::<String, Instant>::new();
     let mut keep_alive_idle_reported = false;
 
     loop {
@@ -2249,6 +2260,15 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                 ensure_container_node_departments(&team_dir)?;
                 nodes = load_nodes(&team_dir)?;
                 ensure_local_node(&mut nodes);
+                if let Some(sync_interval) = node_sync_interval {
+                    maybe_sync_remote_node_assets(
+                        &team_dir,
+                        &nodes,
+                        &node_clients,
+                        &mut last_node_asset_sync,
+                        sync_interval,
+                    )?;
+                }
                 sync_removed_app_server_nodes(
                     &mut node_clients,
                     &mut node_processes,
@@ -7226,6 +7246,56 @@ fn sync_codex_assets_to_node(
     Ok(existing.into_iter().map(str::to_string).collect())
 }
 
+fn maybe_sync_remote_node_assets(
+    team_dir: &Path,
+    nodes: &[TeamNode],
+    node_clients: &HashMap<String, TeamAppServerNodeClient>,
+    last_sync: &mut HashMap<String, Instant>,
+    interval: Duration,
+) -> Result<()> {
+    let now_instant = Instant::now();
+    for node in nodes {
+        if matches!(node.kind, TeamNodeKind::Local | TeamNodeKind::Manual) {
+            continue;
+        }
+        if !node_clients.contains_key(&node.id) {
+            continue;
+        }
+        if last_sync
+            .get(&node.id)
+            .is_some_and(|last| now_instant.duration_since(*last) < interval)
+        {
+            continue;
+        }
+        match sync_codex_assets_to_node(node, "$HOME/.codex", false) {
+            Ok(paths) => {
+                last_sync.insert(node.id.clone(), now_instant);
+                append_event(
+                    team_dir,
+                    "node_assets_periodic_synced",
+                    serde_json::json!({
+                        "node": node.id,
+                        "paths": paths,
+                        "include_auth": false,
+                    }),
+                )?;
+            }
+            Err(err) => {
+                last_sync.insert(node.id.clone(), now_instant);
+                append_event(
+                    team_dir,
+                    "node_assets_periodic_sync_failed",
+                    serde_json::json!({
+                        "node": node.id,
+                        "error": err.to_string(),
+                    }),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_asset_sync_command<'a>(
     node: &TeamNode,
     dest: &str,
@@ -7254,7 +7324,32 @@ fn build_asset_sync_command<'a>(
         shell_quote_path(&codex_home),
         tar_args
     );
-    let remote_extract = format!("mkdir -p {dest} && tar -C {dest} -xf -");
+    let backup_entries = existing
+        .iter()
+        .map(|path| shell_quote(path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remote_extract = format!(
+        r#"set -euo pipefail
+dest={dest}
+mkdir -p "$dest"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+backup="$dest/.codex-team-backups/$stamp"
+made_backup=0
+for p in {backup_entries}; do
+  if [ -e "$dest/$p" ]; then
+    mkdir -p "$backup/$(dirname "$p")"
+    cp -a "$dest/$p" "$backup/$p"
+    made_backup=1
+  fi
+done
+tar -C "$dest" -xf -
+if [ "$made_backup" = "0" ]; then
+  rmdir "$backup" 2>/dev/null || true
+fi"#,
+        dest = shell_quote(dest),
+        backup_entries = backup_entries
+    );
     let command = match node.kind {
         TeamNodeKind::Local => {
             format!("{local_tar} | bash -lc {}", shell_quote(&remote_extract))
