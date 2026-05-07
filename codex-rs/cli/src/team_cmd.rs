@@ -5157,7 +5157,9 @@ fn send_message(root: &Path, args: MessageArgs) -> Result<()> {
     let team_dir = resolve_team_dir(root, args.selector.team.as_deref())?;
     let mut config = load_config(&team_dir)?;
     let from = args.from.unwrap_or_else(default_team_member_name);
-    ensure_member_exists(&config, &from)?;
+    if from != "user" {
+        ensure_member_exists(&config, &from)?;
+    }
     let recipients = resolve_message_recipients(&config, &from, &args.to)?;
 
     for recipient in &recipients {
@@ -5491,7 +5493,7 @@ fn handle_team_ui_request(
                     selector: TeamSelector {
                         team: Some(team.clone()),
                     },
-                    from: Some("lead".to_string()),
+                    from: Some("user".to_string()),
                     to,
                     message,
                 },
@@ -5856,6 +5858,11 @@ fn render_team_ui(
             .map(|dir| render_message_board(dir, &config.id, translation_language))
             .transpose()?
             .unwrap_or_default();
+        let lead_chat = selected_dir
+            .as_ref()
+            .map(|dir| render_lead_chat(dir, &config.id))
+            .transpose()?
+            .unwrap_or_default();
         let thread_board = selected_dir
             .as_ref()
             .map(|dir| render_thread_board(dir, &config, &node_by_id))
@@ -5863,12 +5870,7 @@ fn render_team_ui(
             .unwrap_or_default();
         format!(
             r#"<section><h2>{id}</h2><p>{goal}</p>
-<form method="post" action="/message">
-<input type="hidden" name="team" value="{id}">
-<label>To <input name="to" value="lead"></label>
-<label>Message <textarea name="message" rows="4"></textarea></label>
-<button type="submit">Send</button>
-</form>
+<h3>Lead Chat</h3>{lead_chat}
 <h3>Members</h3><table><tr><th>Name</th><th>Role</th><th>Status</th><th>Node</th><th>Location</th><th>Thread</th></tr>{members}</table>
 <h3>Nodes</h3><table><tr><th>ID</th><th>Kind</th><th>Status</th><th>Host</th><th>Container</th><th>CWD</th></tr>{nodes}</table>
 <h3>Tasks</h3><table><tr><th>ID</th><th>Status</th><th>Owner</th><th>Subject</th></tr>{tasks}</table>
@@ -5877,6 +5879,7 @@ fn render_team_ui(
 <h3>Events</h3><pre>{events}</pre></section>"#,
             id = html_escape(&config.id),
             goal = html_escape(&config.goal),
+            lead_chat = lead_chat,
             members = members,
             nodes = nodes,
             tasks = tasks,
@@ -5906,6 +5909,9 @@ table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{padding:8px;
 pre{{background:#111827;color:#d1d5db;padding:12px;border-radius:6px;overflow:auto;max-height:360px}}
 .messages{{display:grid;gap:8px;max-height:520px;overflow:auto}}
 .msg{{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px}}
+.lead-chat .msg{{border-left:4px solid #8c959f}}
+.lead-chat .chat-user{{border-left-color:#0969da}}
+.lead-chat .chat-lead{{border-left-color:#1a7f37}}
 .msg-meta{{display:flex;gap:8px;flex-wrap:wrap;color:#59636e;font-size:12px;margin-bottom:4px}}
 .pill{{display:inline-block;background:#eef2f7;border:1px solid #d8dee4;border-radius:999px;padding:1px 7px;color:#39424e}}
 .hint{{margin:8px 0;color:#59636e;font-size:12px;line-height:1.4}}
@@ -6104,6 +6110,105 @@ fn render_message_board(team_dir: &Path, team_id: &str, selected_language: &str)
         options = render_language_options(&selected_language),
         translation = translation,
         messages = messages.join(""),
+    ))
+}
+
+fn render_lead_chat(team_dir: &Path, team_id: &str) -> Result<String> {
+    let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl"))?;
+    let mut chat_items = Vec::new();
+    for event in events
+        .into_iter()
+        .filter(|event| event.event == "message_sent")
+        .filter(|event| {
+            let from = event
+                .data
+                .get("from")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let to_user_or_lead = event
+                .data
+                .get("to")
+                .map(|value| match value {
+                    serde_json::Value::Array(values) => values
+                        .iter()
+                        .any(|value| matches!(value.as_str(), Some("user") | Some("lead"))),
+                    serde_json::Value::String(value) => value == "user" || value == "lead",
+                    _ => false,
+                })
+                .unwrap_or(false);
+            from == "user" || from == "lead" || to_user_or_lead
+        })
+        .rev()
+        .take(30)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let from = event
+            .data
+            .get("from")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let to = event
+            .data
+            .get("to")
+            .map(|value| match value {
+                serde_json::Value::Array(values) => values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                serde_json::Value::String(value) => value.clone(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        let message = event
+            .data
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        chat_items.push(format!(
+            r#"<article class="msg chat-{from_class}"><div class="msg-meta"><span>{time}</span><span class="pill">{from} -> {to}</span></div><div>{message}</div></article>"#,
+            from_class = if from == "user" { "user" } else { "lead" },
+            time = html_escape(&event.timestamp),
+            from = html_escape(from),
+            to = html_escape(&to),
+            message = html_escape(message),
+        ));
+    }
+    if chat_items.is_empty() {
+        chat_items.push("<p>No lead chat yet.</p>".to_string());
+    }
+    let lead_live = fs::read_to_string(team_dir.join("live_messages").join("lead.md"))
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| {
+            let tail = text
+                .lines()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                r#"<details class="lead-live"><summary>Lead Thread</summary><pre>{}</pre></details>"#,
+                html_escape(&tail)
+            )
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        r#"<form method="post" action="/message" class="lead-chat-form">
+<input type="hidden" name="team" value="{team}">
+<input type="hidden" name="to" value="lead">
+<label>Message to lead <textarea name="message" rows="5" placeholder="追加指示、方針変更、確認したいことを書いてください"></textarea></label>
+<button type="submit">Send to Lead</button>
+</form>
+<div class="messages lead-chat">{items}</div>{lead_live}"#,
+        team = html_escape(team_id),
+        items = chat_items.join(""),
+        lead_live = lead_live,
     ))
 }
 
@@ -9060,7 +9165,9 @@ fn resolve_message_recipients(config: &TeamConfig, from: &str, to: &str) -> Resu
         return Ok(recipients);
     }
 
-    ensure_member_exists(config, to)?;
+    if to != "user" {
+        ensure_member_exists(config, to)?;
+    }
     Ok(vec![to.to_string()])
 }
 
