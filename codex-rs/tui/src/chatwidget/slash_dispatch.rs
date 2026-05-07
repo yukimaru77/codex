@@ -32,6 +32,8 @@ const SIDE_REVIEW_UNAVAILABLE_MESSAGE: &str =
 const SIDE_SLASH_COMMAND_UNAVAILABLE_HINT: &str = "Press Esc to return to the main thread first.";
 const GOAL_USAGE: &str = "Usage: /goal <objective>";
 const GOAL_USAGE_HINT: &str = "Example: /goal improve benchmark coverage";
+const LOOP_DEFAULT_PROMPT: &str = "Run a maintenance loop for the current session: continue any unfinished authorized work, inspect current status, check relevant tests/builds/jobs/messages, unblock or resume work when appropriate, and report a concise status. Do not start unrelated new initiatives. If nothing needs action, say so briefly and choose a sensible next check interval.";
+const LOOP_MD_MAX_BYTES: usize = 25_000;
 const RAW_USAGE: &str = "Usage: /raw [on|off]";
 
 impl ChatWidget {
@@ -110,6 +112,77 @@ impl ChatWidget {
             .send(AppEvent::RawOutputModeChanged { enabled });
     }
 
+    fn loop_prompt_from_file(&self) -> Option<(String, String)> {
+        let mut candidates = Vec::new();
+        candidates.push(self.config.cwd.join(".codex").join("loop.md"));
+        candidates.push(self.config.cwd.join(".claude").join("loop.md"));
+        candidates.push(self.config.codex_home.join("loop.md"));
+
+        for path in candidates {
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let prompt = if trimmed.len() > LOOP_MD_MAX_BYTES {
+                let end = trimmed
+                    .char_indices()
+                    .map(|(idx, _)| idx)
+                    .take_while(|idx| *idx <= LOOP_MD_MAX_BYTES)
+                    .last()
+                    .unwrap_or(0);
+                trimmed[..end].to_string()
+            } else {
+                trimmed.to_string()
+            };
+            let path = path.display().to_string();
+            return Some((
+                format!("loop prompt file `{path}`"),
+                format!("Use the loop prompt from `{path}`:\n\n{prompt}"),
+            ));
+        }
+        None
+    }
+
+    fn build_loop_user_prompt(&self, args: Option<&str>) -> String {
+        let supplied = args.map(str::trim).filter(|value| !value.is_empty());
+        let (source, body) = if let Some(supplied) = supplied {
+            ("inline /loop arguments".to_string(), supplied.to_string())
+        } else if let Some((source, prompt)) = self.loop_prompt_from_file() {
+            (source, prompt)
+        } else {
+            (
+                "default /loop prompt".to_string(),
+                LOOP_DEFAULT_PROMPT.to_string(),
+            )
+        };
+        format!(
+            r#"You are executing Codex `/loop`.
+
+Loop request source: {source}
+
+Loop request:
+{body}
+
+Behavior:
+- Treat this as a recurring maintenance or polling workflow for the current session.
+- If an interval is present in the request, use it as the preferred cadence. If no interval is present, choose a practical next-check cadence based on what you observe.
+- If this session is bound to a Codex team secretary, coordinate through the bound team lead instead of duplicating team work locally.
+- Use available Codex assets where appropriate: `/goal` state, `codex team status/message/job/ui/monitor`, shell commands, MCP tools, and existing project files.
+- For long waits, builds, servers, or experiments, prefer tracked jobs or a clear status artifact over an untracked background process.
+- At the end of each iteration, report what you checked, what changed, whether another iteration is needed, and the next cadence or stop condition.
+- Do not perform irreversible actions unless they continue work the user already authorized in this session.
+"#
+        )
+    }
+
+    fn submit_loop_prompt(&mut self, args: Option<String>) {
+        let prompt = self.build_loop_user_prompt(args.as_deref());
+        self.submit_user_message(prompt.into());
+    }
+
     pub(super) fn dispatch_command(&mut self, cmd: SlashCommand) {
         if !self.ensure_slash_command_allowed_in_side_conversation(cmd) {
             return;
@@ -172,6 +245,9 @@ impl ChatWidget {
                     self.bottom_pane.set_task_running(/*running*/ true);
                 }
                 self.app_event_tx.compact();
+            }
+            SlashCommand::Loop => {
+                self.submit_loop_prompt(/*args*/ None);
             }
             SlashCommand::Review => {
                 self.open_review_popup();
@@ -625,6 +701,9 @@ impl ChatWidget {
                 }
                 _ => self.add_error_message(RAW_USAGE.to_string()),
             },
+            SlashCommand::Loop if !trimmed.is_empty() => {
+                self.submit_loop_prompt(Some(args));
+            }
             SlashCommand::Rename if !trimmed.is_empty() => {
                 if !self.ensure_thread_rename_allowed() {
                     return;
@@ -920,6 +999,7 @@ impl ChatWidget {
             | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact
+            | SlashCommand::Loop
             | SlashCommand::Review
             | SlashCommand::Model
             | SlashCommand::Realtime
