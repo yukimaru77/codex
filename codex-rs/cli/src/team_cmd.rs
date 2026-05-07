@@ -939,6 +939,17 @@ struct AppServerRegistry {
     updated_at: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TeamSecretaryBinding {
+    session_id: String,
+    team_id: String,
+    team_dir: String,
+    cwd: String,
+    role: String,
+    created_at: String,
+    updated_at: String,
+}
+
 impl TeamCli {
     pub async fn run(self) -> Result<()> {
         let codex_home =
@@ -1581,6 +1592,7 @@ fn run_team(root: &Path, mut args: RunArgs) -> Result<()> {
         .cwd
         .clone()
         .unwrap_or(std::env::current_dir().context("resolve current directory")?);
+    bind_parent_codex_session_to_team(root, &team_id, &team_dir, &cwd)?;
     let codex_exe = std::env::current_exe().context("resolve current Codex executable")?;
 
     if args.prepare_only {
@@ -1777,6 +1789,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     println!("Created app-server team `{team_id}`");
     println!("State: {}", team_dir.display());
     write_team_run_pid(&team_dir, std::process::id())?;
+    bind_parent_codex_session_to_team(root, &team_id, &team_dir, &cwd)?;
     if let Some(design) = lead_department_design.as_ref() {
         merge_lead_node_metadata(&team_dir, &design.nodes)?;
         append_event(
@@ -6784,6 +6797,57 @@ fn team_run_pid_path(team_dir: &Path) -> PathBuf {
 fn write_team_run_pid(team_dir: &Path, pid: u32) -> Result<()> {
     fs::write(team_run_pid_path(team_dir), format!("{pid}\n"))
         .with_context(|| format!("write {}", team_run_pid_path(team_dir).display()))
+}
+
+fn team_secretary_bindings_dir(root: &Path) -> PathBuf {
+    root.parent()
+        .unwrap_or(root)
+        .join("team-secretaries")
+        .to_path_buf()
+}
+
+fn bind_parent_codex_session_to_team(
+    root: &Path,
+    team_id: &str,
+    team_dir: &Path,
+    cwd: &Path,
+) -> Result<()> {
+    let Ok(session_id) = std::env::var("CODEX_THREAD_ID") else {
+        return Ok(());
+    };
+    let session_id = sanitize_id(&session_id);
+    if session_id.is_empty() {
+        return Ok(());
+    }
+    let dir = team_secretary_bindings_dir(root);
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{session_id}.json"));
+    let timestamp = now();
+    let created_at = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<TeamSecretaryBinding>(&raw).ok())
+        .map(|binding| binding.created_at)
+        .unwrap_or_else(|| timestamp.clone());
+    let binding = TeamSecretaryBinding {
+        session_id,
+        team_id: team_id.to_string(),
+        team_dir: team_dir.display().to_string(),
+        cwd: cwd.display().to_string(),
+        role: "lead_secretary".to_string(),
+        created_at,
+        updated_at: timestamp,
+    };
+    write_json_atomic(&path, &binding).with_context(|| format!("write {}", path.display()))?;
+    append_event(
+        team_dir,
+        "lead_secretary_bound",
+        serde_json::json!({
+            "session_id": binding.session_id,
+            "role": binding.role,
+            "cwd": binding.cwd,
+        }),
+    )?;
+    Ok(())
 }
 
 fn ui_team_pids_dir(root: &Path) -> PathBuf {
