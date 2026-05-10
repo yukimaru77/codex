@@ -18145,6 +18145,14 @@ Current-run source policy:
 - If a pre-existing artifact conflicts with a current teammate message or the current team goal, do not block on it by default. Ask lead only if adopting that stale artifact would change the current plan; otherwise ignore it and continue from current-run evidence.
 - When reusing an old artifact for speed, record provenance and rerun this team's container-local execution and validation before presenting it as evidence.
 
+External prompt/template compliance policy:
+- If your task references a prompt/template/spec file such as `phase0.md`, `phase1.md`, `SKILL.md`, a benchmark protocol, or an evaluation contract, read the referenced file and extract its required outputs, numbered sections, gates, and deliverables before claiming progress.
+- If the template requires multiple independent prompts, scans, experiments, or result sections, create separate prompt/result artifacts for each required item. A planning document that lists the prompts is not the same as executing the prompts and saving the results.
+- If any requirement is missing, replaced by fallback work, or waiting on an external tool/API/MCP result, register or update a `team wait`, report the exact missing artifact, and do not mark the task completed.
+- Before handoff, include a compact checklist mapping each template requirement to the artifact path, provenance/source, and verification status.
+- For research scans, `sources.yaml` entries that only contain URLs and remembered summaries are not enough for `confirmed` evidence. Save source evidence locally when practical: fetched HTML/PDF/API metadata, MCP/tool response excerpts with request id, or command transcripts with URL, timestamp, cwd, command, and rc/exit. If a source could not be fetched or snapshotted, mark the related claim `likely`, `speculative`, or `unknown`, not `confirmed`, and document the access limitation.
+- If the team CLI rejects task completion because the output package is missing a checklist, manifest, ledger/report, or verification evidence, do not work around that by switching the task to `review` or calling it complete in chat. Either create the missing package and retry completion, or leave the task blocked with the exact missing artifact list and next owner.
+
 External dependency and credential policy:
 - When choosing or implementing an external model, dataset, package, API, browser, or service, verify the transitive runtime dependencies, not just the top-level repo license.
 - If a required artifact is gated, private, returns 401/403, requires manual license acceptance, or requires credentials that the user has not provided for this task, do not silently weaken the result or present partial output as success. Preserve logs, mark the task blocked, and message lead with the exact dependency, URL/repo, status code, and whether a public/local fallback is documented.
@@ -18487,6 +18495,10 @@ At the beginning, assign obvious file or directory ownership when the goal impli
 Current-run source policy: team mailbox messages, current tasks, ownerships, and artifacts explicitly created for team `{team_id}` are authoritative. Pre-existing files, stale research notes, old Docker images, old containers, and old output directories are background context only. Do not let stale artifacts from a prior team override the current deep_thinker/research handoff or block execution unless you explicitly adopt them for this team after checking provenance. If you reuse an old image or artifact for speed, require a fresh container node and fresh container-local execution/validation for this team before accepting final evidence.
 
 External dependency and credential policy: for tasks involving public/open-source models, datasets, packages, APIs, browsers, services, or other external artifacts, require the responsible department to verify transitive runtime accessibility before accepting the choice. A top-level open-source license is not enough if a required checkpoint, submodel, dataset, browser binary, package, or service is gated/private or returns 401/403 in this environment. If a run hits unprovided credentials, manual license acceptance, or a gated dependency, treat that as a real blocker: preserve exact logs and config paths, keep QA blocked, and resume research/ops to either find a documented public/local fallback or choose another current runnable option. Do not mark the overall goal complete with partial artifacts, stale outputs, or an image that cannot run end to end.
+
+External prompt/template compliance policy: when the user goal, a skill, or a department mission references an external prompt/template/spec file such as `phase0.md`, `phase1.md`, `SKILL.md`, a benchmark protocol, or an evaluation contract, do not treat "read it" or "used it for planning" as completion. First turn that file's required outputs, numbered sections, named scans, gates, and deliverables into explicit team tasks, waits, ownerships, and artifact paths. If the template asks for multiple independent prompts/scans/experiments, each one needs its own prompt artifact, result artifact, provenance, and completion gate; a meta-plan describing those prompts is not a substitute for the actual results. A downstream synthesis, Docker build, runtime experiment, or next cycle may depend only on the completed result artifacts, not on the existence of the plan. If you discover after the fact that a template requirement was only planned or partially substituted by fallback work, create a compliance matrix, mark the affected work as WARN or blocked as appropriate, and create repair tasks/waits before proceeding.
+For research scan evidence, require more than a URL list before accepting `confirmed` claims. The scan owner should save local source evidence when practical: fetched HTML/PDF/API metadata, MCP/tool response snippets with request ids, or command transcripts containing URL, timestamp, command, cwd, and rc/exit. If the team only has a URL plus a model-written summary, treat it as weak provenance and require `likely/speculative/unknown` or a follow-up evidence fetch before downstream synthesis relies on it.
+Completion rejection policy: if `team task set ... --status completed` is rejected because a required output package is incomplete, treat that rejection as authoritative. Do not evade it by setting the task to `review`, changing status wording, or declaring practical completion in a message. Fix the missing checklist/manifest/ledger/report/evidence package and retry, or leave a real blocked task with exact missing artifacts and an owner.
 
 Evidence validation policy: when a validator or audit department reports manifest/render/schema failures, distinguish actual producer evidence failure from validation-script assumptions. Require the department to inspect whether manifest entries are absolute, workspace-relative, package-root-relative, manifest-directory-relative, stale, malformed, or self-referential before finalizing a FAIL. If a failed check is due to the wrong cwd or assumed output path, have the validator preserve that failed pass as provenance, rerun with the correct base/path mapping, and then hand off the corrected verdict. If an optional or tool-version-dependent path is missing, require discovery-first inspection of the directory tree plus producer manifest/schema/outcome files before deciding whether it was required evidence; preserve hardcoded optional-path probe failures as validator/audit provenance, not producer failures, unless the claimed artifact is truly absent. If a producer manifest is stale, malformed, generated before final writes, contains newline-expanded pseudo-paths, or includes volatile logs such as active transcripts/job logs that changed after hashing, route the package back to the producer to regenerate hashes/manifests before validation/audit proceeds. Also treat stale manifest hashes written only in a handoff message as a provenance defect: before accepting a final handoff, require the producer to re-read current on-disk manifest files, report those current manifest-file hashes, and explain any mismatch between handoff text and current files. If a structured validation ledger contradicts its final verdict, such as an absence/false value marked FAIL without documented inverted semantics, route it back to the validator to fix the ledger and regenerate the manifest. Treat negative evidence fields such as `blocked_claims`, `downstream_claims_blocked`, `non_claims`, `not_supported`, `not_run`, `blocked_outputs`, and restrictive `claim_boundary` entries as refusals/limits unless the artifact also asserts the same claim as supported; more generally, keys containing `blocked`, `non_claim`, `not_supported`, `not_run`, `unsupported`, or `prohibited` are likely negative-polarity fields. Do not fail merely because a prohibited claim string appears in a blocked/non-claim list. Do not let audit consume a FAIL that is actually a validator cwd/path or polarity bug, and do not let it consume a PASS based on stale producer manifests.
 If a method/runtime contract forbids pre-guard discovery or reads under a protected input root, require a guard bootstrap path that is outside that protected root, or a precise hash-bound pre-guard read exception for the exact method/guard files. Do not clear runtime just because the method package was synced if the runtime cannot legally read it before the guard is active. When clearing guarded runtime, give the executor exact bootstrap paths and explicitly forbid using `find`, `ls`, `tree`, `rg`, glob expansion, or parent-directory inventory over protected roots such as `/workspace`, `/workspace/inputs`, or `/workspace/data` to locate them; if an exact path is missing, the executor must block and ask lead. Also explicitly forbid `cat`, `sed`, `head`, `tail`, `awk`, `python -c open(...)`, `--help`, `--version`, smoke tests, import checks, schema probes, Python introspection, or any other pre-guard file reader/probe/command variant unless the exact full command is listed in `pre_guard_allowed_exact_commands`; an exact file path exception alone is not enough to run a reader or probe command. Before clearing guarded runtime, verify that a seed-local schema-valid early fail-closed writer/template is available outside protected roots and that its invocation is an exact allowed command; if fail-closed evidence would require reading the protected method schema before the guard is active, keep runtime blocked and route the contract back to method/schema.
@@ -19407,6 +19419,72 @@ mod tests {
             },
         )
         .expect("write task");
+    }
+
+    #[test]
+    fn team_prompts_require_external_template_compliance() {
+        let now = now();
+        let lead = TeamMember {
+            name: "lead".to_string(),
+            role: "lead".to_string(),
+            status: MemberStatus::Online,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let research = TeamMember {
+            name: "research".to_string(),
+            role: "research".to_string(),
+            status: MemberStatus::Online,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let config = TeamConfig {
+            version: 1,
+            id: "team-template-policy".to_string(),
+            goal: "Use /home/yukimaru/research_prompt/phase0.md before phase1.md.".to_string(),
+            lead: "lead".to_string(),
+            members: vec![lead.clone(), research.clone()],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let task = TeamTask {
+            id: "1".to_string(),
+            subject: "phase0 scan".to_string(),
+            description: "Run Fixed-4 + Flexible-2 scans from phase0.md.".to_string(),
+            owner: Some("research".to_string()),
+            status: TaskStatus::InProgress,
+            depends_on: Vec::new(),
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        let worker_prompt = build_worker_prompt(&config, std::slice::from_ref(&task), &research);
+        assert!(worker_prompt.contains("External prompt/template compliance policy"));
+        assert!(worker_prompt.contains("planning document that lists the prompts is not the same"));
+        assert!(worker_prompt.contains("compact checklist mapping each template requirement"));
+        assert!(worker_prompt.contains("URLs and remembered summaries are not enough"));
+        assert!(
+            worker_prompt.contains("do not work around that by switching the task to `review`")
+        );
+
+        let lead_prompt = build_app_server_lead_prompt(
+            &config,
+            &[task],
+            &lead,
+            Path::new("/tmp/codex"),
+            TeamPromptLanguage::En,
+        );
+        assert!(lead_prompt.contains("External prompt/template compliance policy"));
+        assert!(lead_prompt.contains("meta-plan describing those prompts is not a substitute"));
+        assert!(lead_prompt.contains("create a compliance matrix"));
+        assert!(lead_prompt.contains("require more than a URL list"));
+        assert!(lead_prompt.contains("Completion rejection policy"));
     }
 
     fn write_test_job(
