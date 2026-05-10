@@ -4837,15 +4837,21 @@ fi
 if [ -z "${{HOME:-}}" ]; then
   export HOME=/root
 fi
-if command -v codex >/dev/null 2>&1; then
-  CODEX_BIN="$(command -v codex)"
-elif [ -x "$HOME/.codex/bin/codex" ]; then
-  CODEX_BIN="$HOME/.codex/bin/codex"
-elif [ -x "$HOME/.local/bin/codex" ]; then
-  CODEX_BIN="$HOME/.local/bin/codex"
-elif [ -x "$HOME/bin/codex" ]; then
-  CODEX_BIN="$HOME/bin/codex"
-else
+codex_version_ok() {{
+  candidate="$1"
+  [ -x "$candidate" ] || return 1
+  version="$("$candidate" --version 2>/dev/null | awk '{{print $2}}' | tail -n 1)"
+  [ -n "$version" ] || return 1
+  [ "$(printf '%s\n%s\n' "0.130.0" "$version" | sort -V | head -n 1)" = "0.130.0" ]
+}}
+CODEX_BIN=""
+for candidate in "$(command -v codex 2>/dev/null || true)" "$HOME/.codex/bin/codex" "$HOME/.local/bin/codex" "$HOME/bin/codex"; do
+  if [ -n "$candidate" ] && codex_version_ok "$candidate"; then
+    CODEX_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$CODEX_BIN" ]; then
   mkdir -p "$HOME/bin"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' EXIT
@@ -10157,7 +10163,11 @@ fn task_is_open(task: &TeamTask) -> bool {
 fn task_status_can_start_turn(status: TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Pending | TaskStatus::Ready | TaskStatus::InProgress | TaskStatus::Review
+        TaskStatus::Pending
+            | TaskStatus::Waiting
+            | TaskStatus::Ready
+            | TaskStatus::InProgress
+            | TaskStatus::Review
     )
 }
 
