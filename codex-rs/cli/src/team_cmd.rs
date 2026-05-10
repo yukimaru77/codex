@@ -4568,7 +4568,8 @@ fn spawn_ssh_node_app_server(
                 }),
             ));
         }
-        if try_authorize_codex_device_from_log(&log_path, &mut auth_attempted)? {
+        if try_authorize_codex_device_from_log(team_dir, &node.id, &log_path, &mut auth_attempted)?
+        {
             let mut child = child;
             let _ = child.kill();
             let _ = child.wait();
@@ -4661,7 +4662,8 @@ fn spawn_docker_node_app_server(
                 }),
             ));
         }
-        if try_authorize_codex_device_from_log(&log_path, &mut auth_attempted)? {
+        if try_authorize_codex_device_from_log(team_dir, &node.id, &log_path, &mut auth_attempted)?
+        {
             let mut child = child;
             let _ = child.kill();
             let _ = child.wait();
@@ -4788,7 +4790,8 @@ fn spawn_ssh_docker_node_app_server(
                 }),
             ));
         }
-        if try_authorize_codex_device_from_log(&log_path, &mut auth_attempted)? {
+        if try_authorize_codex_device_from_log(team_dir, &node.id, &log_path, &mut auth_attempted)?
+        {
             let mut child = child;
             let _ = child.kill();
             let _ = child.wait();
@@ -5009,7 +5012,12 @@ fn docker_inspect_value(host: Option<&str>, container: &str, template: &str) -> 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn try_authorize_codex_device_from_log(log_path: &Path, attempted: &mut bool) -> Result<bool> {
+fn try_authorize_codex_device_from_log(
+    team_dir: &Path,
+    node_id: &str,
+    log_path: &Path,
+    attempted: &mut bool,
+) -> Result<bool> {
     if *attempted || !log_path.exists() {
         return Ok(false);
     }
@@ -5019,14 +5027,25 @@ fn try_authorize_codex_device_from_log(log_path: &Path, attempted: &mut bool) ->
     };
     *attempted = true;
     match authorize_codex_device_with_auth_browser(&url, &code) {
-        Ok(auth_log) => append_text(
-            log_path,
-            &format!(
-                "\n[codex-team direct-device-auth ok=true url={} code=***]\n{}\n",
-                url,
-                auth_log.join("\n")
-            ),
-        )?,
+        Ok(auth_log) => {
+            append_text(
+                log_path,
+                &format!(
+                    "\n[codex-team direct-device-auth ok=true url={} code=***]\n{}\n",
+                    url,
+                    auth_log.join("\n")
+                ),
+            )?;
+            append_event(
+                team_dir,
+                "node_direct_device_auth_completed",
+                serde_json::json!({
+                    "node": node_id,
+                    "url": url,
+                    "log": log_path.display().to_string(),
+                }),
+            )?;
+        }
         Err(err) => {
             append_text(
                 log_path,
@@ -6540,6 +6559,7 @@ fn recent_usage_limit_retry_remaining_with_auth(
     auth_json: Option<&Path>,
 ) -> Result<Option<Duration>> {
     let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl"))?;
+    let member_node = usage_limit_member_node_id(team_dir, member_name)?;
     let now_utc = Utc::now();
     for event in events.into_iter().rev().take(300) {
         if event.event != "app_server_member_usage_limited" {
@@ -6553,6 +6573,9 @@ fn recent_usage_limit_retry_remaining_with_auth(
             Err(_) => continue,
         };
         if auth_json_was_modified_after(auth_json, event_time)? {
+            return Ok(None);
+        }
+        if node_device_auth_completed_after(team_dir, member_node.as_deref(), event_time)? {
             return Ok(None);
         }
         let elapsed = now_utc.signed_duration_since(event_time);
@@ -6583,6 +6606,48 @@ fn recent_usage_limit_retry_remaining_with_auth(
         return Ok(None);
     }
     Ok(None)
+}
+
+fn usage_limit_member_node_id(team_dir: &Path, member_name: &str) -> Result<Option<String>> {
+    let config_path = team_dir.join("config.json");
+    let Ok(config) = read_json::<TeamConfig>(&config_path) else {
+        return Ok(None);
+    };
+    Ok(config
+        .members
+        .iter()
+        .find(|member| member.name == member_name)
+        .map(member_node_id))
+}
+
+fn node_device_auth_completed_after(
+    team_dir: &Path,
+    node_id: Option<&str>,
+    event_time: DateTime<Utc>,
+) -> Result<bool> {
+    let Some(node_id) = node_id else {
+        return Ok(false);
+    };
+    let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl"))?;
+    for event in events.into_iter().rev().take(300) {
+        if event.event != "node_direct_device_auth_completed"
+            && event.event != "node_auth_copy_fallback_synced"
+        {
+            continue;
+        }
+        if event.data.get("node").and_then(|value| value.as_str()) != Some(node_id) {
+            continue;
+        }
+        let event_time_auth = match DateTime::parse_from_rfc3339(&event.timestamp) {
+            Ok(value) => value.with_timezone(&Utc),
+            Err(_) => continue,
+        };
+        if event_time_auth > event_time {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    Ok(false)
 }
 
 fn auth_json_was_modified_after(
@@ -14145,7 +14210,7 @@ fn parse_node_spec(raw: &str, now: &str) -> Result<TeamNode> {
 
 fn create_task(team_dir: &Path, args: TaskAddArgs) -> Result<TeamTask> {
     let id = allocate_task_id(team_dir)?;
-    let now = now();
+    let created_at = now();
     let depends_on = normalize_task_dependencies(args.depends_on, Some(&id))?;
     validate_task_dependencies_exist(team_dir, &depends_on)?;
     let task = TeamTask {
@@ -14160,8 +14225,8 @@ fn create_task(team_dir: &Path, args: TaskAddArgs) -> Result<TeamTask> {
         },
         depends_on,
         result: None,
-        created_at: now.clone(),
-        updated_at: now,
+        created_at: created_at.clone(),
+        updated_at: created_at,
     };
     write_json_atomic(&task_path(team_dir, &id), &task)?;
     Ok(task)
@@ -16380,6 +16445,37 @@ fn start_team_job(team_dir: &Path, args: JobStartArgs) -> Result<()> {
     let remote_base = format!("/tmp/codex-team-jobs/{id}");
     let remote_log = format!("{remote_base}/job.log");
     let remote_exit = format!("{remote_base}/exit.code");
+    let created_at = now();
+    let mut job = TeamJob {
+        id: id.clone(),
+        node: node.id.clone(),
+        command: command.clone(),
+        cwd: cwd.clone(),
+        owner: Some(owner.clone()),
+        task_id: task_id.clone(),
+        status: TeamJobStatus::Running,
+        pid: None,
+        log_path: remote_log.clone(),
+        exit_path: remote_exit.clone(),
+        exit_code: None,
+        note: args.note,
+        artifacts: Vec::new(),
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    };
+    write_json_atomic(&job_path(team_dir, &id), &job)?;
+    append_event(
+        team_dir,
+        "job_registered_before_remote_start",
+        serde_json::json!({
+            "job": id,
+            "node": node.id,
+            "owner": owner.clone(),
+            "task": task_id.clone(),
+            "log": remote_log,
+            "exit": remote_exit,
+        }),
+    )?;
     let start_script = format!(
         "mkdir -p {base} && cd {cwd} && rm -f {exit_path} && (bash -lc {command} > {log} 2>&1; printf '%s' \"$?\" > {exit_path}) & echo $!",
         base = shell_quote(&remote_base),
@@ -16395,24 +16491,8 @@ fn start_team_job(team_dir: &Path, args: JobStartArgs) -> Result<()> {
         .unwrap_or_default()
         .trim()
         .to_string();
-    let now = now();
-    let job = TeamJob {
-        id: id.clone(),
-        node: node.id.clone(),
-        command,
-        cwd,
-        owner: Some(owner.clone()),
-        task_id: task_id.clone(),
-        status: TeamJobStatus::Running,
-        pid: if pid.is_empty() { None } else { Some(pid) },
-        log_path: remote_log,
-        exit_path: remote_exit,
-        exit_code: None,
-        note: args.note,
-        artifacts: Vec::new(),
-        created_at: now.clone(),
-        updated_at: now,
-    };
+    job.pid = if pid.is_empty() { None } else { Some(pid) };
+    job.updated_at = now();
     write_json_atomic(&job_path(team_dir, &id), &job)?;
     append_event(
         team_dir,
@@ -17128,7 +17208,10 @@ fn assign_unowned_tasks_round_robin(team_dir: &Path) -> Result<()> {
     let mut changed = false;
     let mut worker_idx = 0usize;
     for task in &mut tasks {
-        if task.owner.is_none() && task_is_ready(task, &snapshot) {
+        if task.owner.is_none()
+            && matches!(task.status, TaskStatus::Pending)
+            && task_is_ready(task, &snapshot)
+        {
             let member = workers[worker_idx % workers.len()];
             task.owner = Some(member.name.clone());
             task.updated_at = now();
@@ -20271,6 +20354,41 @@ method_package:
             read_jsonl::<MailMessage>(&mailbox_path(team_dir, "lead")).expect("lead mailbox");
         assert_eq!(lead_messages.len(), 1);
         assert!(lead_messages[0].message.contains("@quality claimed task 1"));
+    }
+
+    #[test]
+    fn round_robin_does_not_assign_unowned_ready_tasks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "1",
+            None,
+            TaskStatus::Ready,
+            Vec::new(),
+            Some("ready for claim"),
+        );
+
+        assign_unowned_tasks_round_robin(team_dir).expect("assign tasks");
+
+        let task = read_json::<TeamTask>(&task_path(team_dir, "1")).expect("task");
+        assert_eq!(task.owner, None);
+        assert_eq!(task.status, TaskStatus::Ready);
+    }
+
+    #[test]
+    fn round_robin_still_assigns_unowned_pending_tasks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(team_dir, "1", None, TaskStatus::Pending, Vec::new(), None);
+
+        assign_unowned_tasks_round_robin(team_dir).expect("assign tasks");
+
+        let task = read_json::<TeamTask>(&task_path(team_dir, "1")).expect("task");
+        assert_eq!(task.owner.as_deref(), Some("engineering"));
+        assert_eq!(task.status, TaskStatus::Pending);
     }
 
     #[test]
@@ -23672,6 +23790,56 @@ authoritative_predecessor:
 
         let remaining =
             recent_usage_limit_retry_remaining_with_auth(team_dir, "lead", Some(&auth_json))
+                .expect("cooldown check");
+
+        assert!(remaining.is_none());
+    }
+
+    #[test]
+    fn usage_limit_cooldown_is_ignored_after_node_device_auth_refresh() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let mut config = load_config(team_dir).expect("config");
+        config.members.push(TeamMember {
+            name: "docker_build".to_string(),
+            role: "ops".to_string(),
+            status: MemberStatus::Standby,
+            joined_at: now(),
+            thread_id: None,
+            workspace_path: None,
+            node: Some("saitou".to_string()),
+        });
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        let event_time = Utc::now() - chrono::Duration::hours(1);
+        let event = Event {
+            event: "app_server_member_usage_limited",
+            timestamp: event_time.to_rfc3339_opts(SecondsFormat::Secs, true),
+            team: "team-task-test",
+            data: serde_json::json!({
+                "member": "docker_build",
+                "node": "saitou",
+                "thread": "thread",
+                "turn": "turn",
+                "status": "Failed",
+                "error": "You've hit your usage limit. Visit settings or try again at May 12th, 2026 7:43 AM.",
+                "retry_after_sec": 7200,
+            }),
+        };
+        append_jsonl(&team_dir.join("events.jsonl"), &event).expect("usage event");
+        append_event(
+            team_dir,
+            "node_direct_device_auth_completed",
+            serde_json::json!({
+                "node": "saitou",
+                "url": "https://auth.openai.com/codex/device",
+                "log": "/tmp/node-saitou.log",
+            }),
+        )
+        .expect("auth event");
+
+        let remaining =
+            recent_usage_limit_retry_remaining_with_auth(team_dir, "docker_build", None)
                 .expect("cooldown check");
 
         assert!(remaining.is_none());
