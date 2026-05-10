@@ -9015,7 +9015,10 @@ fn review_task_local_artifact_issues(
             continue;
         }
         let path = PathBuf::from(&ownership.path);
-        match inspect_local_handoff_path(&path)? {
+        match inspect_local_handoff_path(
+            &path,
+            owner_recent_completion_checklist_message(team_dir, owner)?,
+        )? {
             Some(issue) => issues.push(ReviewArtifactIssue {
                 path: ownership.path.clone(),
                 issue,
@@ -9062,7 +9065,27 @@ fn ownership_path_is_probably_local(team_dir: &Path, raw: &str) -> bool {
     false
 }
 
-fn inspect_local_handoff_path(path: &Path) -> Result<Option<String>> {
+fn owner_recent_completion_checklist_message(team_dir: &Path, owner: &str) -> Result<bool> {
+    for mailbox_owner in [owner, "lead"] {
+        let messages = read_jsonl::<MailMessage>(&mailbox_path(team_dir, mailbox_owner))?;
+        if messages
+            .into_iter()
+            .rev()
+            .take(200)
+            .any(|message| {
+                message.from == owner && message.message.contains("TEAM_COMPLETION_CHECKLIST")
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn inspect_local_handoff_path(
+    path: &Path,
+    owner_has_completion_checklist_message: bool,
+) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(Some("path does not exist".to_string()));
     }
@@ -9090,7 +9113,7 @@ fn inspect_local_handoff_path(path: &Path) -> Result<Option<String>> {
     }
 
     let mut missing = Vec::new();
-    if !stats.has_checklist {
+    if !stats.has_checklist && !owner_has_completion_checklist_message {
         missing.push("TEAM_COMPLETION_CHECKLIST.md");
     }
     if !stats.has_manifest {
@@ -9099,8 +9122,8 @@ fn inspect_local_handoff_path(path: &Path) -> Result<Option<String>> {
     if !stats.has_report {
         missing.push("report markdown/text");
     }
-    if !stats.has_json {
-        missing.push("JSON ledger/report");
+    if !stats.has_structured {
+        missing.push("JSON/YAML ledger/report");
     }
     if missing.is_empty() {
         verify_handoff_manifests(&stats)
@@ -9115,7 +9138,7 @@ struct HandoffArtifactStats {
     has_checklist: bool,
     has_manifest: bool,
     has_report: bool,
-    has_json: bool,
+    has_structured: bool,
     manifest_paths: Vec<PathBuf>,
 }
 
@@ -9270,7 +9293,7 @@ fn collect_handoff_artifact_stats(
                     stats.manifest_paths.push(path.clone());
                 }
                 HandoffFileKind::Report => stats.has_report = true,
-                HandoffFileKind::Json => stats.has_json = true,
+                HandoffFileKind::Structured => stats.has_structured = true,
             }
         }
     }
@@ -9281,7 +9304,7 @@ enum HandoffFileKind {
     Checklist,
     Manifest,
     Report,
-    Json,
+    Structured,
 }
 
 fn handoff_file_kind(name: &str) -> Option<HandoffFileKind> {
@@ -9289,11 +9312,14 @@ fn handoff_file_kind(name: &str) -> Option<HandoffFileKind> {
     if lower == "team_completion_checklist.md" || lower.contains("completion_checklist") {
         return Some(HandoffFileKind::Checklist);
     }
-    if lower == "sha256_manifest.txt" {
+    if lower == "sha256_manifest.txt"
+        || lower.ends_with("_manifest.sha256")
+        || lower.ends_with("manifest.sha256")
+    {
         return Some(HandoffFileKind::Manifest);
     }
-    if lower.ends_with(".json") {
-        return Some(HandoffFileKind::Json);
+    if lower.ends_with(".json") || lower.ends_with(".yaml") || lower.ends_with(".yml") {
+        return Some(HandoffFileKind::Structured);
     }
     if lower.ends_with(".md") || lower.ends_with(".txt") {
         return Some(HandoffFileKind::Report);
@@ -10094,12 +10120,12 @@ fn maybe_send_department_heartbeats(
         };
         let message = if language.is_ja() {
             format!(
-                "Department heartbeat for @{name}: あなたの mission または担当 task が完全に完了していない場合、今すぐ進捗を報告してください。\n\n必須 department action:\n- lead と relevant consumers に簡潔な status update を送ってください。\n- artifact/log/config/job/request path がある場合は具体的に含めてください。\n- 他部署、MCP、remote host、Docker/container、long job、user input を待っている場合、正確な dependency と next action を書いてください。\n- 自部署または他部署の blocked/pending/review task について、gate が cleared に見える、または next owner が不明なら、自分で勝手に開始せず、evidence と suggested resume/reassign/review action を含む `LEAD_PROPOSAL:` を lead に送ってください。\n- 前回 heartbeat から進捗がない場合、黙って待たず lead に介入を求めてください。\n- 完了している場合は TEAM_COMPLETION_CHECKLIST を提示し、follow-up question に答えられる状態で残ってください。\n\nOwned open tasks:\n{owned_tasks}",
+                "Department heartbeat for @{name}: あなたの mission または担当 task が完全に完了していない場合、今すぐ進捗を報告してください。\n\n必須 department action:\n- lead と relevant consumers に簡潔な status update を送ってください。\n- artifact/log/config/job/request path がある場合は具体的に含めてください。\n- 実行中の重い command、download、build、render、training、API/tool 待ち、remote/container 内処理などがある場合、それが team job または team wait に登録済みか明記してください。未登録なら今すぐ登録するか、登録できない具体的理由と代替 progress artifact path を lead に報告してください。\n- Docker/container node の部署は、成果がまだ未完成でも runtime workspace 内に status/progress artifact を作り、command transcript、manifest、metrics、visualization の予定 path を報告してください。\n- manifest や checksum を持つ package を作った場合、最後の追記・script修正・report/status/progress更新後に再度 `sha256sum -c` を実行し、fresh rc と現 disk hash を報告してください。live transcript、manifest check log、handoff log、progress/status file、helper/finalizer script を hash 後に追記または修正した可能性があるなら、完了扱いにせず再生成してください。\n- 他部署、MCP、remote host、Docker/container、long job、user input を待っている場合、正確な dependency と next action を書いてください。\n- 自部署または他部署の blocked/pending/review task について、gate が cleared に見える、または next owner が不明なら、自分で勝手に開始せず、evidence と suggested resume/reassign/review action を含む `LEAD_PROPOSAL:` を lead に送ってください。\n- 前回 heartbeat から進捗がない場合、黙って待たず lead に介入を求めてください。\n- 完了している場合は TEAM_COMPLETION_CHECKLIST を提示し、follow-up question に答えられる状態で残ってください。\n\nOwned open tasks:\n{owned_tasks}",
                 name = member.name
             )
         } else {
             format!(
-                "Department heartbeat for @{name}: if your mission or any owned task is not fully complete, report progress now.\n\nRequired department action:\n- Send lead and relevant consumers a concise status update.\n- Include concrete artifact/log/config/job/request paths when they exist.\n- If waiting on another department, MCP, remote host, Docker/container, long job, or user input, state the exact dependency and next action.\n- If you notice any blocked/pending/review task, including another department's task, whose gate appears cleared or whose next owner is unclear, do not start it yourself; send lead a `LEAD_PROPOSAL:` message with evidence and the suggested resume/reassign/review action.\n- If you have made no progress since the previous heartbeat, ask lead for intervention instead of silently waiting.\n- If complete, provide TEAM_COMPLETION_CHECKLIST and remain available for follow-up questions.\n\nOwned open tasks:\n{owned_tasks}",
+                "Department heartbeat for @{name}: if your mission or any owned task is not fully complete, report progress now.\n\nRequired department action:\n- Send lead and relevant consumers a concise status update.\n- Include concrete artifact/log/config/job/request paths when they exist.\n- If a heavy command, download, build, render, training run, API/tool wait, remote/container process, or other long operation is running, state whether it is registered as a team job or team wait. If it is not registered, register it now or report the exact reason plus a fallback progress artifact path to lead.\n- Docker/container-node departments must create a status/progress artifact in the runtime workspace even before final output exists, and report planned command transcript, manifest, metrics, and visualization paths.\n- If you produced a manifest or checksum package, rerun `sha256sum -c` after the final append, script edit, report/status/progress update and report the fresh rc plus current on-disk hashes. If a live transcript, manifest check log, handoff log, progress/status file, or helper/finalizer script may have been changed after hashing, do not complete; regenerate the package.\n- If waiting on another department, MCP, remote host, Docker/container, long job, or user input, state the exact dependency and next action.\n- If you notice any blocked/pending/review task, including another department's task, whose gate appears cleared or whose next owner is unclear, do not start it yourself; send lead a `LEAD_PROPOSAL:` message with evidence and the suggested resume/reassign/review action.\n- If you have made no progress since the previous heartbeat, ask lead for intervention instead of silently waiting.\n- If complete, provide TEAM_COMPLETION_CHECKLIST and remain available for follow-up questions.\n\nOwned open tasks:\n{owned_tasks}",
                 name = member.name
             )
         };
@@ -15117,7 +15143,7 @@ fn ensure_container_node_departments(team_dir: &Path) -> Result<()> {
             .unwrap_or("the registered container");
         let cwd_text = node.cwd.as_deref().unwrap_or("/workspace");
         let mission = format!(
-            "Run as the container-internal department for node `{node}`{host_text}. You are expected to execute from inside Docker container `{container}` at `{cwd}` through the node app-server, not merely from the host. Take over the main runtime work that this container was created for: install missing tools inside the container, run the sample/application/model/experiment, render or test outputs, debug container-local failures, and produce container-local verification evidence. Verify mounts, ports, GPUs, package/tool availability, and run container-local smoke checks before heavy work. Coordinate with the host/SSH department only for image rebuilds, container replacement, mount/port/GPU fixes, or host-side resource issues. Report results and blockers to lead and other departments, and stay available for follow-up container debugging.",
+            "Run as the container-internal department for node `{node}`{host_text}. You are expected to execute from inside Docker container `{container}` at `{cwd}` through the node app-server, not merely from the host. Take over the main runtime work that this container was created for: install missing tools inside the container, run the sample/application/model/experiment, render or test outputs, debug container-local failures, and produce container-local verification evidence. At the start of your turn, create a concrete runtime workspace such as `{cwd}/runtime_container` and immediately write an initial status/progress artifact there, even before the heavy work finishes. Verify mounts, ports, GPUs, package/tool availability, and run container-local smoke checks before heavy work. Any material command whose exit status matters must leave a command transcript with exact command, cwd, container identity, timestamps when practical, and `rc=`/`exit=`; any long or asynchronous work must be tracked with `team job` or `team wait` instead of being hidden inside an untracked shell or only described in chat. Do not include a live transcript, manifest check log, handoff log, progress file, or helper/finalizer script in a final manifest if you will append to or patch it afterward; either close it permanently before hashing or exclude it and hash a stable final copy. If repairing the manifest changes a script/report/log that is listed in the manifest, regenerate and recheck the manifest again after that file is stable. Immediately before final handoff, rerun manifest verification and report the fresh rc and current manifest/log hashes from disk. Coordinate with the host/SSH department only for image rebuilds, container replacement, mount/port/GPU fixes, or host-side resource issues. Report results and blockers to lead and other departments, and stay available for follow-up container debugging.",
             node = node.id,
             container = container_text,
             cwd = cwd_text,
@@ -17508,9 +17534,17 @@ fn task_completion_missing_required_local_outputs(
     if paths.is_empty() {
         return Ok(None);
     }
+    let owner_has_completion_checklist_message = task
+        .owner
+        .as_deref()
+        .map(|owner| owner_recent_completion_checklist_message(team_dir, owner))
+        .transpose()?
+        .unwrap_or(false);
     let mut issues = Vec::new();
     for path in paths {
-        if let Some(issue) = inspect_local_handoff_path(&path)? {
+        if let Some(issue) =
+            inspect_local_handoff_path(&path, owner_has_completion_checklist_message)?
+        {
             issues.push(format!("{}: {}", path.display(), issue));
         }
     }
@@ -18034,7 +18068,7 @@ Evidence validation policy:
 - For guarded tasks with an early fail-closed path, the method package must provide a seed-local schema-valid fail-closed writer or template outside the protected root, plus an exact allowed command for invoking it. Runtime must use that writer/template for pre-guard failures instead of inventing a legacy or best-effort `outcome.json`. If no schema-valid early fail-closed writer/template is available before protected reads are legal, block and ask lead/method to repair the contract before runtime proceeds.
 - For any runtime, evaluation, render, build, install, bootstrap, or guarded command that is material to the evidence, write a frozen command transcript before final manifest generation that includes the exact command, cwd, node/container identity when non-local, start/end timestamps when practical, and an explicit shell exit code such as `rc=0` or `exit=23`. A mailbox handoff, event ledger, or summarized outcome alone is not sufficient as clean command-exit evidence. If the command ran as a tracked team job, cite the job id/log path and include the observed exit code in the report/checklist.
 - Write hash manifests as one `sha256  path` record per real file. Do not build a single shell variable containing newline-separated paths and pass it as one filename. Prefer `find ... -print0 | sort -z | xargs -0 sha256sum` or an explicit array loop.
-- Exclude volatile or self-referential files from final producer manifests unless you can guarantee they will not change after hashing. Common volatile examples include the active command transcript, live job log, manifest verification log, and the manifest file being generated. If you include them, write the transcript/log first, close it, generate the manifest last, and do not append after that point.
+- Exclude volatile, self-referential, or still-being-edited files from final producer manifests unless you can guarantee they will not change after hashing. Common volatile examples include the active command transcript, live job log, manifest verification log, handoff/status/progress logs, the manifest file being generated, and any helper/finalizer script that you may edit while repairing or checking the manifest. If you include any such file, write it first, close it, generate the manifest after the last edit, and do not append or patch it after that point. If a manifest repair changes a helper script, regenerate and recheck the manifest again after that script is stable.
 - Before announcing a producer handoff as complete, run `sha256sum -c` from the intended manifest root and include the exact command/root plus rc in `TEAM_COMPLETION_CHECKLIST`. If this fails, keep the task in progress or blocked and report the exact mismatch instead of handing off to validation.
 - Immediately before the final handoff message, re-read the current manifest files from disk and compute/report the manifest file hashes from those files. Do not rely on hashes remembered from an earlier script run, draft message, previous handoff attempt, or pre-repair state. If the handoff text hash differs from the current on-disk manifest hash, correct the message before sending; a stale handoff hash is still a WARN-worthy provenance defect even when `sha256sum -c` passes.
 - When validating manifests, reports, metrics, renders, or schema handoffs, do not assume the working directory. First inspect whether paths inside the manifest are absolute, workspace-relative, package-root-relative, or manifest-directory-relative. Run `sha256sum -c` from the correct base directory, or record multiple attempted bases if the provenance is ambiguous.
@@ -22785,6 +22819,65 @@ authoritative_predecessor:
                 .iter()
                 .any(|message| message.message.contains("Review handoff watchdog"))
         );
+    }
+
+    #[test]
+    fn completion_blocker_accepts_named_manifest_and_checklist_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("evaluation");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        fs::write(
+            artifact_dir.join("claim_evidence_matrix.md"),
+            "# claim matrix\n",
+        )
+        .expect("matrix");
+        fs::write(artifact_dir.join("evaluation_status.md"), "# status\n").expect("status");
+        fs::write(artifact_dir.join("evaluation_plan.yaml"), "version: 1\n").expect("yaml");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "claim_evidence_matrix.md",
+                "evaluation_status.md",
+                "evaluation_plan.yaml",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::write(artifact_dir.join("evaluation_manifest.sha256"), manifest.stdout)
+            .expect("manifest");
+        send_team_message_to_dir(
+            team_dir,
+            "quality",
+            "lead",
+            "Final handoff\n\nTEAM_COMPLETION_CHECKLIST:\n- artifacts: evaluation\n- verification: sha256sum -c evaluation_manifest.sha256 rc=0",
+        )
+        .expect("message");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "quality".to_string(),
+                note: "Task44 evaluation handoff".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "44",
+            Some("quality"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("handoff complete"),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "44")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
     }
 
     #[test]
