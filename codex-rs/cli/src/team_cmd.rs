@@ -7596,10 +7596,21 @@ fn member_turn_completion_checklist_issue(
             "messages_sent is empty/unknown; final handoff message was not evidenced".to_string(),
         );
     }
+    if checklist_value_has_unresolved_marker(messages_sent.as_deref()) {
+        return Some(
+            "messages_sent still contains pending/unresolved language; final handoff message was not completed".to_string(),
+        );
+    }
     let consumers_notified = checklist_field_value(&tail, "consumers_notified:");
     if checklist_value_is_empty_or_unknown(consumers_notified.as_deref()) {
         return Some(
             "consumers_notified is empty/unknown; artifact consumers were not evidenced"
+                .to_string(),
+        );
+    }
+    if checklist_value_has_unresolved_marker(consumers_notified.as_deref()) {
+        return Some(
+            "consumers_notified still contains pending/unresolved language; artifact consumers were not actually notified"
                 .to_string(),
         );
     }
@@ -7637,11 +7648,16 @@ fn member_turn_active_task_completion_issue(
             "artifacts is empty/unknown; final handoff artifacts were not evidenced".to_string(),
         ));
     }
-    if checklist_value_is_empty_or_unknown(
-        checklist_field_value(checklist, "verification:").as_deref(),
-    ) {
+    let verification = checklist_field_value(checklist, "verification:");
+    if checklist_value_is_empty_or_unknown(verification.as_deref()) {
         return Ok(Some(
             "verification is empty/unknown; final handoff verification was not evidenced"
+                .to_string(),
+        ));
+    }
+    if checklist_value_has_unresolved_marker(verification.as_deref()) {
+        return Ok(Some(
+            "verification still contains pending/unresolved language; final verification is not complete"
                 .to_string(),
         ));
     }
@@ -7704,6 +7720,31 @@ fn checklist_value_is_empty_or_unknown(value: Option<&str>) -> bool {
     ) || ["none", "n/a", "na", "unknown", "missing", "tbd", "not sure"]
         .iter()
         .any(|prefix| value.starts_with(prefix))
+}
+
+fn checklist_value_has_unresolved_marker(value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let value = value.to_ascii_lowercase();
+    [
+        "pending",
+        "not yet",
+        "not sent",
+        "not notified",
+        "to be sent",
+        "to be generated",
+        "after manifest generation",
+        "awaiting",
+        "未送信",
+        "未通知",
+        "未完了",
+        "未生成",
+        "保留",
+        "待ち",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
 }
 
 fn member_has_active_tasks(team_dir: &Path, member_name: &str) -> Result<bool> {
@@ -9087,6 +9128,11 @@ fn message_has_substantive_completion_checklist(message: &str) -> bool {
         || lower.contains("verification: none")
         || lower.contains("side-channel のため")
         || lower.contains("side-channel")
+        || lower.contains("pending")
+        || lower.contains("not yet")
+        || lower.contains("未送信")
+        || lower.contains("未通知")
+        || lower.contains("未完了")
     {
         return false;
     }
@@ -9137,7 +9183,11 @@ fn inspect_local_handoff_path(
         missing.push("JSON/YAML ledger/report");
     }
     if missing.is_empty() {
-        verify_handoff_manifests(&stats)
+        if let Some(issue) = inspect_handoff_checklists(&stats)? {
+            Ok(Some(issue))
+        } else {
+            verify_handoff_manifests(&stats)
+        }
     } else {
         Ok(Some(format!("missing {}", missing.join(", "))))
     }
@@ -9150,7 +9200,46 @@ struct HandoffArtifactStats {
     has_manifest: bool,
     has_report: bool,
     has_structured: bool,
+    checklist_paths: Vec<PathBuf>,
     manifest_paths: Vec<PathBuf>,
+}
+
+fn inspect_handoff_checklists(stats: &HandoffArtifactStats) -> Result<Option<String>> {
+    for checklist_path in &stats.checklist_paths {
+        let content = fs::read_to_string(checklist_path)
+            .with_context(|| format!("read {}", checklist_path.display()))?;
+        let lower = content.to_ascii_lowercase();
+        if !lower.contains("team_completion_checklist") {
+            return Ok(Some(format!(
+                "{} does not contain TEAM_COMPLETION_CHECKLIST",
+                checklist_path.display()
+            )));
+        }
+        for field in [
+            "artifacts:",
+            "verification:",
+            "messages_sent:",
+            "consumers_notified:",
+            "blockers_or_limits:",
+        ] {
+            let value = checklist_field_value(&lower, field);
+            if field != "blockers_or_limits:"
+                && checklist_value_is_empty_or_unknown(value.as_deref())
+            {
+                return Ok(Some(format!(
+                    "{} has empty/unknown `{field}` field",
+                    checklist_path.display()
+                )));
+            }
+            if checklist_value_has_unresolved_marker(value.as_deref()) {
+                return Ok(Some(format!(
+                    "{} has pending/unresolved `{field}` field",
+                    checklist_path.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn verify_handoff_manifests(stats: &HandoffArtifactStats) -> Result<Option<String>> {
@@ -9337,7 +9426,10 @@ fn collect_handoff_artifact_stats(
             && let Some(kind) = handoff_file_kind(name)
         {
             match kind {
-                HandoffFileKind::Checklist => stats.has_checklist = true,
+                HandoffFileKind::Checklist => {
+                    stats.has_checklist = true;
+                    stats.checklist_paths.push(path.clone());
+                }
                 HandoffFileKind::Manifest => {
                     stats.has_manifest = true;
                     stats.manifest_paths.push(path.clone());
@@ -22922,7 +23014,7 @@ authoritative_predecessor:
         fs::write(artifact_dir.join("cycle8_audit.json"), "{}\n").expect("json");
         fs::write(
             artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
-            "- artifacts: ok\n",
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: cycle8\n- verification: sha256sum -c sha256_manifest.txt rc=0\n- messages_sent: lead and quality\n- consumers_notified: lead and quality\n- blockers_or_limits: none\n",
         )
         .expect("checklist");
         let manifest = Command::new("sha256sum")
@@ -23067,7 +23159,7 @@ authoritative_predecessor:
         .expect("matrix");
         fs::write(
             artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
-            "- artifacts: cycle1_review\n- verification: sha256sum -c manifest/checksums.sha256 rc=0\n",
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: cycle1_review\n- verification: sha256sum -c manifest/checksums.sha256 rc=0\n- messages_sent: lead and quality\n- consumers_notified: lead and quality\n- blockers_or_limits: none\n",
         )
         .expect("checklist");
         fs::write(
@@ -23117,6 +23209,58 @@ authoritative_predecessor:
             .expect("completion blocker");
 
         assert_eq!(issue, None);
+    }
+
+    #[test]
+    fn completion_blocker_rejects_pending_checklist_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("audit").join("phase0_second_pass");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        fs::write(artifact_dir.join("audit_report.md"), "# report\n").expect("report");
+        fs::write(artifact_dir.join("findings.json"), "{}\n").expect("json");
+        fs::write(
+            artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: audit/phase0_second_pass\n- verification: output manifest check pending until manifest generation\n- messages_sent: final handoff to lead/evaluation pending until manifest generation\n- consumers_notified: pending final handoff\n- blockers_or_limits: none\n",
+        )
+        .expect("checklist");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "audit_report.md",
+                "findings.json",
+                "TEAM_COMPLETION_CHECKLIST.md",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::write(artifact_dir.join("manifest.sha256"), manifest.stdout).expect("manifest");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "quality".to_string(),
+                note: "Task47 phase0 second pass final audit package".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "47",
+            Some("quality"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("handoff complete"),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "47")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker")
+            .expect("pending checklist should block completion");
+
+        assert!(issue.contains("pending/unresolved"));
     }
 
     #[test]
@@ -23198,7 +23342,7 @@ authoritative_predecessor:
         fs::write(artifact_dir.join("cycle10_audit.json"), "{}\n").expect("json");
         fs::write(
             artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
-            "- artifacts: ok\n",
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: cycle10_final\n- verification: sha256sum -c sha256_manifest.txt rc=0\n- messages_sent: lead and quality\n- consumers_notified: lead and quality\n- blockers_or_limits: none\n",
         )
         .expect("checklist");
         let manifest = Command::new("sha256sum")
@@ -23285,7 +23429,7 @@ authoritative_predecessor:
         fs::write(artifact_dir.join("cycle8_audit.json"), "{}\n").expect("json");
         fs::write(
             artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
-            "- artifacts: ok\n",
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: cycle8\n- verification: sha256sum -c sha256_manifest.txt rc=0\n- messages_sent: lead and quality\n- consumers_notified: lead and quality\n- blockers_or_limits: none\n",
         )
         .expect("checklist");
         fs::write(
@@ -23350,7 +23494,7 @@ authoritative_predecessor:
         fs::write(artifact_dir.join("outcome.json"), "{}\n").expect("json");
         fs::write(
             artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
-            "- artifacts: ok\n",
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: cycle12\n- verification: sha256sum -c sha256_manifest.txt rc=0\n- messages_sent: lead and engineering\n- consumers_notified: lead and engineering\n- blockers_or_limits: none\n",
         )
         .expect("checklist");
         fs::write(
