@@ -9068,14 +9068,9 @@ fn ownership_path_is_probably_local(team_dir: &Path, raw: &str) -> bool {
 fn owner_recent_completion_checklist_message(team_dir: &Path, owner: &str) -> Result<bool> {
     for mailbox_owner in [owner, "lead"] {
         let messages = read_jsonl::<MailMessage>(&mailbox_path(team_dir, mailbox_owner))?;
-        if messages
-            .into_iter()
-            .rev()
-            .take(200)
-            .any(|message| {
-                message.from == owner && message.message.contains("TEAM_COMPLETION_CHECKLIST")
-            })
-        {
+        if messages.into_iter().rev().take(200).any(|message| {
+            message.from == owner && message.message.contains("TEAM_COMPLETION_CHECKLIST")
+        }) {
             return Ok(true);
         }
     }
@@ -9351,7 +9346,13 @@ fn maybe_send_lead_autonomy_tick(
         .iter()
         .filter(|wait| wait.status.is_open())
         .collect::<Vec<_>>();
-    if open_tasks.is_empty() && open_waits.is_empty() && active.values().all(|run| run.completed) {
+    let next_action_lines = collect_recent_next_action_signals(team_dir, 8)?;
+    let goal_requests_continuation = team_goal_requests_continuation(&config.goal);
+    if open_tasks.is_empty()
+        && open_waits.is_empty()
+        && active.values().all(|run| run.completed)
+        && (!goal_requests_continuation || next_action_lines.is_empty())
+    {
         return Ok(());
     }
     if let Some(lead_run) = active.get(&config.lead)
@@ -9437,9 +9438,25 @@ fn maybe_send_lead_autonomy_tick(
     } else {
         proposal_lines.join("\n")
     };
+    let next_action_block = if next_action_lines.is_empty() {
+        "- none".to_string()
+    } else {
+        next_action_lines.join("\n")
+    };
+    let continuation_policy = if goal_requests_continuation {
+        if language.is_ja() {
+            "この team の goal は継続・反復を明示しています。open task/open wait がなく、監査・評価・handoff に recommended next action / next cycle がある場合、idle とみなさず、lead が次サイクルの task/owner/wait/job を作るか、ユーザー入力が必要な blocker を明示してください。".to_string()
+        } else {
+            "This team's goal explicitly requests continuation/iteration. If there are no open tasks or waits but audit/evaluation/handoff artifacts contain recommended next actions or a next cycle, do not treat the team as idle; lead must either create the next cycle tasks/owners/waits/jobs or record the concrete blocker requiring user input.".to_string()
+        }
+    } else if language.is_ja() {
+        "この team の goal は明示的な継続 loop を要求していません。next action signal は参考情報として扱い、勝手に新しい改善 loop を作らず、必要ならユーザー入力待ちを明示してください。".to_string()
+    } else {
+        "This team's goal does not explicitly request a continuation loop. Treat next-action signals as advisory context; do not invent a new improvement loop unless the user's instructions require it, and record user-input wait when needed.".to_string()
+    };
     let message = if language.is_ja() {
         format!(
-            "Lead autonomy tick: あなたはこの team の意思決定オーケストレーターです。team runtime は状態を報告し、この tick を届けているだけです。runtime があなたの代わりにオーケストレーション判断をしているわけではありません。\n\n必須の lead action:\n- 未完了 task、open wait、部署 mailbox、live message、job、artifact を確認してください。\n- ユーザーの現在の task に向けて協調してください。必要なら部署を steer / resume / reassign し、具体的な artifact、blocker、handoff を求めてください。\n- 部署が完了条件を持つ待機対象を始めたら、種類に決め打ちせず `team wait add` で condition / owner / task / progress / evidence を登録させてください。PID付きコマンドは `team job`、PIDを持たない外部待機や非同期依存は `team wait` で追跡してください。\n- open wait がある task は完了扱いにしないでください。wait が completed/failed/blocked になったら owner を resume し、結果を見て handoff、次 action、または blocker を出させてください。\n- teammate が `LEAD_PROPOSAL:` を送っているなら、resume / reassign / review action として明示的に採用するか、具体的な理由付きで却下してください。\n- action が必要な task がなければ、team が idle のままでよい理由、または user input 待ちである理由を明示的に記録してください。active instruction や domain skill が明示的に要求しない限り、新しい改善 loop を勝手に作らないでください。\n\nOpen tasks:\n{}{omitted_line}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nCurrent app-server turns:\n{}",
+            "Lead autonomy tick: あなたはこの team の意思決定オーケストレーターです。team runtime は状態を報告し、この tick を届けているだけです。runtime があなたの代わりにオーケストレーション判断をしているわけではありません。\n\n必須の lead action:\n- 未完了 task、open wait、部署 mailbox、live message、job、artifact を確認してください。\n- ユーザーの現在の task に向けて協調してください。必要なら部署を steer / resume / reassign し、具体的な artifact、blocker、handoff を求めてください。\n- 部署が完了条件を持つ待機対象を始めたら、種類に決め打ちせず `team wait add` で condition / owner / task / progress / evidence を登録させてください。PID付きコマンドは `team job`、PIDを持たない外部待機や非同期依存は `team wait` で追跡してください。\n- open wait がある task は完了扱いにしないでください。wait が completed/failed/blocked になったら owner を resume し、結果を見て handoff、次 action、または blocker を出させてください。\n- teammate が `LEAD_PROPOSAL:` を送っているなら、resume / reassign / review action として明示的に採用するか、具体的な理由付きで却下してください。\n- {continuation_policy}\n- action が必要な task がなければ、team が idle のままでよい理由、または user input 待ちである理由を明示的に記録してください。active instruction や domain skill が明示的に要求しない限り、新しい改善 loop を勝手に作らないでください。\n\nOpen tasks:\n{}{omitted_line}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nCurrent app-server turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -9458,7 +9475,7 @@ fn maybe_send_lead_autonomy_tick(
         )
     } else {
         format!(
-            "Lead autonomy tick: you are the decision-making orchestrator for this team. The team runtime is only reporting state and delivering this tick; it is not making orchestration decisions for you.\n\nRequired lead action:\n- Inspect unfinished tasks, open waits, department mailboxes, live messages, jobs, and artifacts.\n- Coordinate toward the user's current task: steer, resume, reassign, or ask departments for concrete artifacts, blockers, or handoffs.\n- When a department starts a waitable item with a completion condition, do not categorize it narrowly; register it with `team wait add` including condition / owner / task / progress / evidence. Use `team job` for PID-backed commands and `team wait` for PID-less external waits or async dependencies.\n- Do not treat a task with an open wait as complete. When a wait becomes completed/failed/blocked, resume the owner to inspect the result and publish a handoff, next action, or blocker.\n- If a teammate sent `LEAD_PROPOSAL:`, explicitly accept it with a resume/reassign/review action or reject it with the concrete reason.\n- If no task needs action, explicitly record why the team should remain idle or wait for user input. Do not invent a new improvement loop unless the active instructions or a domain skill explicitly require one.\n\nOpen tasks:\n{}{omitted_line}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nCurrent app-server turns:\n{}",
+            "Lead autonomy tick: you are the decision-making orchestrator for this team. The team runtime is only reporting state and delivering this tick; it is not making orchestration decisions for you.\n\nRequired lead action:\n- Inspect unfinished tasks, open waits, department mailboxes, live messages, jobs, and artifacts.\n- Coordinate toward the user's current task: steer, resume, reassign, or ask departments for concrete artifacts, blockers, or handoffs.\n- When a department starts a waitable item with a completion condition, do not categorize it narrowly; register it with `team wait add` including condition / owner / task / progress / evidence. Use `team job` for PID-backed commands and `team wait` for PID-less external waits or async dependencies.\n- Do not treat a task with an open wait as complete. When a wait becomes completed/failed/blocked, resume the owner to inspect the result and publish a handoff, next action, or blocker.\n- If a teammate sent `LEAD_PROPOSAL:`, explicitly accept it with a resume/reassign/review action or reject it with the concrete reason.\n- {continuation_policy}\n- If no task needs action, explicitly record why the team should remain idle or wait for user input. Do not invent a new improvement loop unless the active instructions or a domain skill explicitly require one.\n\nOpen tasks:\n{}{omitted_line}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nCurrent app-server turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -9484,10 +9501,32 @@ fn maybe_send_lead_autonomy_tick(
             "lead": config.lead,
             "open_tasks": open_tasks.len(),
             "open_waits": open_waits.len(),
+            "next_action_signals": next_action_lines.len(),
+            "goal_requests_continuation": goal_requests_continuation,
             "active_turns": active.values().filter(|run| !run.completed).count(),
         }),
     )?;
     Ok(())
+}
+
+fn team_goal_requests_continuation(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    [
+        "keep iterating",
+        "continue until",
+        "continue the autoresearch loop",
+        "keep cycling",
+        "next cycle",
+        "rerun",
+        "繰り返",
+        "継続",
+        "改善サイクル",
+        "次サイクル",
+        "永遠",
+        "ずっと",
+    ]
+    .iter()
+    .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
 }
 
 fn collect_recent_lead_proposals(team_dir: &Path, lead: &str, limit: usize) -> Result<Vec<String>> {
@@ -9618,7 +9657,6 @@ fn format_lead_proposal_summary(message: &MailMessage) -> String {
     )
 }
 
-#[cfg(test)]
 fn collect_recent_next_action_signals(team_dir: &Path, limit: usize) -> Result<Vec<String>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -9673,7 +9711,6 @@ fn collect_recent_next_action_signals(team_dir: &Path, limit: usize) -> Result<V
     Ok(signals)
 }
 
-#[cfg(test)]
 fn collect_next_action_candidate_files(dir: &Path, depth: usize, candidates: &mut Vec<PathBuf>) {
     if depth > 3 || candidates.len() > 200 {
         return;
@@ -9697,7 +9734,6 @@ fn collect_next_action_candidate_files(dir: &Path, depth: usize, candidates: &mu
     }
 }
 
-#[cfg(test)]
 fn is_next_action_candidate_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -9728,7 +9764,6 @@ fn is_next_action_candidate_file(path: &Path) -> bool {
     has_report_name && has_supported_extension
 }
 
-#[cfg(test)]
 fn extract_next_action_lines(path: &Path) -> Result<Vec<String>> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("failed to stat next-action candidate {}", path.display()))?;
@@ -9761,7 +9796,6 @@ fn extract_next_action_lines(path: &Path) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-#[cfg(test)]
 fn line_mentions_next_action(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     [
@@ -22845,8 +22879,11 @@ authoritative_predecessor:
             .output()
             .expect("sha256sum");
         assert!(manifest.status.success());
-        fs::write(artifact_dir.join("evaluation_manifest.sha256"), manifest.stdout)
-            .expect("manifest");
+        fs::write(
+            artifact_dir.join("evaluation_manifest.sha256"),
+            manifest.stdout,
+        )
+        .expect("manifest");
         send_team_message_to_dir(
             team_dir,
             "quality",
@@ -23672,6 +23709,74 @@ authoritative_predecessor:
             collect_recent_lead_proposals_for_task(team_dir, "lead", "1", 5).expect("proposals");
         assert_eq!(task_proposals.len(), 1);
         assert!(task_proposals[0].contains("@research"));
+    }
+
+    #[test]
+    fn lead_autonomy_tick_surfaces_next_action_when_goal_continues() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let audit_dir = team_dir.join("audit");
+        fs::create_dir_all(&audit_dir).expect("audit dir");
+        fs::write(
+            audit_dir.join("cycle0_audit.md"),
+            "Verdict: PASS_WITH_WARNINGS\n\nRecommended next action: launch cycle1 with a public articulated-object sequence and frozen evaluation gates.\n",
+        )
+        .expect("audit");
+        let created = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-continuation".to_string(),
+            goal: "Keep iterating: research -> docker -> runtime -> audit -> next cycle until blocker.".to_string(),
+            lead: "lead".to_string(),
+            members: vec![TeamMember {
+                name: "lead".to_string(),
+                role: "lead".to_string(),
+                status: MemberStatus::Running,
+                joined_at: created.clone(),
+                thread_id: None,
+                workspace_path: None,
+                node: None,
+            }],
+            language: None,
+            created_at: created.clone(),
+            updated_at: created,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: audit_dir.display().to_string(),
+                owner: "audit".to_string(),
+                note: "cycle0 final audit".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+
+        let active = HashMap::new();
+        let mut last_tick = Instant::now() - Duration::from_secs(181);
+        maybe_send_lead_autonomy_tick(
+            team_dir,
+            &config,
+            &active,
+            &mut last_tick,
+            Duration::from_secs(180),
+            TeamPromptLanguage::En,
+        )
+        .expect("lead tick");
+
+        let lead_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "lead")).expect("lead mailbox");
+        let tick = lead_messages.last().expect("tick message");
+        assert!(tick.message.contains("Recent artifact next-action signals"));
+        assert!(tick.message.contains("public articulated-object sequence"));
+        assert!(
+            tick.message
+                .contains("explicitly requests continuation/iteration")
+        );
+        assert!(tick.message.contains("Open tasks:\n- none"));
     }
 
     #[test]
