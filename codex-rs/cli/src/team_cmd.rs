@@ -9069,12 +9069,28 @@ fn owner_recent_completion_checklist_message(team_dir: &Path, owner: &str) -> Re
     for mailbox_owner in [owner, "lead"] {
         let messages = read_jsonl::<MailMessage>(&mailbox_path(team_dir, mailbox_owner))?;
         if messages.into_iter().rev().take(200).any(|message| {
-            message.from == owner && message.message.contains("TEAM_COMPLETION_CHECKLIST")
+            message.from == owner && message_has_substantive_completion_checklist(&message.message)
         }) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn message_has_substantive_completion_checklist(message: &str) -> bool {
+    if !message.contains("TEAM_COMPLETION_CHECKLIST") {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("artifacts: none")
+        || lower.contains("artifacts: なし")
+        || lower.contains("verification: none")
+        || lower.contains("side-channel のため")
+        || lower.contains("side-channel")
+    {
+        return false;
+    }
+    lower.contains("artifacts:") && lower.contains("verification:")
 }
 
 fn inspect_local_handoff_path(
@@ -18590,7 +18606,7 @@ Use the team CLI if you need context:
 
 If the follow-up asks for work that needs missing normal tools, install them when reasonable before weakening implementation or verification. Docker root installs, user-local installs, and passwordless sudo (`sudo -n`) are allowed; do not wait for an interactive sudo password.
 
-If the follow-up exposes an uncertainty, missing input, weak result, long wait, or cross-department decision, ask the relevant department for judgment instead of answering only to lead. If work cannot continue until an observable condition becomes true, register/update a `team wait` with the exact condition, current progress/request/log/checkpoint, task, and evidence path when available. If the follow-up completes active work, include TEAM_COMPLETION_CHECKLIST in your final response with artifacts, verification, messages_sent, consumers_notified, and blockers_or_limits.
+If the follow-up exposes an uncertainty, missing input, weak result, long wait, or cross-department decision, ask the relevant department for judgment instead of answering only to lead. If work cannot continue until an observable condition becomes true, register/update a `team wait` with the exact condition, current progress/request/log/checkpoint, task, and evidence path when available. Include TEAM_COMPLETION_CHECKLIST only when this follow-up genuinely completes the owned task or a real handoff with concrete artifacts and verification. Do not include TEAM_COMPLETION_CHECKLIST for acknowledgement, steering, side-channel status, or any response whose artifacts would be `none`.
 If this is an idle outreach message and you need help, reply with the exact blocker/question and what kind of help would unblock you. If you do not need help, no reply is required.
 
 If lead or the task table exposes an unassigned `ready` task that clearly matches your department mission, you may claim it with `team task claim`, then message lead with the reason and intended artifacts. Otherwise do not start unrelated work from a follow-up.
@@ -22915,6 +22931,72 @@ authoritative_predecessor:
             .expect("completion blocker");
 
         assert_eq!(issue, None);
+    }
+
+    #[test]
+    fn completion_blocker_ignores_side_channel_empty_checklist_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("evaluation");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        fs::write(
+            artifact_dir.join("claim_evidence_matrix.md"),
+            "# claim matrix\n",
+        )
+        .expect("matrix");
+        fs::write(artifact_dir.join("evaluation_status.md"), "# status\n").expect("status");
+        fs::write(artifact_dir.join("evaluation_plan.yaml"), "version: 1\n").expect("yaml");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "claim_evidence_matrix.md",
+                "evaluation_status.md",
+                "evaluation_plan.yaml",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::write(
+            artifact_dir.join("evaluation_manifest.sha256"),
+            manifest.stdout,
+        )
+        .expect("manifest");
+        send_team_message_to_dir(
+            team_dir,
+            "quality",
+            "lead",
+            "side-channel ack only\n\nTEAM_COMPLETION_CHECKLIST:\n- artifacts: none\n- verification: team message sent rc=0\n- blockers_or_limits: side-channel only",
+        )
+        .expect("message");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "quality".to_string(),
+                note: "Task45 evaluation handoff".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "45",
+            Some("quality"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("handoff complete"),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "45")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert!(
+            issue
+                .expect("empty checklist should not satisfy blocker")
+                .contains("TEAM_COMPLETION_CHECKLIST.md")
+        );
     }
 
     #[test]
