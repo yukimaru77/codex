@@ -142,6 +142,9 @@ enum TeamSubcommand {
     /// Run and inspect long-lived commands on team nodes.
     Job(JobCli),
 
+    /// Track generic long-running waits, requests, gates, or external work.
+    Wait(WaitCli),
+
     /// Manage the dedicated local browser profile used for remote device auth.
     AuthBrowser(AuthBrowserCli),
 
@@ -981,6 +984,105 @@ struct JobArtifactArgs {
     note: String,
 }
 
+#[derive(Debug, Parser)]
+#[command(bin_name = "codex team wait")]
+struct WaitCli {
+    #[command(flatten)]
+    selector: TeamSelector,
+
+    #[command(subcommand)]
+    subcommand: WaitSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum WaitSubcommand {
+    /// Register a generic wait item with a concrete completion condition.
+    Add(WaitAddArgs),
+
+    /// List wait items.
+    List(WaitListArgs),
+
+    /// Update wait status, progress, or evidence.
+    Set(WaitSetArgs),
+}
+
+#[derive(Debug, Args)]
+struct WaitAddArgs {
+    /// Human-readable wait title.
+    #[arg(value_name = "TITLE")]
+    title: String,
+
+    /// Department/member responsible for checking and closing this wait.
+    #[arg(long)]
+    owner: Option<String>,
+
+    /// Task id this wait gates or informs.
+    #[arg(long)]
+    task: Option<String>,
+
+    /// Node/site where the work or wait is happening, if any.
+    #[arg(long)]
+    node: Option<String>,
+
+    /// Concrete condition that proves this wait is finished.
+    #[arg(long, default_value = "")]
+    condition: String,
+
+    /// Current status.
+    #[arg(long, default_value = "waiting")]
+    status: TeamWaitStatus,
+
+    /// Initial progress note, request id, URL, log path, or checkpoint.
+    #[arg(long, default_value = "")]
+    progress: String,
+
+    /// Evidence path or URL proving completion/failure.
+    #[arg(long)]
+    evidence: Option<String>,
+}
+
+#[derive(Debug, Default, Args)]
+struct WaitListArgs {
+    /// Show only waits owned by this department/member.
+    #[arg(long)]
+    owner: Option<String>,
+
+    /// Show only waits linked to this task id.
+    #[arg(long)]
+    task: Option<String>,
+
+    /// Show only waits with this status.
+    #[arg(long)]
+    status: Option<TeamWaitStatus>,
+
+    /// Show at most this many waits. When set, the newest matching waits are shown.
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct WaitSetArgs {
+    /// Wait id.
+    #[arg(value_name = "ID")]
+    id: String,
+
+    /// New status.
+    #[arg(long)]
+    status: Option<TeamWaitStatus>,
+
+    /// Replace progress note, request id, log path, URL, or checkpoint.
+    #[arg(long)]
+    progress: Option<String>,
+
+    /// Replace evidence path or URL.
+    #[arg(long)]
+    evidence: Option<String>,
+
+    /// Clear current evidence.
+    #[arg(long, default_value_t = false)]
+    clear_evidence: bool,
+}
+
 #[derive(Debug, Args)]
 struct MemberStandbyArgs {
     /// Department name.
@@ -1203,6 +1305,25 @@ struct TeamJob {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct TeamWait {
+    id: String,
+    title: String,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    node: Option<String>,
+    condition: String,
+    status: TeamWaitStatus,
+    progress: String,
+    #[serde(default)]
+    evidence: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TeamArtifact {
     path: String,
     note: String,
@@ -1218,6 +1339,45 @@ enum TeamJobStatus {
     Failed,
     Stopped,
     Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[clap(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+enum TeamWaitStatus {
+    Waiting,
+    Running,
+    Polling,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl fmt::Display for TeamWaitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TeamWaitStatus::Waiting => "waiting",
+            TeamWaitStatus::Running => "running",
+            TeamWaitStatus::Polling => "polling",
+            TeamWaitStatus::Blocked => "blocked",
+            TeamWaitStatus::Completed => "completed",
+            TeamWaitStatus::Failed => "failed",
+            TeamWaitStatus::Cancelled => "cancelled",
+        })
+    }
+}
+
+impl TeamWaitStatus {
+    fn is_open(&self) -> bool {
+        matches!(
+            self,
+            TeamWaitStatus::Waiting
+                | TeamWaitStatus::Running
+                | TeamWaitStatus::Polling
+                | TeamWaitStatus::Blocked
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
@@ -1423,6 +1583,7 @@ impl TeamCli {
             Some(TeamSubcommand::Member(cli)) => run_member(&root, cli),
             Some(TeamSubcommand::Node(cli)) => run_node(&root, cli),
             Some(TeamSubcommand::Job(cli)) => run_job(&root, cli),
+            Some(TeamSubcommand::Wait(cli)) => run_wait(&root, cli),
             Some(TeamSubcommand::AuthBrowser(cli)) => run_auth_browser(&codex_home, cli),
             Some(TeamSubcommand::Message(args)) => send_message(&root, args),
             Some(TeamSubcommand::Inbox(args)) => read_inbox(&root, args),
@@ -1819,6 +1980,7 @@ fn create_team(root: &Path, args: StartArgs) -> Result<(String, PathBuf)> {
     fs::create_dir_all(team_dir.join("last_messages"))?;
     fs::create_dir_all(team_dir.join("live_messages"))?;
     fs::create_dir_all(team_dir.join("jobs"))?;
+    fs::create_dir_all(team_dir.join("waits"))?;
     write_json_atomic(
         &team_dir.join("ownerships.json"),
         &Vec::<FileOwnership>::new(),
@@ -3921,6 +4083,18 @@ fn format_status_text(team_dir: &Path) -> Result<String> {
     if !cooldowns.is_empty() {
         out.push_str(&cooldowns);
     }
+    let waits = load_waits(team_dir)?;
+    let open_waits = waits.iter().filter(|wait| wait.status.is_open()).count();
+    if open_waits > 0 {
+        out.push_str(&format!(
+            "Waits: {open_waits} open, {} total\n",
+            waits.len()
+        ));
+        for wait in waits.iter().filter(|wait| wait.status.is_open()).take(12) {
+            out.push_str(&format_wait_line(wait));
+            out.push('\n');
+        }
+    }
     out.push_str(&format!("Tasks: {}\n", format_task_status_counts(&tasks)));
     out.push_str(&format_tasks_text(team_dir)?);
     let ownerships = format_ownerships_text(team_dir)?;
@@ -4096,6 +4270,17 @@ fn format_task_line(task: &TeamTask) -> String {
     )
 }
 
+fn format_wait_line(wait: &TeamWait) -> String {
+    format!(
+        "  {:<8} {:<9} owner={:<12} task={:<6} {}",
+        wait.id,
+        wait.status,
+        wait.owner.as_deref().unwrap_or("-"),
+        wait.task_id.as_deref().unwrap_or("-"),
+        wait.title
+    )
+}
+
 fn format_inbox_text(team_dir: &Path, member: &str) -> Result<String> {
     let config = load_config(team_dir)?;
     let member = sanitize_id(member);
@@ -4159,6 +4344,19 @@ fn parse_job_status(value: &str) -> Result<TeamJobStatus> {
         "stopped" => Ok(TeamJobStatus::Stopped),
         "unknown" => Ok(TeamJobStatus::Unknown),
         other => bail!("unsupported job status `{other}`"),
+    }
+}
+
+fn parse_wait_status(value: &str) -> Result<TeamWaitStatus> {
+    match value.trim().replace('-', "_").as_str() {
+        "waiting" | "wait" => Ok(TeamWaitStatus::Waiting),
+        "running" => Ok(TeamWaitStatus::Running),
+        "polling" | "pending" => Ok(TeamWaitStatus::Polling),
+        "blocked" => Ok(TeamWaitStatus::Blocked),
+        "completed" | "complete" | "done" => Ok(TeamWaitStatus::Completed),
+        "failed" | "failure" => Ok(TeamWaitStatus::Failed),
+        "cancelled" | "canceled" => Ok(TeamWaitStatus::Cancelled),
+        other => bail!("unsupported wait status `{other}`"),
     }
 }
 
@@ -7535,6 +7733,46 @@ fn ingest_team_signal_lines(
         )?;
     }
     for line in new_text.lines() {
+        let wait_update = match parse_team_wait_line(line) {
+            Ok(Some(wait_update)) => wait_update,
+            Ok(None) => continue,
+            Err(err) => {
+                append_event(
+                    team_dir,
+                    "team_wait_parse_failed",
+                    serde_json::json!({
+                        "from": member_name,
+                        "line": line.trim().chars().take(500).collect::<String>(),
+                        "error": err.to_string(),
+                        "source": "assistant_text",
+                    }),
+                )?;
+                continue;
+            }
+        };
+        match ingest_team_wait_fallback(team_dir, member_name, wait_update) {
+            Ok(wait_id) => append_event(
+                team_dir,
+                "team_wait_ingested",
+                serde_json::json!({
+                    "from": member_name,
+                    "wait": wait_id,
+                    "source": "assistant_text",
+                }),
+            )?,
+            Err(err) => append_event(
+                team_dir,
+                "team_wait_ingest_failed",
+                serde_json::json!({
+                    "from": member_name,
+                    "line": line.trim().chars().take(500).collect::<String>(),
+                    "error": err.to_string(),
+                    "source": "assistant_text",
+                }),
+            )?,
+        }
+    }
+    for line in new_text.lines() {
         let node_args = match parse_team_node_line(line) {
             Ok(Some(node_args)) => node_args,
             Ok(None) => continue,
@@ -7587,6 +7825,16 @@ struct TeamTaskFallback {
     id: String,
     status: TaskStatus,
     result: Option<String>,
+}
+
+struct TeamWaitFallback {
+    id: Option<String>,
+    title: String,
+    status: TeamWaitStatus,
+    task_id: Option<String>,
+    condition: String,
+    progress: String,
+    evidence: Option<String>,
 }
 
 fn parse_team_message_line(line: &str) -> Option<(String, String)> {
@@ -7651,6 +7899,137 @@ fn parse_team_task_line(line: &str) -> Result<Option<TeamTaskFallback>> {
         status: parse_task_status(&status)?,
         result: result.filter(|value| !value.trim().is_empty()),
     }))
+}
+
+fn parse_team_wait_line(line: &str) -> Result<Option<TeamWaitFallback>> {
+    let line = line.trim();
+    let Some(rest) = line.strip_prefix("TEAM_WAIT ") else {
+        return Ok(None);
+    };
+    let parts = rest.split(" | ").collect::<Vec<_>>();
+    let head = parts.first().copied().unwrap_or_default();
+    let mut fields = HashMap::<String, String>::new();
+    for token in head.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        fields.insert(
+            key.trim().to_ascii_lowercase(),
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string(),
+        );
+    }
+    for part in parts.into_iter().skip(1) {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        fields.insert(
+            key.trim().to_ascii_lowercase(),
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string(),
+        );
+    }
+    let title = fields
+        .remove("title")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "external wait".to_string());
+    let status = fields
+        .remove("status")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "waiting".to_string());
+    let id = fields.remove("id").filter(|value| !value.trim().is_empty());
+    if id
+        .as_deref()
+        .is_some_and(|id| id.contains('<') || id.contains('>'))
+    {
+        bail!("TEAM_WAIT id must be concrete, not a placeholder");
+    }
+    let task_id = fields
+        .remove("task")
+        .filter(|value| !value.trim().is_empty());
+    if task_id
+        .as_deref()
+        .is_some_and(|task| task.contains('<') || task.contains('>'))
+    {
+        bail!("TEAM_WAIT task must be concrete, not a placeholder");
+    }
+    Ok(Some(TeamWaitFallback {
+        id,
+        title,
+        status: parse_wait_status(&status)?,
+        task_id,
+        condition: fields.remove("condition").unwrap_or_default(),
+        progress: fields.remove("progress").unwrap_or_default(),
+        evidence: fields
+            .remove("evidence")
+            .filter(|value| !value.trim().is_empty()),
+    }))
+}
+
+fn ingest_team_wait_fallback(
+    team_dir: &Path,
+    member_name: &str,
+    wait_update: TeamWaitFallback,
+) -> Result<String> {
+    let config = load_config(team_dir)?;
+    ensure_member_exists(&config, member_name)?;
+    if let Some(wait_id) = wait_update.id.as_deref()
+        && wait_path(team_dir, wait_id).exists()
+    {
+        set_team_wait(
+            team_dir,
+            WaitSetArgs {
+                id: wait_id.to_string(),
+                status: Some(wait_update.status),
+                progress: Some(wait_update.progress),
+                evidence: wait_update.evidence,
+                clear_evidence: false,
+            },
+        )?;
+        return Ok(wait_id.to_string());
+    }
+
+    let id = wait_update
+        .id
+        .unwrap_or_else(|| allocate_wait_id(team_dir).unwrap_or_else(|_| "wait-1".to_string()));
+    if wait_path(team_dir, &id).exists() {
+        bail!("wait `{id}` already exists");
+    }
+    if let Some(task_id) = wait_update.task_id.as_deref() {
+        let tasks = load_tasks(team_dir)?;
+        if !tasks.iter().any(|task| task.id == task_id) {
+            bail!("task `{task_id}` does not exist");
+        }
+        set_task_status_if_open(
+            team_dir,
+            task_id,
+            TaskStatus::Waiting,
+            Some(&format!("Waiting on `{id}`: {}", wait_update.title)),
+        )?;
+    }
+    let now = now();
+    let wait = TeamWait {
+        id: id.clone(),
+        title: wait_update.title,
+        owner: Some(member_name.to_string()),
+        task_id: wait_update.task_id,
+        node: None,
+        condition: wait_update.condition,
+        status: wait_update.status,
+        progress: wait_update.progress,
+        evidence: wait_update.evidence,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    fs::create_dir_all(waits_dir(team_dir))?;
+    write_json_atomic(&wait_path(team_dir, &id), &wait)?;
+    Ok(id)
 }
 
 fn parse_team_node_line(line: &str) -> Result<Option<NodeAddArgs>> {
@@ -8315,10 +8694,16 @@ fn maybe_warn_unattended_tasks(
 
     let tasks = load_tasks(team_dir)?;
     let jobs = load_jobs(team_dir)?;
+    let waits = load_waits(team_dir)?;
     let running_job_tasks = jobs
         .iter()
         .filter(|job| matches!(job.status, TeamJobStatus::Running))
         .filter_map(|job| job.task_id.as_deref())
+        .collect::<HashSet<_>>();
+    let open_wait_tasks = waits
+        .iter()
+        .filter(|wait| wait.status.is_open())
+        .filter_map(|wait| wait.task_id.as_deref())
         .collect::<HashSet<_>>();
     let mut config = config.clone();
     let mut config_changed = false;
@@ -8344,7 +8729,8 @@ fn maybe_warn_unattended_tasks(
         };
         let active_owner_turn = active.get(owner).is_some_and(|run| !run.completed);
         let tracked_running_job = running_job_tasks.contains(task.id.as_str());
-        if active_owner_turn || tracked_running_job {
+        let tracked_open_wait = open_wait_tasks.contains(task.id.as_str());
+        if active_owner_turn || tracked_running_job || tracked_open_wait {
             continue;
         }
         if !task.depends_on.is_empty() && !task_dependencies_completed(task, &tasks) {
@@ -8859,11 +9245,16 @@ fn maybe_send_lead_autonomy_tick(
     *last_tick = now_instant;
 
     let tasks = load_tasks(team_dir)?;
+    let waits = load_waits(team_dir)?;
     let open_tasks = tasks
         .iter()
         .filter(|task| task_is_open(task))
         .collect::<Vec<_>>();
-    if open_tasks.is_empty() && active.values().all(|run| run.completed) {
+    let open_waits = waits
+        .iter()
+        .filter(|wait| wait.status.is_open())
+        .collect::<Vec<_>>();
+    if open_tasks.is_empty() && open_waits.is_empty() && active.values().all(|run| run.completed) {
         return Ok(());
     }
     if let Some(lead_run) = active.get(&config.lead)
@@ -8921,6 +9312,28 @@ fn maybe_send_lead_autonomy_tick(
     } else {
         String::new()
     };
+    let open_wait_lines = open_waits
+        .iter()
+        .take(20)
+        .map(|wait| {
+            format!(
+                "- wait {id} [{status}] owner=@{owner} task={task} node={node} condition={condition} progress={progress}",
+                id = wait.id,
+                status = wait.status,
+                owner = wait.owner.as_deref().unwrap_or("unassigned"),
+                task = wait.task_id.as_deref().unwrap_or("-"),
+                node = wait.node.as_deref().unwrap_or("-"),
+                condition = wait.condition,
+                progress = wait.progress
+            )
+        })
+        .collect::<Vec<_>>();
+    let omitted_waits = open_waits.len().saturating_sub(open_wait_lines.len());
+    let omitted_waits_line = if omitted_waits > 0 {
+        format!("\n- ... {omitted_waits} more open waits")
+    } else {
+        String::new()
+    };
     let proposal_lines = collect_recent_lead_proposals(team_dir, &config.lead, 5)?;
     let proposal_block = if proposal_lines.is_empty() {
         "- none".to_string()
@@ -8929,11 +9342,16 @@ fn maybe_send_lead_autonomy_tick(
     };
     let message = if language.is_ja() {
         format!(
-            "Lead autonomy tick: あなたはこの team の意思決定オーケストレーターです。team runtime は状態を報告し、この tick を届けているだけです。runtime があなたの代わりにオーケストレーション判断をしているわけではありません。\n\n必須の lead action:\n- 未完了 task、部署 mailbox、live message、job、artifact を確認してください。\n- ユーザーの現在の task に向けて協調してください。必要なら部署を steer / resume / reassign し、具体的な artifact、blocker、handoff を求めてください。\n- 部署が MCP、remote node、Docker、job、他部署を待っているなら、path / request / job id / next action を含む status record を要求してください。\n- teammate が `LEAD_PROPOSAL:` を送っているなら、resume / reassign / review action として明示的に採用するか、具体的な理由付きで却下してください。\n- action が必要な task がなければ、team が idle のままでよい理由、または user input 待ちである理由を明示的に記録してください。active instruction や domain skill が明示的に要求しない限り、新しい改善 loop を勝手に作らないでください。\n\nOpen tasks:\n{}{omitted_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nCurrent app-server turns:\n{}",
+            "Lead autonomy tick: あなたはこの team の意思決定オーケストレーターです。team runtime は状態を報告し、この tick を届けているだけです。runtime があなたの代わりにオーケストレーション判断をしているわけではありません。\n\n必須の lead action:\n- 未完了 task、open wait、部署 mailbox、live message、job、artifact を確認してください。\n- ユーザーの現在の task に向けて協調してください。必要なら部署を steer / resume / reassign し、具体的な artifact、blocker、handoff を求めてください。\n- 部署が完了条件を持つ待機対象を始めたら、種類に決め打ちせず `team wait add` で condition / owner / task / progress / evidence を登録させてください。PID付きコマンドは `team job`、PIDを持たない外部待機や非同期依存は `team wait` で追跡してください。\n- open wait がある task は完了扱いにしないでください。wait が completed/failed/blocked になったら owner を resume し、結果を見て handoff、次 action、または blocker を出させてください。\n- teammate が `LEAD_PROPOSAL:` を送っているなら、resume / reassign / review action として明示的に採用するか、具体的な理由付きで却下してください。\n- action が必要な task がなければ、team が idle のままでよい理由、または user input 待ちである理由を明示的に記録してください。active instruction や domain skill が明示的に要求しない限り、新しい改善 loop を勝手に作らないでください。\n\nOpen tasks:\n{}{omitted_line}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nCurrent app-server turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
                 open_task_lines.join("\n")
+            },
+            if open_wait_lines.is_empty() {
+                "- none".to_string()
+            } else {
+                open_wait_lines.join("\n")
             },
             if active_lines.is_empty() {
                 "- none".to_string()
@@ -8943,11 +9361,16 @@ fn maybe_send_lead_autonomy_tick(
         )
     } else {
         format!(
-            "Lead autonomy tick: you are the decision-making orchestrator for this team. The team runtime is only reporting state and delivering this tick; it is not making orchestration decisions for you.\n\nRequired lead action:\n- Inspect unfinished tasks, department mailboxes, live messages, jobs, and artifacts.\n- Coordinate toward the user's current task: steer, resume, reassign, or ask departments for concrete artifacts, blockers, or handoffs.\n- If a department is waiting on MCP, a remote node, Docker, a job, or another department, require a status record with path/request/job id and next action.\n- If a teammate sent `LEAD_PROPOSAL:`, explicitly accept it with a resume/reassign/review action or reject it with the concrete reason.\n- If no task needs action, explicitly record why the team should remain idle or wait for user input. Do not invent a new improvement loop unless the active instructions or a domain skill explicitly require one.\n\nOpen tasks:\n{}{omitted_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nCurrent app-server turns:\n{}",
+            "Lead autonomy tick: you are the decision-making orchestrator for this team. The team runtime is only reporting state and delivering this tick; it is not making orchestration decisions for you.\n\nRequired lead action:\n- Inspect unfinished tasks, open waits, department mailboxes, live messages, jobs, and artifacts.\n- Coordinate toward the user's current task: steer, resume, reassign, or ask departments for concrete artifacts, blockers, or handoffs.\n- When a department starts a waitable item with a completion condition, do not categorize it narrowly; register it with `team wait add` including condition / owner / task / progress / evidence. Use `team job` for PID-backed commands and `team wait` for PID-less external waits or async dependencies.\n- Do not treat a task with an open wait as complete. When a wait becomes completed/failed/blocked, resume the owner to inspect the result and publish a handoff, next action, or blocker.\n- If a teammate sent `LEAD_PROPOSAL:`, explicitly accept it with a resume/reassign/review action or reject it with the concrete reason.\n- If no task needs action, explicitly record why the team should remain idle or wait for user input. Do not invent a new improvement loop unless the active instructions or a domain skill explicitly require one.\n\nOpen tasks:\n{}{omitted_line}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nCurrent app-server turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
                 open_task_lines.join("\n")
+            },
+            if open_wait_lines.is_empty() {
+                "- none".to_string()
+            } else {
+                open_wait_lines.join("\n")
             },
             if active_lines.is_empty() {
                 "- none".to_string()
@@ -8963,6 +9386,7 @@ fn maybe_send_lead_autonomy_tick(
         serde_json::json!({
             "lead": config.lead,
             "open_tasks": open_tasks.len(),
+            "open_waits": open_waits.len(),
             "active_turns": active.values().filter(|run| !run.completed).count(),
         }),
     )?;
@@ -10564,6 +10988,14 @@ fn print_status(team_dir: &Path) -> Result<()> {
     let cooldowns = format_usage_limit_cooldowns(team_dir, &config)?;
     if !cooldowns.is_empty() {
         print!("{cooldowns}");
+    }
+    let waits = load_waits(team_dir)?;
+    let open_waits = waits.iter().filter(|wait| wait.status.is_open()).count();
+    if open_waits > 0 {
+        println!("Waits: {open_waits} open, {} total", waits.len());
+        for wait in waits.iter().filter(|wait| wait.status.is_open()).take(12) {
+            println!("{}", format_wait_line(wait));
+        }
     }
     println!("Tasks: {}", format_task_status_counts(&tasks));
     for task in &tasks {
@@ -14371,11 +14803,21 @@ fn update_task(team_dir: &Path, args: TaskSetArgs) -> Result<()> {
             ));
         }
     }
-    if let Some(status) = args.status {
+    let requested_status = args.status;
+    if let Some(status) = requested_status {
         task.status = status;
     }
     if let Some(result) = args.result {
         task.result = Some(result);
+    }
+    if requested_status == Some(TaskStatus::Completed)
+        && let Some(issue) = task_completion_blocker(team_dir, &task)?
+    {
+        task.status = TaskStatus::Blocked;
+        task.result = Some(append_result_note(
+            task.result.as_deref(),
+            &format!("Completion rejected: {issue}"),
+        ));
     }
     task.updated_at = now();
     write_json_atomic(&path, &task)?;
@@ -15551,6 +15993,18 @@ fn run_job(root: &Path, cli: JobCli) -> Result<()> {
     }
 }
 
+fn run_wait(root: &Path, cli: WaitCli) -> Result<()> {
+    let team_dir = resolve_team_dir(root, cli.selector.team.as_deref())?;
+    match cli.subcommand {
+        WaitSubcommand::Add(args) => add_team_wait(&team_dir, args),
+        WaitSubcommand::List(args) => {
+            print!("{}", format_waits_text_filtered(&team_dir, &args)?);
+            Ok(())
+        }
+        WaitSubcommand::Set(args) => set_team_wait(&team_dir, args),
+    }
+}
+
 fn list_jobs(team_dir: &Path, args: JobListArgs) -> Result<()> {
     print!("{}", format_jobs_text_filtered(team_dir, &args)?);
     Ok(())
@@ -15603,6 +16057,261 @@ fn format_jobs_text_filtered(team_dir: &Path, args: &JobListArgs) -> Result<Stri
         ));
     }
     Ok(out)
+}
+
+fn format_waits_text_filtered(team_dir: &Path, args: &WaitListArgs) -> Result<String> {
+    let mut waits = load_waits(team_dir)?;
+    waits.retain(|wait| {
+        if let Some(owner) = args.owner.as_deref()
+            && wait.owner.as_deref() != Some(owner)
+        {
+            return false;
+        }
+        if let Some(task) = args.task.as_deref()
+            && wait.task_id.as_deref() != Some(task)
+        {
+            return false;
+        }
+        if let Some(status) = args.status.as_ref()
+            && &wait.status != status
+        {
+            return false;
+        }
+        true
+    });
+    waits.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    if let Some(limit) = args.limit {
+        let keep_from = waits.len().saturating_sub(limit);
+        waits = waits.split_off(keep_from);
+    }
+    if waits.is_empty() {
+        return Ok("No waits.\n".to_string());
+    }
+    let mut out = String::new();
+    for wait in waits {
+        let evidence = wait.evidence.as_deref().unwrap_or("-");
+        out.push_str(&format!(
+            "{:<18} {:<10} owner={:<12} task={:<6} node={:<14} evidence={:<20} title={} condition={} progress={}\n",
+            wait.id,
+            wait.status,
+            wait.owner.as_deref().unwrap_or("-"),
+            wait.task_id.as_deref().unwrap_or("-"),
+            wait.node.as_deref().unwrap_or("-"),
+            evidence,
+            wait.title,
+            wait.condition,
+            wait.progress
+        ));
+    }
+    Ok(out)
+}
+
+fn add_team_wait(team_dir: &Path, args: WaitAddArgs) -> Result<()> {
+    let config = load_config(team_dir)?;
+    let id = allocate_wait_id(team_dir)?;
+    let owner = args
+        .owner
+        .or_else(|| std::env::var("CODEX_TEAM_MEMBER").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "lead".to_string());
+    ensure_member_exists(&config, &owner)?;
+    let task_id = args.task.filter(|value| !value.trim().is_empty());
+    if let Some(task_id) = task_id.as_deref() {
+        let tasks = load_tasks(team_dir)?;
+        let Some(task) = tasks.iter().find(|task| task.id == task_id) else {
+            bail!("task `{task_id}` does not exist");
+        };
+        if let Some(task_owner) = task.owner.as_deref()
+            && task_owner != owner
+            && owner != config.lead
+        {
+            bail!("task `{task_id}` is owned by `{task_owner}`, not `{owner}`");
+        }
+        set_task_status_if_open(
+            team_dir,
+            task_id,
+            TaskStatus::Waiting,
+            Some(&format!("Waiting on `{id}`: {}", args.title)),
+        )?;
+    }
+    if let Some(node_id) = args.node.as_deref() {
+        let mut nodes = load_nodes(team_dir)?;
+        ensure_local_node(&mut nodes);
+        if !nodes.iter().any(|node| node.id == node_id) {
+            bail!("node `{node_id}` not found");
+        }
+    }
+    let now = now();
+    let wait = TeamWait {
+        id: id.clone(),
+        title: args.title,
+        owner: Some(owner.clone()),
+        task_id: task_id.clone(),
+        node: args.node.filter(|value| !value.trim().is_empty()),
+        condition: args.condition,
+        status: args.status,
+        progress: args.progress,
+        evidence: args.evidence.filter(|value| !value.trim().is_empty()),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    fs::create_dir_all(waits_dir(team_dir))?;
+    write_json_atomic(&wait_path(team_dir, &id), &wait)?;
+    append_event(
+        team_dir,
+        "wait_registered",
+        serde_json::json!({
+            "wait": id,
+            "owner": owner,
+            "task": task_id,
+            "status": wait.status.to_string(),
+            "condition": wait.condition.as_str(),
+            "evidence": wait.evidence.as_deref(),
+        }),
+    )?;
+    println!("Registered wait {}", wait.id);
+    Ok(())
+}
+
+fn set_team_wait(team_dir: &Path, args: WaitSetArgs) -> Result<()> {
+    let mut wait = load_wait(team_dir, &args.id)?;
+    let previous_status = wait.status.clone();
+    if let Some(status) = args.status {
+        wait.status = status;
+    }
+    if let Some(progress) = args.progress {
+        wait.progress = progress;
+    }
+    if args.clear_evidence {
+        wait.evidence = None;
+    }
+    if let Some(evidence) = args.evidence {
+        wait.evidence = if evidence.trim().is_empty() {
+            None
+        } else {
+            Some(evidence)
+        };
+    }
+    wait.updated_at = now();
+    write_json_atomic(&wait_path(team_dir, &wait.id), &wait)?;
+    append_event(
+        team_dir,
+        "wait_updated",
+        serde_json::json!({
+            "wait": wait.id,
+            "previous_status": previous_status.to_string(),
+            "status": wait.status.to_string(),
+            "owner": wait.owner.as_deref(),
+            "task": wait.task_id.as_deref(),
+            "evidence": wait.evidence.as_deref(),
+        }),
+    )?;
+    handle_wait_status_change(team_dir, &wait, previous_status)?;
+    println!("Updated wait {}", wait.id);
+    Ok(())
+}
+
+fn handle_wait_status_change(
+    team_dir: &Path,
+    wait: &TeamWait,
+    previous_status: TeamWaitStatus,
+) -> Result<()> {
+    if wait.status == previous_status {
+        return Ok(());
+    }
+    let Some(task_id) = wait.task_id.as_deref() else {
+        return Ok(());
+    };
+    let config = load_config(team_dir)?;
+    let owner = wait.owner.as_deref().unwrap_or(config.lead.as_str());
+    let evidence = wait.evidence.as_deref().unwrap_or("-");
+    match &wait.status {
+        TeamWaitStatus::Completed => {
+            set_task_status_if_open(
+                team_dir,
+                task_id,
+                TaskStatus::InProgress,
+                Some(&format!(
+                    "Wait `{}` completed. Evidence: {evidence}. Owner must inspect the result and publish the final handoff/checklist or next blocker.",
+                    wait.id
+                )),
+            )?;
+            resume_wait_owner_after_wait_status_change(team_dir, wait, task_id)?;
+        }
+        TeamWaitStatus::Failed | TeamWaitStatus::Cancelled | TeamWaitStatus::Blocked => {
+            set_task_status_if_open(
+                team_dir,
+                task_id,
+                TaskStatus::Blocked,
+                Some(&format!(
+                    "Wait `{}` ended as {}. Evidence/progress: {evidence} {}",
+                    wait.id, wait.status, wait.progress
+                )),
+            )?;
+            resume_wait_owner_after_wait_status_change(team_dir, wait, task_id)?;
+        }
+        TeamWaitStatus::Waiting | TeamWaitStatus::Running | TeamWaitStatus::Polling => {}
+    }
+    if config.members.iter().any(|member| member.name == owner) && owner != config.lead {
+        set_member_status(team_dir, owner, MemberStatus::Online)?;
+    }
+    Ok(())
+}
+
+fn resume_wait_owner_after_wait_status_change(
+    team_dir: &Path,
+    wait: &TeamWait,
+    task_id: &str,
+) -> Result<()> {
+    let config = load_config(team_dir)?;
+    let Some(owner) = wait.owner.as_deref() else {
+        return Ok(());
+    };
+    let evidence = wait.evidence.as_deref().unwrap_or("-");
+    let language = config.language.unwrap_or_default();
+    if owner != config.lead && config.members.iter().any(|member| member.name == owner) {
+        set_member_status(team_dir, owner, MemberStatus::Online)?;
+        let message = if language.is_ja() {
+            format!(
+                "WAIT_STATUS: task {task_id} に紐づく wait `{}` が `{}` になりました。condition=`{}` evidence=`{evidence}` progress=`{}`。結果を確認し、final handoff/checklist、次の task、または具体的 blocker を lead/all に送ってください。",
+                wait.id, wait.status, wait.condition, wait.progress
+            )
+        } else {
+            format!(
+                "WAIT_STATUS: wait `{}` for task {task_id} is now `{}`. condition=`{}` evidence=`{evidence}` progress=`{}`. Inspect the result, then send lead/all the final handoff/checklist, next task, or concrete blocker.",
+                wait.id, wait.status, wait.condition, wait.progress
+            )
+        };
+        send_team_message_to_dir(team_dir, "system", owner, &message)?;
+    }
+    let lead_message = if language.is_ja() {
+        format!(
+            "WAIT_STATUS: @{owner} の task {task_id} に紐づく wait `{}` が `{}` になりました。condition=`{}` evidence=`{evidence}`。handoff/recovery のため owner を再開しました。",
+            wait.id, wait.status, wait.condition
+        )
+    } else {
+        format!(
+            "WAIT_STATUS: @{owner}'s wait `{}` for task {task_id} is now `{}`. condition=`{}` evidence=`{evidence}`. Owner was resumed for handoff/recovery.",
+            wait.id, wait.status, wait.condition
+        )
+    };
+    send_team_message_to_dir(team_dir, "system", &config.lead, &lead_message)?;
+    append_event(
+        team_dir,
+        "wait_owner_resumed",
+        serde_json::json!({
+            "wait": wait.id,
+            "task": task_id,
+            "owner": owner,
+            "status": wait.status.to_string(),
+            "evidence": wait.evidence.as_deref(),
+        }),
+    )?;
+    Ok(())
 }
 
 fn start_team_job(team_dir: &Path, args: JobStartArgs) -> Result<()> {
@@ -16620,7 +17329,7 @@ fn set_task_status_if_open(
             )
         {
             if status == TaskStatus::Completed
-                && let Some(issue) = task_completion_missing_required_local_outputs(team_dir, task)?
+                && let Some(issue) = task_completion_blocker(team_dir, task)?
             {
                 task.status = TaskStatus::Blocked;
                 task.result = Some(append_result_note(
@@ -16668,7 +17377,7 @@ fn complete_member_tasks_if_active(team_dir: &Path, member_name: &str) -> Result
                     | TaskStatus::Review
             )
         {
-            if let Some(issue) = task_completion_missing_required_local_outputs(team_dir, task)? {
+            if let Some(issue) = task_completion_blocker(team_dir, task)? {
                 task.status = TaskStatus::Blocked;
                 task.result = Some(append_result_note(
                     task.result.as_deref(),
@@ -16720,6 +17429,27 @@ fn task_completion_missing_required_local_outputs(
             issues.join("; ")
         )))
     }
+}
+
+fn task_completion_blocker(team_dir: &Path, task: &TeamTask) -> Result<Option<String>> {
+    let open_waits = load_waits(team_dir)?
+        .into_iter()
+        .filter(|wait| wait.task_id.as_deref() == Some(task.id.as_str()))
+        .filter(|wait| wait.status.is_open())
+        .map(|wait| {
+            format!(
+                "{} status={} condition={}",
+                wait.id, wait.status, wait.condition
+            )
+        })
+        .collect::<Vec<_>>();
+    if !open_waits.is_empty() {
+        return Ok(Some(format!(
+            "task has open wait item(s): {}",
+            open_waits.join("; ")
+        )));
+    }
+    task_completion_missing_required_local_outputs(team_dir, task)
 }
 
 fn task_required_local_output_paths(team_dir: &Path, task: &TeamTask) -> Result<Vec<PathBuf>> {
@@ -17145,7 +17875,7 @@ Tooling and dependency policy:
 - Do not stop at "this image/environment lacks node/python/chromium/rg/etc." when installing the missing tool is reasonable for the task. Install needed libraries, runtimes, CLIs, browsers, test tools, build tools, and package dependencies so the work can be implemented and verified properly.
 - In Docker containers, you are often root; use the container package manager directly. On SSH/local hosts, prefer project-local or user-local installs, and use passwordless sudo (`sudo -n`) only when available. Never wait for an interactive sudo password.
 - Prefer the environment's best package manager and project conventions: apt/apk/dnf/yum/brew for OS packages, npm/pnpm/yarn for JS, pip/uv/poetry for Python, cargo for Rust, and the repo's lockfiles/scripts when present.
-- Use non-interactive, reproducible commands where possible. If installation is heavy, long-running, or important to inspect later, ask lead to track it with `team job --owner <department> --task <task-id>` or use `team job` when available.
+- Use non-interactive, reproducible commands where possible. If work will take time or has an external completion condition, make it observable: use `team job` for PID-backed commands, and use `team wait` for non-PID waits or asynchronous/external dependencies.
 - Report significant installs, versions, and any fallback to lead. Only fall back to weaker static checks after a concrete install attempt is impossible or unsafe.
 
 Coordinate through the native team store with these shell commands:
@@ -17161,12 +17891,15 @@ Coordinate through the native team store with these shell commands:
 - "$CODEX_TEAM_CLI" team task --team "$CODEX_TEAM_ID" set <TASK_ID> --status blocked --result "<what you are waiting for>"
 - "$CODEX_TEAM_CLI" team task --team "$CODEX_TEAM_ID" set <TASK_ID> --status completed --result "<short result>"
 - "$CODEX_TEAM_CLI" team job --team "$CODEX_TEAM_ID" start --owner "$CODEX_TEAM_MEMBER" --task <TASK_ID> --node <node-id> --cwd <cwd> -- <command...>
+- "$CODEX_TEAM_CLI" team wait --team "$CODEX_TEAM_ID" add "<title>" --owner "$CODEX_TEAM_MEMBER" --task <TASK_ID> --condition "<exact completion condition>" --progress "<request id, URL, log path, checkpoint, or current state>"
+- "$CODEX_TEAM_CLI" team wait --team "$CODEX_TEAM_ID" list --owner "$CODEX_TEAM_MEMBER"
+- "$CODEX_TEAM_CLI" team wait --team "$CODEX_TEAM_ID" set <WAIT_ID> --status <waiting|running|polling|blocked|completed|failed|cancelled> --progress "<current state>" [--evidence <path-or-url>]
 - "$CODEX_TEAM_CLI" team message --team "$CODEX_TEAM_ID" lead "<message>"
 - "$CODEX_TEAM_CLI" team message --team "$CODEX_TEAM_ID" all "<message>"
 
 The message command defaults the sender to CODEX_TEAM_MEMBER, so teammates can DM each other without passing --from. Use `all` for a broadcast.
 
-Start by reading your inbox, the task list, and the ownership list. Before editing a file, claim the path with the ownership command. If another department owns the path, do not edit it until that department hands it off or lead explicitly reassigns ownership. Check your inbox again after important task updates and before finishing. Discuss disagreements, blockers, handoffs, and review findings through team messages. Own your department mission end to end. If the work is broad, research-heavy, implementation-heavy, review-heavy, or otherwise benefits from parallel thinking, actively use available subagent/agent tools, skills, MCP servers, and internal decomposition within this department; do not try to carry all substantial work in one main thread when helpers are available. Do not ask the lead to create duplicate peer departments solely for load balancing. Work on tasks assigned to your department. You may also self-claim an unassigned `ready` task with `team task claim` only when it clearly matches your department mission and you can own it end to end; after claiming, message lead with the reason and intended artifacts. When handing a file to another department, send a message and release or ask lead to reassign ownership. If you are blocked waiting for another department, a research gate, credentials, an artifact, or lead decision, set your assigned task to `blocked`, message lead and the relevant department, and finish; do not mark it completed just because your current turn is waiting. If you notice a blocked, pending, or review task whose gate appears cleared, whose prerequisite artifact/handoff has arrived, or whose next owner is ambiguous, do not start owned work for another department; send lead a concise `LEAD_PROPOSAL:` message with the evidence and proposed resume/reassign/review action. If this department is assigned to a non-local node, treat that node as your operational site. If Codex authentication is requested via device code, let the team runtime's direct local browser automation handle the device URL/code; report only if that automation fails and you remain unauthenticated.
+Start by reading your inbox, the task list, the wait list, and the ownership list. Before editing a file, claim the path with the ownership command. If another department owns the path, do not edit it until that department hands it off or lead explicitly reassigns ownership. Check your inbox again after important task updates and before finishing. Discuss disagreements, blockers, handoffs, and review findings through team messages. Own your department mission end to end. If the work is broad, research-heavy, implementation-heavy, review-heavy, or otherwise benefits from parallel thinking, actively use available subagent/agent tools, skills, MCP servers, and internal decomposition within this department; do not try to carry all substantial work in one main thread when helpers are available. Do not ask the lead to create duplicate peer departments solely for load balancing. Work on tasks assigned to your department. You may also self-claim an unassigned `ready` task with `team task claim` only when it clearly matches your department mission and you can own it end to end; after claiming, message lead with the reason and intended artifacts. When handing a file to another department, send a message and release or ask lead to reassign ownership. If you start work that cannot finish until an observable condition becomes true, register it as `team wait` unless it is already a tracked `team job`. Include the exact completion condition, current request/job/log/checkpoint identifier, owner, task, and expected evidence. Do not mark a task completed while one of its waits is open. If you are blocked waiting for another department, a research gate, credentials, an artifact, lead decision, or any other condition, set your assigned task to `blocked` or register/update a wait, message lead and the relevant department, and finish; do not mark it completed just because your current turn is waiting. If you notice a blocked, pending, or review task whose gate appears cleared, whose prerequisite artifact/handoff has arrived, or whose next owner is ambiguous, do not start owned work for another department; send lead a concise `LEAD_PROPOSAL:` message with the evidence and proposed resume/reassign/review action. If this department is assigned to a non-local node, treat that node as your operational site. If Codex authentication is requested via device code, let the team runtime's direct local browser automation handle the device URL/code; report only if that automation fails and you remain unauthenticated.
 
 Active collaboration protocol:
 - Broadcast a short initial plan to `all` when starting nontrivial work, including intended outputs, consumers, and known risks.
@@ -17275,6 +18008,9 @@ App-server managed team run:
   - "{codex}" team job --team "{team_id}" start --owner "{member}" --task <TASK_ID> --node <node-id> --cwd <cwd> -- <command...>
   - "{codex}" team job --team "{team_id}" status <job-id>
   - "{codex}" team job --team "{team_id}" logs <job-id> --tail 80
+  - "{codex}" team wait --team "{team_id}" add "<title>" --owner "{member}" --task <TASK_ID> --condition "<exact completion condition>" --progress "<request id, URL, log path, checkpoint, or current state>"
+  - "{codex}" team wait --team "{team_id}" list --owner "{member}"
+  - "{codex}" team wait --team "{team_id}" set <WAIT_ID> --status <waiting|running|polling|blocked|completed|failed|cancelled> --progress "<current state>" [--evidence <path-or-url>]
   - "{codex}" team ownership --team "{team_id}" list
   - "{codex}" team ownership --team "{team_id}" claim <PATH> --owner "{member}" --note "<editing scope>"
   - "{codex}" team ownership --team "{team_id}" release <PATH> --owner "{member}"
@@ -17299,6 +18035,9 @@ App-server managed team run:
   - "$TEAM_CLI" task set <TASK_ID> --status in_progress
   - "$TEAM_CLI" task set <TASK_ID> --status blocked --result "<what you are waiting for>"
   - "$TEAM_CLI" task set <TASK_ID> --status completed --result "<short result>"
+  - "$TEAM_CLI" wait add "<title>" --owner "{member}" --task <TASK_ID> --condition "<exact completion condition>" --progress "<request id, URL, log path, checkpoint, or current state>"
+  - "$TEAM_CLI" wait list --owner "{member}"
+  - "$TEAM_CLI" wait set <WAIT_ID> --status <waiting|running|polling|blocked|completed|failed|cancelled> --progress "<current state>" [--evidence <path-or-url>]
   - "$TEAM_CLI" message --from "{member}" lead "<message>"
   - "$TEAM_CLI" message --from "{member}" all "<message>"
   - "$TEAM_CLI" message --from "{member}" <member> "<direct question>"
@@ -17308,13 +18047,15 @@ When a teammate sends you a message, the orchestrator may steer this active turn
 If your work or an invoked skill creates or uses a Docker container for ongoing team work, do not leave it as an invisible side environment. Ask lead to use `team node create-docker` when possible; otherwise use a stable long-lived container name, mount the relevant workspace, publish any user-facing ports with `-p`, keep the container alive, and send lead the exact container name, host, mount paths, exposed ports, and suggested node kind (`docker` or `ssh-docker`) so lead can register or update the placement. If you cannot run the local team CLI but have enough details, also write one standalone line in this exact format: `TEAM_NODE id=<node-id> kind=<docker|ssh-docker> host=<ssh-host-or-> container=<container> cwd=<container-cwd> note=<short_note>`. The orchestrator will register the node and add a container-internal department automatically. Once the node is registered, the container-internal department owns installs, runtime execution, rendering, tests, and debugging inside that container; host-side departments should stop at image/container creation plus handoff unless lead asks for a rebuild or replacement. Avoid read-write mounting the host's entire `~/.codex` into a root-owned container; use `team node sync-assets`, a dedicated Codex home, copied credentials/config, or the existing bootstrap/auth flow. If lead has already assigned you to a Docker/SSH-Docker node, treat the execution node context above as authoritative.
 If you need a local artifact, schema package, config, generated input, report, or source matrix on a remote/Docker node and it is not mounted there, ask lead to hand it off with `team node sync-path <node-id> --src <local-path> --dest <node-path> [--replace]`. Do not silently recreate stale copies on the node, and treat missing handoff files as a blocker until the authoritative artifact is synced.
 If your assigned node lacks a normal verification tool, install it before weakening the verification. Example: for a web app, install Node.js/npm or a headless browser when needed to run smoke tests; for Python work, install the project/test dependencies in a venv when appropriate. In containers, root-level installs are acceptable. On SSH/local nodes, use user-local installs or passwordless sudo only.
-If you start long-running commands, servers, builds, tests, crawlers, or experiments that may need later status/logs/cancellation/artifacts, ask lead to track them with `team job --owner {member} --task <TASK_ID>` or use the local-node `team job` command when available. Do not hide important background work in an untracked shell process.
-If you start a tracked job yourself, send `all` or the relevant departments the job id, target node, exact command intent, and expected log/artifact paths. When the job completes, hand off the result and include it in `TEAM_COMPLETION_CHECKLIST`.
+If you start work that may take time, make it inspectable. Use `team job --owner {member} --task <TASK_ID>` for commands the team CLI can run and inspect. Use `team wait add --owner {member} --task <TASK_ID>` for anything with a completion condition but no reliable team-managed PID. This is generic: do not assume only a fixed set of wait types exists. Include the exact completion condition, current request/log/checkpoint identifier, and expected evidence. Do not hide important background or external work in an untracked shell process or an unregistered wait.
+If you start a tracked job or wait yourself, send `all` or the relevant departments the id, target node if any, exact intent, completion condition, and expected log/artifact/evidence paths. When it completes or fails, update the job/wait, hand off the result, and include it in `TEAM_COMPLETION_CHECKLIST`.
 If this session runs on a remote/SSH/Docker node where both the local team CLI path and `codex-team` are unavailable, communicate by writing a standalone line in this exact format:
 TEAM_MESSAGE to=<lead|all|member|member[,member...]>: <message>
 If `codex-team task set ...` is unavailable, also write one standalone line in this exact format:
 TEAM_TASK id=<TASK_ID> status=<pending|waiting|ready|in_progress|blocked|review|completed|failed|cancelled> result=<short result or blocker>
-The orchestrator will copy TEAM_MESSAGE lines into the local team mailbox and TEAM_TASK lines into the task table while your response streams, and again when your turn completes.
+If `codex-team wait ...` is unavailable, register or update a wait with one standalone line in this exact format:
+TEAM_WAIT title=<short_no_spaces> task=<TASK_ID> status=<waiting|running|polling|blocked|completed|failed|cancelled> | condition=<exact completion condition> | progress=<request id, URL, log path, checkpoint, or current state> | evidence=<path-or-url-or-empty>
+The orchestrator will copy TEAM_MESSAGE lines into the local team mailbox, TEAM_TASK lines into the task table, and TEAM_WAIT lines into the wait table while your response streams, and again when your turn completes.
 {remote_note}
 "#,
         codex = codex_exe.display(),
@@ -17506,6 +18247,9 @@ Commands:
 - "{codex}" team job --team "{team_id}" status <job-id>
 - "{codex}" team job --team "{team_id}" logs <job-id> --tail 80
 - "{codex}" team job --team "{team_id}" artifact <job-id> <path> --note "<what it is>"
+- "{codex}" team wait --team "{team_id}" add "<title>" --owner <department> --task <TASK_ID> --condition "<exact completion condition>" --progress "<request id, URL, log path, checkpoint, or current state>" [--node <node-id>] [--evidence <path-or-url>]
+- "{codex}" team wait --team "{team_id}" list [--owner <department>] [--task <TASK_ID>]
+- "{codex}" team wait --team "{team_id}" set <WAIT_ID> --status <waiting|running|polling|blocked|completed|failed|cancelled> --progress "<current state>" [--evidence <path-or-url>]
 - "{codex}" team task --team "{team_id}" list
 - "{codex}" team task --team "{team_id}" set <TASK_ID> --status <status> --depends-on <DEP_TASK_ID> [--depends-on <DEP_TASK_ID>...] --result "<why>"
 - "{codex}" team ownership --team "{team_id}" list
@@ -17544,7 +18288,7 @@ Remote/container artifact handoff policy: when a non-local department needs a lo
 
 Tooling policy: lead should expect departments to install missing task tools instead of downgrading work quality. If `team node inspect` or a department report shows missing Node.js, Python tooling, browsers, build tools, CUDA libraries, package managers, or test utilities, instruct the responsible department to install what is needed on its own node and verify with the best practical checks. In Docker containers, root installs are acceptable. On SSH/local nodes, use project-local or user-local installs first, and passwordless sudo (`sudo -n`) only when available. Do not require user intervention for ordinary package installs. Ask for a fallback only when install is impossible, unsafe, or requires an interactive password.
 
-For long-running commands, servers, builds, tests, crawlers, or experiments on any node, prefer `team job start/status/logs/artifact` over untracked background shell commands, and include `--owner <department> --task <task-id>` whenever the job executes a department mission. Jobs are generic: they are not research-specific. Use them whenever later inspection, logs, cancellation, or artifact handoff may matter.
+For any long-running or externally-completed work, make the completion condition explicit. Use `team job start/status/logs/artifact` for PID-backed commands that the team CLI can run and inspect. Use `team wait add/list/set` for anything with a completion condition but no reliable team-managed PID, including tool/API polling, service-side processing, human/account/credential gates, external queues, remote workflows owned by another process, or any other waitable dependency. Do not hardcode the category: if a task cannot continue until some observable condition becomes true, register a wait with owner, task, condition, progress/request/log identifiers, and final evidence. A task with an open wait is not complete; when the wait is completed/failed/blocked, resume the owner to inspect the result and publish the real handoff, next action, or blocker.
 
 Collaboration policy: departments should over-communicate compared with a solo Codex session. Require each nontrivial department to broadcast an initial plan, ask producer/consumer departments for judgment on uncertain choices, report failures with exact logs and proposed next actions, and hand off artifacts to the departments that must consume or review them. Departments have different natural speeds; do not equate slower output with failure, and do not push for low-quality premature artifacts just to satisfy a heartbeat. For slow or quiet work, require status evidence, current subtask, running tool/job/MCP details, risks, and the next checkpoint. Departments are also allowed to act as observers: if they see a blocked/pending/review task that appears ready or misassigned, they should send lead a `LEAD_PROPOSAL:` with evidence instead of silently waiting or starting unassigned work. Treat proposals as advisory signals; validate them against current tasks, ownerships, mailboxes, jobs, and artifacts before resuming or reassigning anyone. A completed task without a `TEAM_COMPLETION_CHECKLIST` in the department's final response is not a clean completion; resume that department with a concrete mission to send missing messages, evidence, verification, and handoff paths instead of doing its work yourself. If a department ends too quickly after a substantial mission, treat that as suspicious until its checklist and mailbox messages prove real work or a valid blocker.
 
@@ -17615,6 +18359,9 @@ Use the team CLI if you need context:
 - "{codex}" team job --team "{team_id}" start --owner lead --task <TASK_ID> --node <node-id> --cwd <cwd> -- <command...>
 - "{codex}" team job --team "{team_id}" status <job-id>
 - "{codex}" team job --team "{team_id}" logs <job-id> --tail 80
+- "{codex}" team wait --team "{team_id}" add "<title>" --owner <department> --task <TASK_ID> --condition "<exact completion condition>" --progress "<request id, URL, log path, checkpoint, or current state>"
+- "{codex}" team wait --team "{team_id}" list [--owner <department>] [--task <TASK_ID>]
+- "{codex}" team wait --team "{team_id}" set <WAIT_ID> --status <waiting|running|polling|blocked|completed|failed|cancelled> --progress "<current state>" [--evidence <path-or-url>]
 - "{codex}" team task --team "{team_id}" list
 - "{codex}" team task --team "{team_id}" set <TASK_ID> --status <status> --depends-on <DEP_TASK_ID> [--depends-on <DEP_TASK_ID>...] --result "<why>"
 - "{codex}" team ownership --team "{team_id}" list
@@ -17623,7 +18370,7 @@ Use the team CLI if you need context:
 - "{codex}" team member --team "{team_id}" standby <member> --reason "<why active work is no longer needed>"
 - "{codex}" team inbox --team "{team_id}" lead
 
-Respond as lead only if coordination, prioritization, clarification, ownership reassignment, placement add/remove, department add/standby/resume, job tracking, tooling setup, a handoff, or a `LEAD_PROPOSAL:` is useful. Current-run mailbox messages and team-owned artifacts are authoritative; stale files/images/containers from earlier teams should not override the current plan unless you deliberately adopt them with provenance and require fresh validation. If a message reveals SSH/Docker/container work, inspect/create/update the placement node and assign/resume a department there. If a teammate sends `LEAD_PROPOSAL:`, treat it as advisory: inspect the cited task, dependency, artifact, job, mailbox, and ownership state, then either resume/reassign/merge/cancel with a concrete instruction or reply why the proposal is premature. If a blocked department's gate has cleared, resume it with a concrete next mission instead of treating its earlier waiting turn as completed work. If a run hits a gated/private/401/403 external dependency or unprovided credential, preserve the evidence, keep QA blocked, and resume research/ops to find a documented public fallback or choose another current runnable option; do not accept partial output as completion. If a skill or department created/recreated a Docker container, register or update the Docker node immediately and let the auto-added container department take over work inside that container. Keep exactly one active Docker node for a given purpose; if lead and a department both created containers, choose the intended active node, standby the duplicate container department, and remove the stale node so its tasks are cancelled. If the host/SSH department is about to continue the main task through `docker run`/`docker exec`, stop it at image/container creation and redirect runtime execution, installs, rendering, and verification to the container-internal department. If a teammate reports a missing normal tool or weakens verification because something is unavailable, tell that department to install the needed dependency on its node when reasonable; Docker root installs and passwordless sudo/user-local installs are allowed. If a teammate starts long-running background work, track it with `team job --owner <department> --task <task-id>` or ask for the exact command so it can be tracked. If a department completed without a TEAM_COMPLETION_CHECKLIST or without notifying consumers, resume it and demand the missing handoff/evidence; avoid substituting your own direct `team job` unless no department can reasonably own the work. Keep this short and concrete.
+Respond as lead only if coordination, prioritization, clarification, ownership reassignment, placement add/remove, department add/standby/resume, job/wait tracking, tooling setup, a handoff, or a `LEAD_PROPOSAL:` is useful. Current-run mailbox messages and team-owned artifacts are authoritative; stale files/images/containers from earlier teams should not override the current plan unless you deliberately adopt them with provenance and require fresh validation. If a message reveals SSH/Docker/container work, inspect/create/update the placement node and assign/resume a department there. If a teammate sends `LEAD_PROPOSAL:`, treat it as advisory: inspect the cited task, dependency, artifact, job, wait, mailbox, and ownership state, then either resume/reassign/merge/cancel with a concrete instruction or reply why the proposal is premature. If a blocked department's gate has cleared, resume it with a concrete next mission instead of treating its earlier waiting turn as completed work. If a run hits a gated/private/401/403 external dependency or unprovided credential, preserve the evidence, keep QA blocked, and resume research/ops to find a documented public fallback or choose another current runnable option; do not accept partial output as completion. If a skill or department created/recreated a Docker container, register or update the Docker node immediately and let the auto-added container department take over work inside that container. Keep exactly one active Docker node for a given purpose; if lead and a department both created containers, choose the intended active node, standby the duplicate container department, and remove the stale node so its tasks are cancelled. If the host/SSH department is about to continue the main task through `docker run`/`docker exec`, stop it at image/container creation and redirect runtime execution, installs, rendering, and verification to the container-internal department. If a teammate reports a missing normal tool or weakens verification because something is unavailable, tell that department to install the needed dependency on its node when reasonable; Docker root installs and passwordless sudo/user-local installs are allowed. If a teammate starts long-running work, use `team job --owner <department> --task <task-id>` when there is a trackable command PID, or `team wait add --owner <department> --task <task-id>` when completion depends on an external/non-PID condition; require an exact condition and later evidence. If a department completed without a TEAM_COMPLETION_CHECKLIST or without notifying consumers, resume it and demand the missing handoff/evidence; avoid substituting your own direct `team job` unless no department can reasonably own the work. Keep this short and concrete.
 "#,
         member = member.name,
         role = member.role,
@@ -17671,6 +18418,9 @@ Use the team CLI if you need context:
 - "{codex}" team node --team "{team_id}" inspect [node-id]
 - "{codex}" team task --team "{team_id}" list
 - "{codex}" team task --team "{team_id}" claim [TASK_ID] --owner "{member}"
+- "{codex}" team wait --team "{team_id}" list --owner "{member}"
+- "{codex}" team wait --team "{team_id}" add "<title>" --owner "{member}" --task <TASK_ID> --condition "<exact completion condition>" --progress "<request id, URL, log path, checkpoint, or current state>"
+- "{codex}" team wait --team "{team_id}" set <WAIT_ID> --status <waiting|running|polling|blocked|completed|failed|cancelled> --progress "<current state>" [--evidence <path-or-url>]
 - "{codex}" team ownership --team "{team_id}" list
 - "{codex}" team inbox --team "{team_id}" "{member}"
 - "{codex}" team message --team "{team_id}" --from "{member}" lead "<answer, blocker, or handoff>"
@@ -17679,7 +18429,7 @@ Use the team CLI if you need context:
 
 If the follow-up asks for work that needs missing normal tools, install them when reasonable before weakening implementation or verification. Docker root installs, user-local installs, and passwordless sudo (`sudo -n`) are allowed; do not wait for an interactive sudo password.
 
-If the follow-up exposes an uncertainty, missing input, weak result, or cross-department decision, ask the relevant department for judgment instead of answering only to lead. If the follow-up completes active work, include TEAM_COMPLETION_CHECKLIST in your final response with artifacts, verification, messages_sent, consumers_notified, and blockers_or_limits.
+If the follow-up exposes an uncertainty, missing input, weak result, long wait, or cross-department decision, ask the relevant department for judgment instead of answering only to lead. If work cannot continue until an observable condition becomes true, register/update a `team wait` with the exact condition, current progress/request/log/checkpoint, task, and evidence path when available. If the follow-up completes active work, include TEAM_COMPLETION_CHECKLIST in your final response with artifacts, verification, messages_sent, consumers_notified, and blockers_or_limits.
 If this is an idle outreach message and you need help, reply with the exact blocker/question and what kind of help would unblock you. If you do not need help, no reply is required.
 
 If lead or the task table exposes an unassigned `ready` task that clearly matches your department mission, you may claim it with `team task claim`, then message lead with the reason and intended artifacts. Otherwise do not start unrelated work from a follow-up.
@@ -17887,6 +18637,14 @@ fn job_path(team_dir: &Path, job_id: &str) -> PathBuf {
     jobs_dir(team_dir).join(format!("{}.json", sanitize_id(job_id)))
 }
 
+fn waits_dir(team_dir: &Path) -> PathBuf {
+    team_dir.join("waits")
+}
+
+fn wait_path(team_dir: &Path, wait_id: &str) -> PathBuf {
+    waits_dir(team_dir).join(format!("{}.json", sanitize_id(wait_id)))
+}
+
 fn load_job(team_dir: &Path, job_id: &str) -> Result<TeamJob> {
     read_json(&job_path(team_dir, job_id)).with_context(|| format!("failed to read job `{job_id}`"))
 }
@@ -17909,6 +18667,29 @@ fn load_jobs(team_dir: &Path) -> Result<Vec<TeamJob>> {
     Ok(jobs)
 }
 
+fn load_wait(team_dir: &Path, wait_id: &str) -> Result<TeamWait> {
+    read_json(&wait_path(team_dir, wait_id))
+        .with_context(|| format!("failed to read wait `{wait_id}`"))
+}
+
+fn load_waits(team_dir: &Path) -> Result<Vec<TeamWait>> {
+    let dir = waits_dir(team_dir);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut waits = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+        {
+            waits.push(read_json::<TeamWait>(&entry.path())?);
+        }
+    }
+    waits.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(waits)
+}
+
 fn allocate_job_id(team_dir: &Path) -> Result<String> {
     fs::create_dir_all(jobs_dir(team_dir))?;
     let mut high = 0_u64;
@@ -17920,6 +18701,19 @@ fn allocate_job_id(team_dir: &Path) -> Result<String> {
         }
     }
     Ok(format!("job-{}", high + 1))
+}
+
+fn allocate_wait_id(team_dir: &Path) -> Result<String> {
+    fs::create_dir_all(waits_dir(team_dir))?;
+    let mut high = 0_u64;
+    for wait in load_waits(team_dir)? {
+        if let Some(number) = wait.id.strip_prefix("wait-")
+            && let Ok(number) = number.parse::<u64>()
+        {
+            high = high.max(number);
+        }
+    }
+    Ok(format!("wait-{}", high + 1))
 }
 
 fn load_node_for_job(team_dir: &Path, job: &TeamJob) -> Result<TeamNode> {
@@ -18429,6 +19223,34 @@ mod tests {
         .expect("write job");
     }
 
+    fn write_test_wait(
+        team_dir: &Path,
+        id: &str,
+        owner: Option<&str>,
+        task_id: Option<&str>,
+        status: TeamWaitStatus,
+    ) {
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        let now = now();
+        write_json_atomic(
+            &wait_path(team_dir, id),
+            &TeamWait {
+                id: id.to_string(),
+                title: format!("wait {id}"),
+                owner: owner.map(str::to_string),
+                task_id: task_id.map(str::to_string),
+                node: None,
+                condition: "condition becomes true".to_string(),
+                status,
+                progress: "still waiting".to_string(),
+                evidence: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write wait");
+    }
+
     #[test]
     fn completed_job_artifact_revives_blocked_owner_task() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -18494,6 +19316,89 @@ mod tests {
                 .iter()
                 .any(|event| event.event == "job_artifact_requires_owner_handoff")
         );
+    }
+
+    #[test]
+    fn open_wait_blocks_task_completion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "7",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            None,
+        );
+        write_test_wait(
+            team_dir,
+            "wait-1",
+            Some("engineering"),
+            Some("7"),
+            TeamWaitStatus::Polling,
+        );
+
+        let changed = set_task_status_if_open(team_dir, "7", TaskStatus::Completed, Some("done"))
+            .expect("set task");
+
+        assert!(changed);
+        let task = read_json::<TeamTask>(&task_path(team_dir, "7")).expect("task");
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert!(
+            task.result
+                .as_deref()
+                .is_some_and(|result| result.contains("open wait item"))
+        );
+    }
+
+    #[test]
+    fn wait_completion_resumes_owner_for_handoff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "8",
+            Some("engineering"),
+            TaskStatus::Waiting,
+            Vec::new(),
+            Some("Waiting on wait-1"),
+        );
+        write_test_wait(
+            team_dir,
+            "wait-1",
+            Some("engineering"),
+            Some("8"),
+            TeamWaitStatus::Polling,
+        );
+
+        set_team_wait(
+            team_dir,
+            WaitSetArgs {
+                id: "wait-1".to_string(),
+                status: Some(TeamWaitStatus::Completed),
+                progress: Some("finished".to_string()),
+                evidence: Some("/tmp/result.json".to_string()),
+                clear_evidence: false,
+            },
+        )
+        .expect("set wait");
+
+        let task = read_json::<TeamTask>(&task_path(team_dir, "8")).expect("task");
+        assert_eq!(task.status, TaskStatus::InProgress);
+        let config = load_config(team_dir).expect("config");
+        let engineering = config
+            .members
+            .iter()
+            .find(|member| member.name == "engineering")
+            .expect("engineering");
+        assert_eq!(engineering.status, MemberStatus::Online);
+        let messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering")).expect("messages");
+        assert!(messages.iter().any(|message| {
+            message.message.contains("WAIT_STATUS") && message.message.contains("wait-1")
+        }));
     }
 
     #[test]

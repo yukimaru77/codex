@@ -53,6 +53,95 @@ You can enable notifications by configuring a script that is run whenever the ag
 To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. If you provide both a prompt argument and piped stdin, Codex appends stdin as a `<stdin>` block after the prompt so patterns like `echo "my output" | codex exec "Summarize this concisely"` work naturally. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.
 Use `codex exec --ephemeral ...` to run without persisting session rollout files to disk.
 
+### Codex Teams orchestration (experimental)
+
+This fork includes an experimental `codex team` workflow for coordinating multiple Codex sessions through an app-server runtime. A team has a live lead session plus peer departments such as `research`, `ops`, `reviewer`, or `remote_ops`. The lead reads the natural-language goal, creates the needed departments, places them on local/SSH/Docker execution nodes, and coordinates work through a shared mailbox, task state, side-channel replies, and periodic wakeups.
+
+Start a team from a natural-language request:
+
+```shell
+codex team swarm "Use teams to inspect ssh saitou-h200, create a remote_ops department there, write a hello file, and have a local reviewer verify it." \
+  --app-server \
+  --language ja \
+  --dangerously-bypass-approvals-and-sandbox
+```
+
+Inspect and operate a running team:
+
+```shell
+codex team status --team <team-id>
+codex team monitor --team <team-id>
+codex team ui --open
+codex team message --team <team-id> --from user lead "Please continue from the previous result."
+```
+
+Track long-running or externally completed work:
+
+```shell
+codex team job --team <team-id> start --owner <department> --task <task-id> --node <node-id> -- <command...>
+codex team wait --team <team-id> add "external request" --owner <department> --task <task-id> \
+  --condition "the request result is saved and cited" \
+  --progress "request id or status URL"
+codex team wait --team <team-id> set <wait-id> --status completed --evidence <path-or-url>
+```
+
+`team job` is for commands the team runtime can launch and inspect by PID/log/exit status. `team wait` is the generic ledger for anything that has a completion condition but no reliable team-managed PID, such as external tool polling, service-side processing, human/account gates, or any other asynchronous dependency. A task with an open wait is not accepted as cleanly complete; when the wait completes or fails, the owner is resumed to inspect the result and publish the real handoff, next action, or blocker.
+
+#### Remote node bootstrap
+
+When the lead assigns a department to an SSH or Docker node, the team runtime bootstraps that execution site before starting the remote department session. The bootstrap is deterministic shell code, not an AI-written install step:
+
+- Connect to the requested SSH host or container.
+- Install basic dependencies when possible.
+- Reuse an existing `codex` binary if one is already on `PATH`, under `$HOME/.codex/bin`, `$HOME/.local/bin`, or `$HOME/bin`.
+- Otherwise download the matching release artifact from GitHub Releases, for example `codex-x86_64-unknown-linux-musl` on x86_64 Linux, and install it to `$HOME/bin/codex`.
+- Install the `codex-team` helper under `$HOME/bin`.
+- Start `codex app-server` on the remote node with SSH port forwarding back to the local team runtime.
+
+After bootstrap, the AI department takes over normal work on that node: deciding commands, creating artifacts, reporting blockers, and handing results to other departments.
+
+#### Device-auth automation
+
+If the remote node has no `$HOME/.codex/auth.json`, the bootstrap runs `codex login --device-auth` on the remote side and the local team runtime captures the device URL/code from the log. The code is then completed automatically through a dedicated local Chromium profile:
+
+```shell
+codex team auth-browser login
+codex team auth-browser status
+codex team auth-browser authorize <DEVICE-CODE>
+```
+
+`auth-browser login` opens a dedicated browser profile. Sign in with Google there once. Later device-auth prompts can be completed automatically: a temporary Chrome extension observes the OpenAI device-auth page, clicks the Google/consent steps, fills the one-time code, and waits for a success state. This is rule-based browser automation, not an LLM decision. It can still fail if the provider changes the page, requires extra 2FA, shows an extended security challenge, or the dedicated browser profile is not signed in.
+
+Local auth-browser automation requires:
+
+- A local graphical session with an X11 display. The command uses `$DISPLAY` when set, and falls back to `DISPLAY=:1` when available.
+- Chromium or Chrome on the local machine: `chromium-browser`, `chromium`, `google-chrome`, or `google-chrome-stable`.
+- `xdotool` on the local machine so the runtime can find and activate the browser window.
+- A writable dedicated browser profile. With Snap Chromium, the default profile is placed under `$HOME/snap/chromium/common/codex-team-auth-browser/chromium-profile` to avoid Snap profile-directory restrictions. Other installs use an XDG/local-data profile path.
+- A Google-signed-in state in that dedicated profile. Run `codex team auth-browser login` once and complete Google sign-in there.
+- Local network access to `https://auth.openai.com/codex/device` and the Google sign-in/consent pages.
+- A remote `codex login --device-auth` log that contains the device URL and one-time code; the team runtime parses this output and forwards the code to the local auth-browser.
+
+The auth-browser path is intentionally not headless and does not use Chrome DevTools Protocol for the OpenAI login page. It drives a normal browser window plus a temporary extension because remote-debugging based automation can trigger provider security checks more aggressively.
+
+Known fragile cases:
+
+- Google asks for additional 2FA or a manual security confirmation.
+- The dedicated profile has multiple ambiguous Google accounts and the first account is not the intended one.
+- The security verification page remains active for too long.
+- OpenAI or Google changes the page structure or visible labels used by the rule-based extension.
+- The Chromium profile is locked by another process or has become corrupt.
+- No usable X11 display is available, for example on a fully headless local machine.
+
+On a second run against the same remote node, bootstrap usually reuses:
+
+- `$HOME/bin/codex`
+- `$HOME/bin/codex-team`
+- `$HOME/.codex/auth.json`
+- synced team assets such as selected skills/config/MCP settings
+
+That means subsequent runs normally skip the Codex download and device-auth flow, then only reconnect, refresh the helper, start the remote app-server, and launch the remote department sessions.
+
 ### Experimenting with the Codex Sandbox
 
 To test to see what happens when a command is run under the sandbox provided by Codex, we provide the following subcommands in Codex CLI:
