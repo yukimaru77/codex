@@ -9128,7 +9128,7 @@ fn inspect_local_handoff_path(
         missing.push("TEAM_COMPLETION_CHECKLIST.md");
     }
     if !stats.has_manifest {
-        missing.push("sha256_manifest.txt");
+        missing.push("sha256_manifest.txt or manifest/checksums.sha256");
     }
     if !stats.has_report {
         missing.push("report markdown/text");
@@ -9169,15 +9169,21 @@ fn verify_handoff_manifests(stats: &HandoffArtifactStats) -> Result<Option<Strin
         if let Some(issue) = inspect_handoff_manifest_entries(manifest_path)? {
             return Ok(Some(issue));
         }
-        let Some(parent) = manifest_path.parent() else {
+        let Some((cwd, manifest_arg)) = sha256_manifest_check_context(manifest_path) else {
             continue;
         };
         let output = Command::new("sha256sum")
             .arg("-c")
-            .arg(manifest_path)
-            .current_dir(parent)
+            .arg(&manifest_arg)
+            .current_dir(&cwd)
             .output()
-            .with_context(|| format!("run sha256sum -c {}", manifest_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "run sha256sum -c {} from {}",
+                    manifest_arg.display(),
+                    cwd.display()
+                )
+            })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -9196,6 +9202,21 @@ fn verify_handoff_manifests(stats: &HandoffArtifactStats) -> Result<Option<Strin
         }
     }
     Ok(None)
+}
+
+fn sha256_manifest_check_context(manifest_path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let parent = manifest_path.parent()?;
+    let file_name = manifest_path.file_name()?;
+    let parent_name = parent.file_name().and_then(|name| name.to_str());
+    if matches!(parent_name, Some("manifest" | "manifests"))
+        && let (Some(root), Some(parent_file_name)) = (parent.parent(), parent.file_name())
+    {
+        return Some((
+            root.to_path_buf(),
+            PathBuf::from(parent_file_name).join(file_name),
+        ));
+    }
+    Some((parent.to_path_buf(), PathBuf::from(file_name)))
 }
 
 fn inspect_handoff_manifest_entries(manifest_path: &Path) -> Result<Option<String>> {
@@ -9248,10 +9269,28 @@ fn manifest_entry_points_to_self(entry_path: &str, manifest_path: &Path) -> bool
     if entry.is_absolute() {
         return entry == manifest_path;
     }
-    manifest_path
+    if manifest_path
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| entry_path == name)
+    {
+        return true;
+    }
+    let Some(parent) = manifest_path.parent() else {
+        return false;
+    };
+    if !matches!(
+        parent.file_name().and_then(|name| name.to_str()),
+        Some("manifest" | "manifests")
+    ) {
+        return false;
+    }
+    let Some(file_name) = manifest_path.file_name() else {
+        return false;
+    };
+    parent
+        .file_name()
+        .is_some_and(|parent_name| entry == Path::new(parent_name).join(file_name))
 }
 
 fn volatile_handoff_manifest_entry_reason(entry_path: &str) -> Option<&'static str> {
@@ -9324,6 +9363,8 @@ fn handoff_file_kind(name: &str) -> Option<HandoffFileKind> {
         return Some(HandoffFileKind::Checklist);
     }
     if lower == "sha256_manifest.txt"
+        || lower == "checksums.sha256"
+        || lower == "checksum.sha256"
         || lower.ends_with("_manifest.sha256")
         || lower.ends_with("manifest.sha256")
     {
@@ -22926,6 +22967,73 @@ authoritative_predecessor:
             Some("handoff complete"),
         );
         let task = read_json::<TeamTask>(&task_path(team_dir, "44")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
+    }
+
+    #[test]
+    fn completion_blocker_accepts_nested_checksums_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("evaluation").join("cycle1_review");
+        let manifest_dir = artifact_dir.join("manifest");
+        fs::create_dir_all(&manifest_dir).expect("manifest dir");
+        fs::write(
+            artifact_dir.join("claim_evidence_matrix.md"),
+            "# claim matrix\n",
+        )
+        .expect("matrix");
+        fs::write(
+            artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "- artifacts: cycle1_review\n- verification: sha256sum -c manifest/checksums.sha256 rc=0\n",
+        )
+        .expect("checklist");
+        fs::write(
+            artifact_dir.join("validation_summary.json"),
+            "{\"ok\":true}\n",
+        )
+        .expect("json");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "claim_evidence_matrix.md",
+                "TEAM_COMPLETION_CHECKLIST.md",
+                "validation_summary.json",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::write(manifest_dir.join("checksums.sha256"), manifest.stdout).expect("manifest");
+        send_team_message_to_dir(
+            team_dir,
+            "quality",
+            "lead",
+            "Final handoff\n\nTEAM_COMPLETION_CHECKLIST:\n- artifacts: evaluation/cycle1_review\n- verification: sha256sum -c manifest/checksums.sha256 rc=0",
+        )
+        .expect("message");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "quality".to_string(),
+                note: "Task46 evaluation handoff".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "46",
+            Some("quality"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("handoff complete"),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "46")).expect("task");
 
         let issue = task_completion_missing_required_local_outputs(team_dir, &task)
             .expect("completion blocker");
