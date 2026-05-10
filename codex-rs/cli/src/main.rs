@@ -901,6 +901,38 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             }
         }
         Some(Subcommand::Team(team_cli)) => {
+            if team_cli.is_interactive_entrypoint() {
+                let (team_shared_options, team_selector, team_language) =
+                    team_cli.into_interactive_parts();
+                let launch = team_cmd::launch_interactive_lead_team(
+                    &team_shared_options,
+                    team_selector.as_deref(),
+                    team_language,
+                )?;
+                eprintln!(
+                    "Attached to team lead: {} ({})",
+                    launch.team_id,
+                    launch.team_dir.display()
+                );
+                prepend_config_flags(
+                    &mut interactive.config_overrides,
+                    root_config_overrides.clone(),
+                );
+                interactive
+                    .shared
+                    .apply_subcommand_overrides(team_shared_options);
+                interactive.resume_session_id = Some(launch.lead_thread_id);
+                interactive.resume_include_non_interactive = true;
+                let exit_info = run_interactive_tui(
+                    interactive,
+                    Some(launch.app_server_url),
+                    None,
+                    arg0_paths.clone(),
+                )
+                .await?;
+                handle_app_exit(exit_info)?;
+                return Ok(());
+            }
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
                 root_remote_auth_token_env.as_deref(),
@@ -1900,6 +1932,72 @@ mod tests {
             include_non_interactive,
             resume_cli,
         )
+    }
+
+    #[test]
+    fn bare_team_command_parses_as_interactive_entrypoint() {
+        let cli = MultitoolCli::try_parse_from(["codex", "team"]).expect("parse");
+        let Some(Subcommand::Team(team_cli)) = cli.subcommand else {
+            panic!("expected team subcommand");
+        };
+        assert!(team_cli.is_interactive_entrypoint());
+    }
+
+    #[test]
+    fn team_subcommands_still_parse_as_non_interactive() {
+        let cli = MultitoolCli::try_parse_from(["codex", "team", "list"]).expect("parse");
+        let Some(Subcommand::Team(team_cli)) = cli.subcommand else {
+            panic!("expected team subcommand");
+        };
+        assert!(!team_cli.is_interactive_entrypoint());
+    }
+
+    #[test]
+    fn bare_team_command_accepts_interactive_yolo_flag() {
+        let cli = MultitoolCli::try_parse_from(["codex", "team", "--yolo"]).expect("parse");
+        let Some(Subcommand::Team(team_cli)) = cli.subcommand else {
+            panic!("expected team subcommand");
+        };
+        assert!(team_cli.is_interactive_entrypoint());
+        let (shared, team, language) = team_cli.into_interactive_parts();
+        assert!(shared.dangerously_bypass_approvals_and_sandbox);
+        assert_eq!(team, None);
+        assert_eq!(language, None);
+    }
+
+    #[test]
+    fn bare_team_command_accepts_existing_team_selector() {
+        let cli = MultitoolCli::try_parse_from(["codex", "team", "--team", "team-123", "--yolo"])
+            .expect("parse");
+        let Some(Subcommand::Team(team_cli)) = cli.subcommand else {
+            panic!("expected team subcommand");
+        };
+        assert!(team_cli.is_interactive_entrypoint());
+        let (shared, team, language) = team_cli.into_interactive_parts();
+        assert!(shared.dangerously_bypass_approvals_and_sandbox);
+        assert_eq!(team.as_deref(), Some("team-123"));
+        assert_eq!(language, None);
+    }
+
+    #[test]
+    fn bare_team_command_accepts_language_selector() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "team",
+            "--team",
+            "team-123",
+            "--language",
+            "ja",
+            "--yolo",
+        ])
+        .expect("parse");
+        let Some(Subcommand::Team(team_cli)) = cli.subcommand else {
+            panic!("expected team subcommand");
+        };
+        assert!(team_cli.is_interactive_entrypoint());
+        let (_shared, team, language) = team_cli.into_interactive_parts();
+        assert_eq!(team.as_deref(), Some("team-123"));
+        assert_eq!(language.map(|language| language.cli_value()), Some("ja"));
     }
 
     fn finalize_fork_from_args(args: &[&str]) -> TuiCli {

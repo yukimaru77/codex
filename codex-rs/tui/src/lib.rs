@@ -659,6 +659,19 @@ fn latest_session_lookup_params(
     }
 }
 
+fn append_developer_instructions(existing: Option<String>, suffix: &str) -> Option<String> {
+    let suffix = suffix.trim();
+    if suffix.is_empty() {
+        return existing;
+    }
+    Some(match existing {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{}\n\n{}", existing.trim_end(), suffix)
+        }
+        _ => suffix.to_string(),
+    })
+}
+
 fn config_cwd_for_app_server_target(
     cwd: Option<&Path>,
     app_server_target: &AppServerTarget,
@@ -971,6 +984,16 @@ pub async fn run_main(
             eprintln!("{err}");
             std::process::exit(1);
         }
+    }
+
+    if let Some(suffix) = cli
+        .developer_instructions_suffix
+        .as_deref()
+        .map(str::trim)
+        .filter(|suffix| !suffix.is_empty())
+    {
+        config.developer_instructions =
+            append_developer_instructions(config.developer_instructions.take(), suffix);
     }
 
     let log_dir = crate::legacy_core::config::log_dir(&config)?;
@@ -1765,6 +1788,22 @@ mod tests {
             Arc::new(EnvironmentManager::default_for_tests()),
         )
         .await
+    }
+
+    #[test]
+    fn append_developer_instructions_preserves_existing_text() {
+        assert_eq!(
+            append_developer_instructions(Some("Existing policy.".to_string()), "Team policy."),
+            Some("Existing policy.\n\nTeam policy.".to_string())
+        );
+        assert_eq!(
+            append_developer_instructions(None, "Team policy."),
+            Some("Team policy.".to_string())
+        );
+        assert_eq!(
+            append_developer_instructions(Some("Existing policy.".to_string()), "  "),
+            Some("Existing policy.".to_string())
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::SandboxModeCliArg;
 use clap::Args;
 use std::path::PathBuf;
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct SharedCliOptions {
     /// Optional image(s) to attach to the initial prompt.
     #[arg(

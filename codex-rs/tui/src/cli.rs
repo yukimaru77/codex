@@ -71,6 +71,9 @@ pub struct Cli {
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+
+    #[clap(skip)]
+    pub developer_instructions_suffix: Option<String>,
 }
 
 impl std::ops::Deref for Cli {
