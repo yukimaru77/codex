@@ -10047,9 +10047,37 @@ fn maybe_send_department_idle_wakeups(
             last_wakeup.remove(&member.name);
             continue;
         }
-        let member_has_open_tasks = tasks
+        let member_open_task_count = tasks
             .iter()
-            .any(|task| task.owner.as_deref() == Some(member.name.as_str()) && task_is_open(task));
+            .filter(|task| {
+                task.owner.as_deref() == Some(member.name.as_str()) && task_is_open(task)
+            })
+            .count();
+        let member_has_open_tasks = member_open_task_count > 0;
+        if let Some(remaining) = recent_usage_limit_retry_remaining(team_dir, &member.name)? {
+            if last_wakeup
+                .get(&member.name)
+                .is_some_and(|last| now_instant.duration_since(*last) < interval)
+            {
+                continue;
+            }
+            last_wakeup.insert(member.name.clone(), now_instant);
+            idle_since.remove(&member.name);
+            append_event(
+                team_dir,
+                "department_idle_wakeup_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "usage_limit_cooldown",
+                    "retry_after_sec": remaining.as_secs(),
+                    "owned_open_tasks": member_open_task_count,
+                    "cooldown_source": "member",
+                }),
+            )?;
+            continue;
+        }
         if let Some(remaining) = should_suppress_empty_department_ping_during_cooldown(
             config,
             active,
@@ -10273,6 +10301,31 @@ fn maybe_send_department_heartbeats(
             .filter(|task| task_is_open(task))
             .collect::<Vec<_>>();
         let active_run = active.get(&member.name).is_some_and(|run| !run.completed);
+        if !active_run
+            && let Some(remaining) = recent_usage_limit_retry_remaining(team_dir, &member.name)?
+        {
+            let entry = heartbeats
+                .entry(member.name.clone())
+                .or_insert(now_instant - interval);
+            if now_instant.duration_since(*entry) < interval {
+                continue;
+            }
+            *entry = now_instant;
+            append_event(
+                team_dir,
+                "department_heartbeat_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "usage_limit_cooldown",
+                    "retry_after_sec": remaining.as_secs(),
+                    "owned_open_tasks": member_tasks.len(),
+                    "cooldown_source": "member",
+                }),
+            )?;
+            continue;
+        }
         if member_tasks.is_empty()
             && !active_run
             && !matches!(member.status, MemberStatus::Running | MemberStatus::Standby)
@@ -23108,6 +23161,134 @@ authoritative_predecessor:
             })
             .count();
         assert_eq!(skipped_count, 1);
+    }
+
+    #[test]
+    fn department_pings_suppress_open_task_owner_during_member_usage_limit_cooldown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let now = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-open-task-cooldown".to_string(),
+            goal: "continuous research loop".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "research".to_string(),
+                    role: "research".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+            ],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        write_test_task(
+            team_dir,
+            "1",
+            Some("research"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            None,
+        );
+        append_event(
+            team_dir,
+            "app_server_member_usage_limited",
+            serde_json::json!({
+                "member": "research",
+                "node": "local",
+                "thread": "thread",
+                "turn": "turn",
+                "status": "Failed",
+                "error": "You've hit your usage limit. Try again later.",
+                "retry_after_sec": 600,
+            }),
+        )
+        .expect("usage event");
+
+        let mut heartbeats = HashMap::new();
+        maybe_send_department_heartbeats(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut heartbeats,
+            &HashMap::new(),
+            Duration::from_secs(60),
+            TeamPromptLanguage::En,
+        )
+        .expect("heartbeat");
+
+        let mut idle_since = HashMap::from([(
+            "research".to_string(),
+            Instant::now() - Duration::from_secs(601),
+        )]);
+        let mut last_wakeup = HashMap::new();
+        let mut last_batch = Instant::now() - Duration::from_secs(601);
+        let mut cursor = 0_usize;
+        maybe_send_department_idle_wakeups(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut idle_since,
+            &mut last_wakeup,
+            &mut last_batch,
+            &mut cursor,
+            Duration::from_secs(600),
+            TeamPromptLanguage::En,
+        )
+        .expect("idle wakeup");
+
+        let research_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "research")).expect("mailbox");
+        assert!(research_messages.is_empty());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "department_heartbeat_skipped"
+                && event.data.get("reason").and_then(|value| value.as_str())
+                    == Some("usage_limit_cooldown")
+                && event
+                    .data
+                    .get("cooldown_source")
+                    .and_then(|value| value.as_str())
+                    == Some("member")
+                && event
+                    .data
+                    .get("owned_open_tasks")
+                    .and_then(|value| value.as_u64())
+                    == Some(1)
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "department_idle_wakeup_skipped"
+                && event.data.get("reason").and_then(|value| value.as_str())
+                    == Some("usage_limit_cooldown")
+                && event
+                    .data
+                    .get("cooldown_source")
+                    .and_then(|value| value.as_str())
+                    == Some("member")
+                && event
+                    .data
+                    .get("owned_open_tasks")
+                    .and_then(|value| value.as_u64())
+                    == Some(1)
+        }));
     }
 
     #[test]
