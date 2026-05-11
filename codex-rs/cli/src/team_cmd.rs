@@ -11320,15 +11320,24 @@ fn run_task(root: &Path, cli: TaskCli) -> Result<()> {
     let _lock = lock_team_state(&team_dir)?;
     match cli.subcommand {
         TaskSubcommand::Add(args) => {
-            let task = create_task(&team_dir, args)?;
-            append_event(
-                &team_dir,
-                "task_created",
-                serde_json::json!({ "task": task }),
-            )?;
-            auto_promote_dependency_waits(&team_dir)?;
-            touch_config(&team_dir)?;
-            println!("Created task {}", task.id);
+            let (task, reused) = create_or_reuse_similar_open_task(&team_dir, args)?;
+            if reused {
+                append_event(
+                    &team_dir,
+                    "task_add_reused_similar_open_task",
+                    serde_json::json!({ "task": task }),
+                )?;
+                println!("Reused task {}", task.id);
+            } else {
+                append_event(
+                    &team_dir,
+                    "task_created",
+                    serde_json::json!({ "task": task }),
+                )?;
+                auto_promote_dependency_waits(&team_dir)?;
+                touch_config(&team_dir)?;
+                println!("Created task {}", task.id);
+            }
             Ok(())
         }
         TaskSubcommand::Claim(args) => claim_ready_task(&team_dir, args),
@@ -14459,6 +14468,76 @@ fn create_task(team_dir: &Path, args: TaskAddArgs) -> Result<TeamTask> {
     };
     write_json_atomic(&task_path(team_dir, &id), &task)?;
     Ok(task)
+}
+
+fn create_or_reuse_similar_open_task(
+    team_dir: &Path,
+    args: TaskAddArgs,
+) -> Result<(TeamTask, bool)> {
+    let candidate_depends_on = normalize_task_dependencies(args.depends_on.clone(), None)?;
+    if let Some(task) = find_similar_open_task_for_add(team_dir, &args, &candidate_depends_on)? {
+        return Ok((task, true));
+    }
+    Ok((create_task(team_dir, args)?, false))
+}
+
+fn find_similar_open_task_for_add(
+    team_dir: &Path,
+    args: &TaskAddArgs,
+    candidate_depends_on: &[String],
+) -> Result<Option<TeamTask>> {
+    let candidate_text = format!("{} {}", args.subject, args.description);
+    let mut best = None::<(TeamTask, f32)>;
+    for task in load_tasks(team_dir)? {
+        if matches!(
+            task.status,
+            TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Failed
+        ) {
+            continue;
+        }
+        if task.owner != args.owner {
+            continue;
+        }
+        if task.depends_on != candidate_depends_on {
+            continue;
+        }
+        let existing_text = format!("{} {}", task.subject, task.description);
+        let similarity = task_text_containment_similarity(&existing_text, &candidate_text);
+        if similarity < 0.75 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(_, score)| similarity > *score) {
+            best = Some((task, similarity));
+        }
+    }
+    Ok(best.map(|(task, _)| task))
+}
+
+fn task_text_containment_similarity(left: &str, right: &str) -> f32 {
+    let left_tokens = task_similarity_tokens(left);
+    let right_tokens = task_similarity_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return 0.0;
+    }
+    let common = left_tokens.intersection(&right_tokens).count();
+    common as f32 / left_tokens.len().min(right_tokens.len()) as f32
+}
+
+fn task_similarity_tokens(text: &str) -> HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "as", "for", "in", "of", "on", "or", "the", "to", "with", "を", "と",
+        "の", "に", "は",
+    ];
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            if token.len() < 3 || STOPWORDS.contains(&token.as_str()) {
+                None
+            } else {
+                Some(token)
+            }
+        })
+        .collect()
 }
 
 fn create_or_reuse_resume_task(
@@ -20963,6 +21042,74 @@ mod tests {
         assert!(
             task_created_index < task_unblocked_index,
             "task_created should be recorded before dependency unblocking"
+        );
+    }
+
+    #[test]
+    fn task_add_reuses_similar_open_task_with_same_owner_and_dependencies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let team_dir = root.join("team-task-test");
+        write_test_config(&team_dir);
+        write_test_task(
+            &team_dir,
+            "36",
+            Some("quality"),
+            TaskStatus::Completed,
+            Vec::new(),
+            Some("evaluation complete"),
+        );
+        write_test_task(
+            &team_dir,
+            "37",
+            Some("quality"),
+            TaskStatus::Completed,
+            Vec::new(),
+            Some("audit complete"),
+        );
+        let now = now();
+        write_json_atomic(
+            &task_path(&team_dir, "38"),
+            &TeamTask {
+                id: "38".to_string(),
+                subject: "post task35 preparation review reconciliation and next gate decision"
+                    .to_string(),
+                description: String::new(),
+                owner: Some("engineering".to_string()),
+                status: TaskStatus::Waiting,
+                depends_on: vec!["36".to_string(), "37".to_string()],
+                result: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write task 38");
+
+        run_task(
+            root,
+            TaskCli {
+                selector: TeamSelector {
+                    team: Some("team-task-test".to_string()),
+                },
+                subcommand: TaskSubcommand::Add(TaskAddArgs {
+                    subject: "task35 preparation preflight review reconciliation".to_string(),
+                    description: String::new(),
+                    owner: Some("engineering".to_string()),
+                    depends_on: vec!["36".to_string(), "37".to_string()],
+                }),
+            },
+        )
+        .expect("task add should reuse");
+
+        let tasks = load_tasks(&team_dir).expect("load tasks");
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks.iter().any(|task| task.id == "38"));
+        assert!(!task_path(&team_dir, "39").exists());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "task_add_reused_similar_open_task")
         );
     }
 
