@@ -7465,7 +7465,8 @@ fn merge_side_context_ids(run: &mut AppServerMemberRun, context_ids: &[String]) 
 }
 
 fn side_reply_message_body(reply: &AppServerSideReply, language: TeamPromptLanguage) -> String {
-    let body = reply.buffer.trim();
+    let cleaned = strip_side_channel_completion_checklist(&reply.buffer);
+    let body = cleaned.trim();
     if body.is_empty() {
         return String::new();
     }
@@ -7480,6 +7481,14 @@ fn side_reply_message_body(reply: &AppServerSideReply, language: TeamPromptLangu
             reply.member.name, body
         )
     }
+}
+
+fn strip_side_channel_completion_checklist(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    let Some(idx) = lower.find("team_completion_checklist:") else {
+        return message.to_string();
+    };
+    message[..idx].trim_end().to_string()
 }
 
 fn summarize_side_reply_messages(messages: &[MailMessage], language: TeamPromptLanguage) -> String {
@@ -10976,14 +10985,14 @@ fn build_side_channel_reply_prompt(
 ) -> String {
     if language.is_ja() {
         format!(
-            "あなたは Codex team における @{name} の fast side-channel responder です。\n\n部署 role: {role}\n\nmain @{name} turn はまだ実行中です。止めないでください。long job を始めないでください。この side channel で広範な実装作業をしないでください。必要なら軽い local state の確認は可能ですが、主目的は部署間の対話を滑らかに保つことです。\n\n以下の incoming team messages に対して、@{name} としてすぐに簡潔に返信してください。返信は requester に直接送られるため、「返信した」というメタ要約ではなく、実質的な答えそのものを書いてください。status を聞かれた場合は current mode、blocker 有無、request/job id、command/log path、next checkpoint、expected artifact filenames、verification gate を具体的に含めてください。main turn の作業変更が必要なら、main turn が取り込むべき commitment/constraint を明記してください。不明なら具体的な clarifying question を 1 つだけ聞くか blocker を述べてください。必要がなければ markdown code fence は使わないでください。自然文は日本語で書いてください。\n\nIncoming messages:\n{}",
+            "あなたは Codex team における @{name} の fast side-channel responder です。\n\n部署 role: {role}\n\nmain @{name} turn はまだ実行中です。止めないでください。long job を始めないでください。この side channel で広範な実装作業をしないでください。必要なら軽い local state の確認は可能ですが、主目的は部署間の対話を滑らかに保つことです。\n\n以下の incoming team messages に対して、@{name} としてすぐに簡潔に返信してください。返信は requester に直接送られるため、「返信した」というメタ要約ではなく、実質的な答えそのものを書いてください。status を聞かれた場合は current mode、blocker 有無、request/job id、command/log path、next checkpoint、expected artifact filenames、verification gate を具体的に含めてください。main turn の作業変更が必要なら、main turn が取り込むべき commitment/constraint を明記してください。不明なら具体的な clarifying question を 1 つだけ聞くか blocker を述べてください。side-channel は task 完了・artifact handoff ではないため、TEAM_COMPLETION_CHECKLIST を絶対に書かないでください。必要がなければ markdown code fence は使わないでください。自然文は日本語で書いてください。\n\nIncoming messages:\n{}",
             summarize_side_reply_messages(messages, language),
             name = member.name,
             role = member.role,
         )
     } else {
         format!(
-            "You are @{name}'s fast side-channel responder for a Codex team.\n\nYour department role: {role}\n\nThe main @{name} turn is still running. Do not stop it, do not start long jobs, and do not perform broad implementation work in this side channel. You may inspect lightweight local state if needed, but the primary purpose is to keep inter-department discussion fluid.\n\nReply immediately and concisely as @{name} to the incoming team messages below. Your reply is sent directly to the requester, so it must be the substantive answer itself, not a meta-summary of what you did. Do not write phrases like \"I replied\", \"handed back\", \"will tell lead\", or \"status was provided\" unless you also include the actual requested facts in the same message. If the incoming message asks for status, include concrete status fields directly: current mode, blocker or none, request/job id or none, command/log path if any, next checkpoint, expected artifact filenames, and any verification gate. If the request requires the main turn to change its work, state the exact commitment or constraint that the main turn must incorporate. If you are unsure, ask one concrete clarifying question or state the blocker. Do not include markdown code fences unless necessary.\n\nIncoming messages:\n{}",
+            "You are @{name}'s fast side-channel responder for a Codex team.\n\nYour department role: {role}\n\nThe main @{name} turn is still running. Do not stop it, do not start long jobs, and do not perform broad implementation work in this side channel. You may inspect lightweight local state if needed, but the primary purpose is to keep inter-department discussion fluid.\n\nReply immediately and concisely as @{name} to the incoming team messages below. Your reply is sent directly to the requester, so it must be the substantive answer itself, not a meta-summary of what you did. Do not write phrases like \"I replied\", \"handed back\", \"will tell lead\", or \"status was provided\" unless you also include the actual requested facts in the same message. If the incoming message asks for status, include concrete status fields directly: current mode, blocker or none, request/job id or none, command/log path if any, next checkpoint, expected artifact filenames, and any verification gate. If the request requires the main turn to change its work, state the exact commitment or constraint that the main turn must incorporate. If you are unsure, ask one concrete clarifying question or state the blocker. A side-channel reply is not task completion or artifact handoff, so never include TEAM_COMPLETION_CHECKLIST. Do not include markdown code fences unless necessary.\n\nIncoming messages:\n{}",
             summarize_side_reply_messages(messages, language),
             name = member.name,
             role = member.role,
@@ -20060,6 +20069,63 @@ mod tests {
                 .unwrap_or("")
                 .contains("reported handoff hash for `manifest.sha256` is stale")
         );
+    }
+
+    #[test]
+    fn side_channel_reply_strips_completion_checklist_noise() {
+        let member = TeamMember {
+            name: "runtime_container".to_string(),
+            role: "container".to_string(),
+            status: MemberStatus::Running,
+            joined_at: now(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let reply = AppServerSideReply {
+            member,
+            node_id: "runtime_container".to_string(),
+            source_thread_id: "main".to_string(),
+            side_thread_id: "side".to_string(),
+            turn_id: "turn".to_string(),
+            recipients: vec!["lead".to_string()],
+            messages: Vec::new(),
+            buffer: "現状はpreflight中です。\n\nTEAM_COMPLETION_CHECKLIST:\n- artifacts: none\n- verification: message sent rc=0\n"
+                .to_string(),
+            started_at: Instant::now(),
+        };
+
+        let body = side_reply_message_body(&reply, TeamPromptLanguage::Ja);
+
+        assert!(body.contains("現状はpreflight中です。"));
+        assert!(!body.contains("TEAM_COMPLETION_CHECKLIST"));
+        assert!(!body.contains("artifacts: none"));
+    }
+
+    #[test]
+    fn side_channel_prompt_forbids_completion_checklist() {
+        let member = TeamMember {
+            name: "worker".to_string(),
+            role: "runtime".to_string(),
+            status: MemberStatus::Running,
+            joined_at: now(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let messages = vec![MailMessage {
+            from: "lead".to_string(),
+            to: "worker".to_string(),
+            message: "status?".to_string(),
+            timestamp: now(),
+            read: false,
+        }];
+
+        let en = build_side_channel_reply_prompt(&member, &messages, TeamPromptLanguage::En);
+        let ja = build_side_channel_reply_prompt(&member, &messages, TeamPromptLanguage::Ja);
+
+        assert!(en.contains("never include TEAM_COMPLETION_CHECKLIST"));
+        assert!(ja.contains("TEAM_COMPLETION_CHECKLIST を絶対に書かない"));
     }
 
     #[test]
