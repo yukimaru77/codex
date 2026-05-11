@@ -8748,6 +8748,8 @@ fn maybe_send_idle_department_outreach(
     *last_outreach = now_instant;
 
     let tasks = load_tasks(team_dir)?;
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
     let mut helpers = config
         .members
         .iter()
@@ -8759,6 +8761,7 @@ fn maybe_send_idle_department_outreach(
             )
         })
         .filter(|member| active.get(&member.name).is_none_or(|run| run.completed))
+        .filter(|member| member_node_unavailable_from_nodes(member, &nodes).is_none())
         .filter(|member| {
             !tasks.iter().any(|task| {
                 task.owner.as_deref() == Some(member.name.as_str())
@@ -8790,6 +8793,10 @@ fn maybe_send_idle_department_outreach(
         .iter()
         .filter(|member| member.role != "lead")
         .filter(|member| !matches!(member.status, MemberStatus::Failed | MemberStatus::Offline))
+        .filter(|member| {
+            active.get(&member.name).is_some_and(|run| !run.completed)
+                || member_node_unavailable_from_nodes(member, &nodes).is_none()
+        })
         .filter(|member| {
             tasks.iter().any(|task| {
                 task.owner.as_deref() == Some(member.name.as_str())
@@ -22884,6 +22891,110 @@ authoritative_predecessor:
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].from, "helper");
         assert!(messages[0].message.contains("Periodic idle outreach"));
+    }
+
+    #[test]
+    fn idle_outreach_skips_unavailable_remote_helpers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let now = now();
+        let stale = (Utc::now() - chrono::Duration::seconds(11 * 60))
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let config = TeamConfig {
+            version: 1,
+            id: "team-test".to_string(),
+            goal: "test".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Online,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "remote_helper".to_string(),
+                    role: "review".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: Some("remote".to_string()),
+                },
+                TeamMember {
+                    name: "target".to_string(),
+                    role: "worker".to_string(),
+                    status: MemberStatus::Running,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+            ],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        write_nodes(
+            team_dir,
+            &[TeamNode {
+                id: "remote".to_string(),
+                kind: TeamNodeKind::Ssh,
+                url: Some("ws://127.0.0.1:9999".to_string()),
+                host: Some("remote-host".to_string()),
+                container: None,
+                cwd: Some("/work".to_string()),
+                status: TeamNodeStatus::Online,
+                note: String::new(),
+                created_at: now.clone(),
+                updated_at: stale,
+            }],
+        )
+        .expect("write nodes");
+        write_json_atomic(
+            &task_path(team_dir, "1"),
+            &TeamTask {
+                id: "1".to_string(),
+                subject: "active work".to_string(),
+                description: String::new(),
+                owner: Some("target".to_string()),
+                status: TaskStatus::InProgress,
+                depends_on: Vec::new(),
+                result: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write task");
+
+        let mut last = Instant::now() - Duration::from_secs(601);
+        let mut cursor = 0;
+        maybe_send_idle_department_outreach(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut last,
+            &mut cursor,
+            Duration::from_secs(600),
+            TeamPromptLanguage::En,
+        )
+        .expect("outreach");
+
+        let messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "target")).unwrap_or_default();
+        assert!(messages.is_empty());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "idle_outreach_skipped"
+                && event.data.get("reason").and_then(|value| value.as_str())
+                    == Some("no_idle_departments")
+        }));
     }
 
     #[test]
