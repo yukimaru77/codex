@@ -4183,16 +4183,30 @@ fn mailbox_unread_counts(team_dir: &Path, member_name: &str) -> Result<MailboxUn
 
 fn format_node_status_line(node: &TeamNode) -> String {
     let (age, stale) = format_node_last_seen_age(&node.updated_at);
+    let status = format_node_display_status(&node.status, stale);
     format!(
-        "  {} {:?} {:?} url={} last_seen={} age={}{}",
+        "  {} {:?} {} url={} last_seen={} age={}{}",
         node.id,
         node.kind,
-        node.status,
+        status,
         node.url.as_deref().unwrap_or(""),
         node.updated_at,
         age,
         if stale { " stale" } else { "" }
     )
+}
+
+fn format_node_display_status(status: &TeamNodeStatus, stale: bool) -> String {
+    if stale {
+        match status {
+            TeamNodeStatus::Online => "Stale(raw=Online)".to_string(),
+            TeamNodeStatus::Pending => "Pending(stale)".to_string(),
+            TeamNodeStatus::Offline => "Offline(stale)".to_string(),
+            TeamNodeStatus::Failed => "Failed(stale)".to_string(),
+        }
+    } else {
+        format!("{status:?}")
+    }
 }
 
 fn format_usage_limit_cooldowns(team_dir: &Path, config: &TeamConfig) -> Result<String> {
@@ -20738,7 +20752,7 @@ mod tests {
         let status = format_status_text(team_dir).expect("status");
 
         assert!(status.contains(
-            "remote Ssh Online url=ws://127.0.0.1:9999 last_seen=2026-05-08T06:41:31Z age="
+            "remote Ssh Stale(raw=Online) url=ws://127.0.0.1:9999 last_seen=2026-05-08T06:41:31Z age="
         ));
         assert!(status.contains(" stale"));
     }
