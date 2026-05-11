@@ -8929,23 +8929,40 @@ fn maybe_warn_unattended_tasks(
                 proposal_lines.join("\n")
             )
         };
+        let owner_cooldown = recent_usage_limit_retry_remaining(team_dir, owner)?;
+        let cooldown_note = if let Some(remaining) = owner_cooldown {
+            if language.is_ja() {
+                format!(
+                    " owner は usage-limit cooldown 中です retry_in={}。owner へ直接 wakeup を積まず、lead が待機・正式な再割当て・安全な代替 owner のいずれかを判断してください。",
+                    format_compact_duration(remaining.as_secs())
+                )
+            } else {
+                format!(
+                    " The owner is in usage-limit cooldown retry_in={}; do not queue direct owner wakeups. Lead should explicitly wait, reassign, or choose a safe alternate owner.",
+                    format_compact_duration(remaining.as_secs())
+                )
+            }
+        } else {
+            String::new()
+        };
         let message = if language.is_ja() {
             format!(
-                "Task watchdog: task {} は @{owner} が owner で、状態は `{}` ですが、owner の live turn も tracked running job もありません。Owner status は {status} です。lead は @{owner} を resume するか、`team job --owner {owner} --task {}` を attach/start するか、具体的 blocker 付きで blocked にするか、evidence 付きで completed にしてください。{proposal_note}",
+                "Task watchdog: task {} は @{owner} が owner で、状態は `{}` ですが、owner の live turn も tracked running job もありません。Owner status は {status} です。lead は @{owner} を resume するか、`team job --owner {owner} --task {}` を attach/start するか、具体的 blocker 付きで blocked にするか、evidence 付きで completed にしてください。{cooldown_note}{proposal_note}",
                 task.id, task.status, task.id
             )
         } else {
             format!(
-                "Task watchdog: task {} owned by @{owner} is `{}` but has no live owner turn and no tracked running job. Owner status is {status}. Resume @{owner}, attach/start a `team job --owner {owner} --task {}`, mark it blocked with a concrete blocker, or complete it with evidence.{proposal_note}",
+                "Task watchdog: task {} owned by @{owner} is `{}` but has no live owner turn and no tracked running job. Owner status is {status}. Resume @{owner}, attach/start a `team job --owner {owner} --task {}`, mark it blocked with a concrete blocker, or complete it with evidence.{cooldown_note}{proposal_note}",
                 task.id, task.status, task.id
             )
         };
         send_team_message_to_dir(team_dir, "system", &config.lead, &message)?;
-        if config.members.iter().any(|member| member.name == owner) {
+        if owner_cooldown.is_none() && config.members.iter().any(|member| member.name == owner) {
             send_team_message_to_dir(team_dir, "system", owner, &message)?;
         }
         let mut reactivated_owner = false;
-        if task_status_can_start_turn(task.status)
+        if owner_cooldown.is_none()
+            && task_status_can_start_turn(task.status)
             && let Some(member) = config
                 .members
                 .iter_mut()
@@ -8970,6 +8987,7 @@ fn maybe_warn_unattended_tasks(
                 "owner_status": status,
                 "reason": "no live owner turn and no tracked running job",
                 "owner_reactivated": reactivated_owner,
+                "owner_usage_limit_cooldown_sec": owner_cooldown.map(|remaining| remaining.as_secs()),
             }),
         )?;
     }
@@ -23879,6 +23897,119 @@ authoritative_predecessor:
                     .get("owner_reactivated")
                     .and_then(|value| value.as_bool())
                     == Some(true)
+        }));
+    }
+
+    #[test]
+    fn task_watchdog_does_not_reactivate_usage_limited_owner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        fs::create_dir_all(team_dir.join("jobs")).expect("jobs dir");
+        let now = now();
+        let old = (Utc::now() - chrono::Duration::seconds(180))
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let config = TeamConfig {
+            version: 1,
+            id: "team-watch-cooldown".to_string(),
+            goal: "test".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Online,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "worker".to_string(),
+                    role: "worker".to_string(),
+                    status: MemberStatus::Completed,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+            ],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        write_json_atomic(
+            &task_path(team_dir, "42"),
+            &TeamTask {
+                id: "42".to_string(),
+                subject: "needs work".to_string(),
+                description: String::new(),
+                owner: Some("worker".to_string()),
+                status: TaskStatus::InProgress,
+                depends_on: Vec::new(),
+                result: None,
+                created_at: old.clone(),
+                updated_at: old,
+            },
+        )
+        .expect("write task");
+        append_event(
+            team_dir,
+            "app_server_member_usage_limited",
+            serde_json::json!({
+                "member": "worker",
+                "node": "local",
+                "thread": "thread",
+                "turn": "turn",
+                "status": "Failed",
+                "error": "You've hit your usage limit. Try again later.",
+                "retry_after_sec": 600,
+            }),
+        )
+        .expect("usage event");
+
+        let mut last = Instant::now() - Duration::from_secs(61);
+        let mut warned = HashSet::new();
+        maybe_warn_unattended_tasks(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut last,
+            &mut warned,
+            Duration::from_secs(60),
+            TeamPromptLanguage::En,
+        )
+        .expect("watchdog");
+
+        let lead_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "lead")).expect("lead mailbox");
+        let worker_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "worker")).expect("worker mailbox");
+        assert_eq!(lead_messages.len(), 1);
+        assert!(lead_messages[0].message.contains("usage-limit cooldown"));
+        assert!(worker_messages.is_empty());
+        let config = load_config(team_dir).expect("reload config");
+        let worker = config
+            .members
+            .iter()
+            .find(|member| member.name == "worker")
+            .expect("worker");
+        assert_eq!(worker.status, MemberStatus::Completed);
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "task_watchdog_attention"
+                && event
+                    .data
+                    .get("owner_reactivated")
+                    .and_then(|value| value.as_bool())
+                    == Some(false)
+                && event
+                    .data
+                    .get("owner_usage_limit_cooldown_sec")
+                    .and_then(|value| value.as_u64())
+                    .is_some()
         }));
     }
 
