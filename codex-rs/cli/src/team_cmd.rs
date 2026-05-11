@@ -9605,9 +9605,9 @@ fn maybe_send_lead_autonomy_tick(
     };
     let continuation_policy = if goal_requests_continuation {
         if language.is_ja() {
-            "この team の goal は継続・反復を明示しています。open task/open wait がなく、監査・評価・handoff に recommended next action / next cycle がある場合、idle とみなさず、lead が次サイクルの task/owner/wait/job を作るか、ユーザー入力が必要な blocker を明示してください。".to_string()
+            "この team の goal は継続・反復を明示しています。open task/open wait がなく、監査・評価・handoff に recommended next action / follow-up がある場合、idle とみなさず、lead が次の許可済み task/owner/wait/job を作るか、ユーザー入力が必要な blocker を明示してください。研究 skill が明示的に要求する場合だけ、研究サイクルとして扱ってください。".to_string()
         } else {
-            "This team's goal explicitly requests continuation/iteration. If there are no open tasks or waits but audit/evaluation/handoff artifacts contain recommended next actions or a next cycle, do not treat the team as idle; lead must either create the next cycle tasks/owners/waits/jobs or record the concrete blocker requiring user input.".to_string()
+            "This team's goal explicitly requests continuation/iteration. If there are no open tasks or waits but audit/evaluation/handoff artifacts contain recommended next actions or follow-ups, do not treat the team as idle; lead must either create the next authorized tasks/owners/waits/jobs or record the concrete blocker requiring user input. Treat the work as a research cycle only when a domain skill explicitly requires it.".to_string()
         }
     } else if language.is_ja() {
         "この team の goal は明示的な継続 loop を要求していません。next action signal は参考情報として扱い、勝手に新しい改善 loop を作らず、必要ならユーザー入力待ちを明示してください。".to_string()
@@ -17853,17 +17853,7 @@ fn extract_probable_local_paths_from_task_text(team_dir: &Path, task: &TeamTask)
 }
 
 fn clean_embedded_path_token(token: &str) -> Option<&str> {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '`' | '\'' | '"' | ',' | '.' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}'
-        )
-    });
-    if trimmed.starts_with("/home/") || trimmed.starts_with("/tmp/") {
-        Some(trimmed)
-    } else {
-        None
-    }
+    embedded_absolute_path_slice(token, &["/home/", "/tmp/"])
 }
 
 fn extract_absolute_paths_from_text(text: &str) -> Vec<String> {
@@ -17873,13 +17863,7 @@ fn extract_absolute_paths_from_text(text: &str) -> Vec<String> {
 }
 
 fn clean_embedded_absolute_path_token(token: &str) -> Option<String> {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '`' | '\'' | '"' | ',' | '.' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}'
-        )
-    });
-    let starts_with_absolute_root = [
+    let roots = [
         "/home/",
         "/tmp/",
         "/workspace/",
@@ -17888,14 +17872,85 @@ fn clean_embedded_absolute_path_token(token: &str) -> Option<String> {
         "/mnt/",
         "/opt/",
         "/root/",
-    ]
-    .iter()
-    .any(|prefix| trimmed.starts_with(prefix));
-    if starts_with_absolute_root {
-        Some(trimmed.to_string())
+    ];
+    embedded_absolute_path_slice(token, &roots).map(str::to_string)
+}
+
+fn embedded_absolute_path_slice<'a>(token: &'a str, roots: &[&str]) -> Option<&'a str> {
+    let trimmed = token.trim_matches(path_wrapper_or_trailing_punctuation);
+    let start = roots.iter().filter_map(|root| trimmed.find(root)).min()?;
+    let candidate = &trimmed[start..];
+    let end = candidate
+        .char_indices()
+        .find_map(|(idx, ch)| (idx > 0 && path_token_terminator(ch)).then_some(idx))
+        .unwrap_or(candidate.len());
+    let path = candidate[..end].trim_matches(path_wrapper_or_trailing_punctuation);
+    if roots.iter().any(|root| path.starts_with(root)) {
+        Some(path)
     } else {
         None
     }
+}
+
+fn path_wrapper_or_trailing_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '`' | '\''
+            | '"'
+            | ','
+            | '.'
+            | ';'
+            | ':'
+            | ')'
+            | '('
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+            | '。'
+            | '、'
+            | '，'
+            | '；'
+            | '：'
+            | '）'
+            | '（'
+            | '」'
+            | '「'
+            | '』'
+            | '『'
+    )
+}
+
+fn path_token_terminator(ch: char) -> bool {
+    matches!(
+        ch,
+        '`' | '\''
+            | '"'
+            | ','
+            | ';'
+            | ':'
+            | ')'
+            | '('
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+            | '。'
+            | '、'
+            | '，'
+            | '；'
+            | '：'
+            | '）'
+            | '（'
+            | '」'
+            | '「'
+            | '』'
+            | '『'
+    )
 }
 
 fn notify_rejected_task_completions(
@@ -19562,6 +19617,29 @@ mod tests {
             },
         )
         .expect("write task");
+    }
+
+    #[test]
+    fn embedded_local_path_extraction_handles_japanese_punctuation_and_prefixes() {
+        assert_eq!(
+            clean_embedded_path_token(
+                "出力先=/home/yukimaru/research/team/audit/protocol_freeze_review。必須成果物:"
+            ),
+            Some("/home/yukimaru/research/team/audit/protocol_freeze_review")
+        );
+        assert_eq!(
+            clean_embedded_path_token(
+                "root=/home/yukimaru/research/team/evaluation/protocol_freeze_review、manifest"
+            ),
+            Some("/home/yukimaru/research/team/evaluation/protocol_freeze_review")
+        );
+        assert_eq!(
+            clean_embedded_absolute_path_token(
+                "container_root=/workspace/team/runtime/cycle1。次の確認"
+            )
+            .as_deref(),
+            Some("/workspace/team/runtime/cycle1")
+        );
     }
 
     #[test]
