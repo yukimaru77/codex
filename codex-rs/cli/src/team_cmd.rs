@@ -9579,6 +9579,33 @@ fn maybe_send_lead_autonomy_tick(
     } else {
         String::new()
     };
+    let mut task_owner_cooldown_lines = Vec::new();
+    let mut seen_cooldown_owners = HashSet::new();
+    for task in &open_tasks {
+        let Some(owner) = task.owner.as_deref() else {
+            continue;
+        };
+        if !seen_cooldown_owners.insert(owner.to_string()) {
+            continue;
+        }
+        if let Some(remaining) = recent_usage_limit_retry_remaining(team_dir, owner)? {
+            let owner_open_tasks = open_tasks
+                .iter()
+                .filter(|candidate| candidate.owner.as_deref() == Some(owner))
+                .map(|candidate| format!("#{}", candidate.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            task_owner_cooldown_lines.push(format!(
+                "- @{owner} owns open task(s) {owner_open_tasks} but is in usage-limit cooldown for {duration}; lead must either wait explicitly, reassign, or create a safe alternate task owner.",
+                duration = format_compact_duration(remaining.as_secs())
+            ));
+        }
+    }
+    let task_owner_cooldown_block = if task_owner_cooldown_lines.is_empty() {
+        "- none".to_string()
+    } else {
+        task_owner_cooldown_lines.join("\n")
+    };
     let open_wait_lines = open_waits
         .iter()
         .take(20)
@@ -9625,7 +9652,7 @@ fn maybe_send_lead_autonomy_tick(
     };
     let message = if language.is_ja() {
         format!(
-            "Lead autonomy tick: あなたはこの team の意思決定オーケストレーターです。team runtime は状態を報告し、この tick を届けているだけです。runtime があなたの代わりにオーケストレーション判断をしているわけではありません。\n\n必須の lead action:\n- 未完了 task、open wait、部署 mailbox、live message、job、artifact を確認してください。\n- ユーザーの現在の task に向けて協調してください。必要なら部署を steer / resume / reassign し、具体的な artifact、blocker、handoff を求めてください。\n- 部署が完了条件を持つ待機対象を始めたら、種類に決め打ちせず `team wait add` で condition / owner / task / progress / evidence を登録させてください。PID付きコマンドは `team job`、PIDを持たない外部待機や非同期依存は `team wait` で追跡してください。\n- open wait がある task は完了扱いにしないでください。wait が completed/failed/blocked になったら owner を resume し、結果を見て handoff、次 action、または blocker を出させてください。\n- teammate が `LEAD_PROPOSAL:` を送っているなら、resume / reassign / review action として明示的に採用するか、具体的な理由付きで却下してください。\n- {continuation_policy}\n- action が必要な task がなければ、team が idle のままでよい理由、または user input 待ちである理由を明示的に記録してください。active instruction や domain skill が明示的に要求しない限り、新しい改善 loop を勝手に作らないでください。\n\nOpen tasks:\n{}{omitted_line}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nCurrent app-server turns:\n{}",
+            "Lead autonomy tick: あなたはこの team の意思決定オーケストレーターです。team runtime は状態を報告し、この tick を届けているだけです。runtime があなたの代わりにオーケストレーション判断をしているわけではありません。\n\n必須の lead action:\n- 未完了 task、open wait、部署 mailbox、live message、job、artifact を確認してください。\n- ユーザーの現在の task に向けて協調してください。必要なら部署を steer / resume / reassign し、具体的な artifact、blocker、handoff を求めてください。\n- 部署が完了条件を持つ待機対象を始めたら、種類に決め打ちせず `team wait add` で condition / owner / task / progress / evidence を登録させてください。PID付きコマンドは `team job`、PIDを持たない外部待機や非同期依存は `team wait` で追跡してください。\n- open wait がある task は完了扱いにしないでください。wait が completed/failed/blocked になったら owner を resume し、結果を見て handoff、次 action、または blocker を出させてください。\n- teammate が `LEAD_PROPOSAL:` を送っているなら、resume / reassign / review action として明示的に採用するか、具体的な理由付きで却下してください。\n- {continuation_policy}\n- action が必要な task がなければ、team が idle のままでよい理由、または user input 待ちである理由を明示的に記録してください。active instruction や domain skill が明示的に要求しない限り、新しい改善 loop を勝手に作らないでください。\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nCurrent app-server turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -9644,7 +9671,7 @@ fn maybe_send_lead_autonomy_tick(
         )
     } else {
         format!(
-            "Lead autonomy tick: you are the decision-making orchestrator for this team. The team runtime is only reporting state and delivering this tick; it is not making orchestration decisions for you.\n\nRequired lead action:\n- Inspect unfinished tasks, open waits, department mailboxes, live messages, jobs, and artifacts.\n- Coordinate toward the user's current task: steer, resume, reassign, or ask departments for concrete artifacts, blockers, or handoffs.\n- When a department starts a waitable item with a completion condition, do not categorize it narrowly; register it with `team wait add` including condition / owner / task / progress / evidence. Use `team job` for PID-backed commands and `team wait` for PID-less external waits or async dependencies.\n- Do not treat a task with an open wait as complete. When a wait becomes completed/failed/blocked, resume the owner to inspect the result and publish a handoff, next action, or blocker.\n- If a teammate sent `LEAD_PROPOSAL:`, explicitly accept it with a resume/reassign/review action or reject it with the concrete reason.\n- {continuation_policy}\n- If no task needs action, explicitly record why the team should remain idle or wait for user input. Do not invent a new improvement loop unless the active instructions or a domain skill explicitly require one.\n\nOpen tasks:\n{}{omitted_line}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nCurrent app-server turns:\n{}",
+            "Lead autonomy tick: you are the decision-making orchestrator for this team. The team runtime is only reporting state and delivering this tick; it is not making orchestration decisions for you.\n\nRequired lead action:\n- Inspect unfinished tasks, open waits, department mailboxes, live messages, jobs, and artifacts.\n- Coordinate toward the user's current task: steer, resume, reassign, or ask departments for concrete artifacts, blockers, or handoffs.\n- When a department starts a waitable item with a completion condition, do not categorize it narrowly; register it with `team wait add` including condition / owner / task / progress / evidence. Use `team job` for PID-backed commands and `team wait` for PID-less external waits or async dependencies.\n- Do not treat a task with an open wait as complete. When a wait becomes completed/failed/blocked, resume the owner to inspect the result and publish a handoff, next action, or blocker.\n- If a teammate sent `LEAD_PROPOSAL:`, explicitly accept it with a resume/reassign/review action or reject it with the concrete reason.\n- {continuation_policy}\n- If no task needs action, explicitly record why the team should remain idle or wait for user input. Do not invent a new improvement loop unless the active instructions or a domain skill explicitly require one.\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nCurrent app-server turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -24868,6 +24895,20 @@ authoritative_predecessor:
             "Lead autonomy tick instructions mention `LEAD_PROPOSAL:` and task 1, but this is not a teammate proposal.",
         )
         .expect("send system instruction");
+        append_event(
+            team_dir,
+            "app_server_member_usage_limited",
+            serde_json::json!({
+                "member": "research",
+                "node": "local",
+                "thread": "thread",
+                "turn": "turn",
+                "status": "Failed",
+                "error": "You've hit your usage limit. Try again later.",
+                "retry_after_sec": 1200,
+            }),
+        )
+        .expect("usage event");
 
         let mut active = HashMap::new();
         active.insert(
@@ -24906,6 +24947,11 @@ authoritative_predecessor:
         let tick = lead_messages.last().expect("tick message");
         assert!(tick.message.contains("Lead autonomy tick"));
         assert!(tick.message.contains("research cycle"));
+        assert!(tick.message.contains("Open task owner cooldowns"));
+        assert!(
+            tick.message
+                .contains("@research owns open task(s) #1 but is in usage-limit cooldown")
+        );
         assert!(tick.message.contains("Recent LEAD_PROPOSAL signals"));
         assert!(tick.message.contains("task 1 appears ready for review"));
         assert!(!tick.message.contains("this is not a teammate proposal"));
