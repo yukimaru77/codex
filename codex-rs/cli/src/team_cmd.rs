@@ -17770,7 +17770,167 @@ fn task_completion_blocker(team_dir: &Path, task: &TeamTask) -> Result<Option<St
             open_waits.join("; ")
         )));
     }
-    task_completion_missing_required_local_outputs(team_dir, task)
+    if let Some(issue) = task_completion_missing_required_local_outputs(team_dir, task)? {
+        return Ok(Some(issue));
+    }
+    task_completion_reported_local_hash_mismatch(team_dir, task)
+}
+
+fn task_completion_reported_local_hash_mismatch(
+    team_dir: &Path,
+    task: &TeamTask,
+) -> Result<Option<String>> {
+    let Some(result) = task.result.as_deref() else {
+        return Ok(None);
+    };
+    let claims = extract_reported_hash_claims(result)?;
+    if claims.is_empty() {
+        return Ok(None);
+    }
+    let output_roots = task_required_local_output_paths(team_dir, task)?;
+    if output_roots.is_empty() {
+        return Ok(None);
+    }
+
+    for (label, expected) in claims {
+        let candidates = resolve_reported_hash_claim_paths(&output_roots, &label)?;
+        if candidates.len() != 1 {
+            continue;
+        }
+        let path = &candidates[0];
+        let actual = sha256sum_file(path)?;
+        if actual != expected {
+            return Ok(Some(format!(
+                "reported handoff hash for `{label}` is stale or mismatched: result says {expected}, current {} is {actual}",
+                path.display()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn extract_reported_hash_claims(text: &str) -> Result<Vec<(String, String)>> {
+    let mut claims = Vec::new();
+    let file_hash = Regex::new(r"(?i)([A-Za-z0-9_./-]+)\s*=\s*([0-9a-f]{64})")?;
+    for capture in file_hash.captures_iter(text) {
+        let Some(label) = capture.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if !reported_hash_label_looks_file_like(label) {
+            continue;
+        }
+        let Some(hash) = capture.get(2).map(|m| m.as_str().to_ascii_lowercase()) else {
+            continue;
+        };
+        claims.push((normalize_reported_hash_label(label), hash));
+    }
+
+    let manifest_hash = Regex::new(r"(?i)manifest\s+hash\s*=\s*([0-9a-f]{64})")?;
+    for capture in manifest_hash.captures_iter(text) {
+        let Some(hash) = capture.get(1).map(|m| m.as_str().to_ascii_lowercase()) else {
+            continue;
+        };
+        claims.push(("manifest.sha256".to_string(), hash));
+    }
+
+    claims.sort();
+    claims.dedup();
+    Ok(claims)
+}
+
+fn reported_hash_label_looks_file_like(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    lower.contains('/')
+        || lower.ends_with(".sha256")
+        || lower.ends_with(".log")
+        || lower.ends_with(".md")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".json")
+}
+
+fn normalize_reported_hash_label(label: &str) -> String {
+    label
+        .trim_matches(path_wrapper_or_trailing_punctuation)
+        .to_string()
+}
+
+fn resolve_reported_hash_claim_paths(
+    output_roots: &[PathBuf],
+    label: &str,
+) -> Result<Vec<PathBuf>> {
+    let label_path = Path::new(label);
+    if label_path.is_absolute() {
+        return Ok(label_path
+            .exists()
+            .then(|| label_path.to_path_buf())
+            .into_iter()
+            .collect());
+    }
+
+    let mut candidates = Vec::new();
+    for root in output_roots {
+        let direct = root.join(label);
+        if direct.is_file() {
+            candidates.push(direct);
+        }
+    }
+    if !candidates.is_empty() {
+        candidates.sort();
+        candidates.dedup();
+        return Ok(candidates);
+    }
+
+    let Some(file_name) = Path::new(label).file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    for root in output_roots {
+        collect_named_files(root, file_name, 0, &mut candidates)?;
+    }
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn collect_named_files(
+    root: &Path,
+    file_name: &str,
+    depth: usize,
+    matches: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if depth > 4 || !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).with_context(|| format!("read {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_named_files(&path, file_name, depth + 1, matches)?;
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == file_name)
+        {
+            matches.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn sha256sum_file(path: &Path) -> Result<String> {
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .with_context(|| format!("run sha256sum {}", path.display()))?;
+    if !output.status.success() {
+        bail!("sha256sum failed for {}", path.display());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .next()
+        .map(|hash| hash.to_ascii_lowercase())
+        .ok_or_else(|| anyhow!("sha256sum produced no hash for {}", path.display()))
 }
 
 fn task_required_local_output_paths(team_dir: &Path, task: &TeamTask) -> Result<Vec<PathBuf>> {
@@ -18418,6 +18578,7 @@ Evidence validation policy:
 - Exclude volatile, self-referential, or still-being-edited files from final producer manifests unless you can guarantee they will not change after hashing. Common volatile examples include the active command transcript, live job log, manifest verification log, handoff/status/progress logs, the manifest file being generated, and any helper/finalizer script that you may edit while repairing or checking the manifest. If you include any such file, write it first, close it, generate the manifest after the last edit, and do not append or patch it after that point. If a manifest repair changes a helper script, regenerate and recheck the manifest again after that script is stable.
 - Before announcing a producer handoff as complete, run `sha256sum -c` from the intended manifest root and include the exact command/root plus rc in `TEAM_COMPLETION_CHECKLIST`. If this fails, keep the task in progress or blocked and report the exact mismatch instead of handing off to validation.
 - Immediately before the final handoff message, re-read the current manifest files from disk and compute/report the manifest file hashes from those files. Do not rely on hashes remembered from an earlier script run, draft message, previous handoff attempt, or pre-repair state. If the handoff text hash differs from the current on-disk manifest hash, correct the message before sending; a stale handoff hash is still a WARN-worthy provenance defect even when `sha256sum -c` passes.
+- Keep the final handoff message outside the hashed package unless the task explicitly requires an in-package handoff log. If an in-package handoff log is required, write it before manifest generation and never edit it after the manifest/check step. Do not append to command transcripts, manifest check logs, progress/status files, helper scripts, or checklists after reporting final hashes; if a late correction is required, make the correction first, regenerate the manifest/check log, rerun `sha256sum -c`, then send a new handoff with freshly read hashes.
 - When validating manifests, reports, metrics, renders, or schema handoffs, do not assume the working directory. First inspect whether paths inside the manifest are absolute, workspace-relative, package-root-relative, or manifest-directory-relative. Run `sha256sum -c` from the correct base directory, or record multiple attempted bases if the provenance is ambiguous.
 - If a manifest check fails because paths are evaluated from the wrong cwd, treat that as a validator methodology issue, not as producer evidence failure. Regenerate the validation report after correcting the cwd/path interpretation, and preserve the failed validator pass in transcript/provenance so audit can see what changed.
 - Structured validation ledgers must be polarity-consistent with the final verdict. Before handoff, check that boolean/value/status fields do not contradict themselves; for example, `validator_path_or_tooling_limitation=false` should not be marked `FAIL` unless the ledger explicitly documents inverted semantics. If the structured ledger and final verdict disagree, fix the ledger and regenerate its manifest before audit consumes it.
@@ -19828,6 +19989,77 @@ mod tests {
             .expect("completion blocker");
 
         assert_eq!(issue, None);
+    }
+
+    #[test]
+    fn completion_checker_rejects_stale_reported_manifest_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        let output_root = team_dir.join("research_planning").join("task32_gate");
+        fs::create_dir_all(&output_root).expect("output root");
+        fs::write(output_root.join("reconciliation_report.md"), "# report\n").expect("report");
+        fs::write(output_root.join("gate.yaml"), "verdict: pass\n").expect("yaml");
+        fs::write(
+            output_root.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: task32_gate\n- verification: sha256sum -c manifest.sha256 rc=0\n- messages_sent: lead/evaluation/audit\n- consumers_notified: lead/evaluation/audit\n- blockers_or_limits: none\n",
+        )
+        .expect("checklist");
+        let first_manifest = Command::new("sha256sum")
+            .args([
+                "reconciliation_report.md",
+                "gate.yaml",
+                "TEAM_COMPLETION_CHECKLIST.md",
+            ])
+            .current_dir(&output_root)
+            .output()
+            .expect("sha256sum");
+        assert!(first_manifest.status.success());
+        fs::write(output_root.join("manifest.sha256"), first_manifest.stdout).expect("manifest");
+        let stale_manifest_hash =
+            sha256sum_file(&output_root.join("manifest.sha256")).expect("manifest hash");
+
+        let second_manifest = Command::new("sha256sum")
+            .args([
+                "TEAM_COMPLETION_CHECKLIST.md",
+                "gate.yaml",
+                "reconciliation_report.md",
+            ])
+            .current_dir(&output_root)
+            .output()
+            .expect("sha256sum");
+        assert!(second_manifest.status.success());
+        fs::write(output_root.join("manifest.sha256"), second_manifest.stdout).expect("manifest");
+        assert_ne!(
+            stale_manifest_hash,
+            sha256sum_file(&output_root.join("manifest.sha256")).expect("current manifest hash")
+        );
+        let task = TeamTask {
+            id: "32".to_string(),
+            subject: "task32 gate".to_string(),
+            description: format!(
+                "Produce {} with reconciliation_report.md, gate.yaml, TEAM_COMPLETION_CHECKLIST.md, manifest.sha256.",
+                output_root.display(),
+            ),
+            owner: Some("research_planning".to_string()),
+            status: TaskStatus::InProgress,
+            depends_on: Vec::new(),
+            result: Some(format!(
+                "corrected package complete: manifest hash={stale_manifest_hash}"
+            )),
+            created_at: now(),
+            updated_at: now(),
+        };
+
+        let issue = task_completion_blocker(team_dir, &task).expect("completion blocker");
+
+        assert!(
+            issue
+                .as_deref()
+                .unwrap_or("")
+                .contains("reported handoff hash for `manifest.sha256` is stale")
+        );
     }
 
     #[test]
