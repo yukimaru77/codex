@@ -3359,6 +3359,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let mut department_heartbeats = HashMap::<String, Instant>::new();
     let mut last_stale_active_turn_check = Instant::now();
     let mut last_job_refresh = Instant::now() - Duration::from_secs(15);
+    let mut last_node_connection_heartbeat = Instant::now() - Duration::from_secs(60);
     let mut contract_input_sync_attempts = HashSet::<String>::new();
     let mut keep_alive_idle_reported = false;
     #[cfg(unix)]
@@ -3425,6 +3426,16 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                 ensure_container_node_departments(&team_dir)?;
                 nodes = load_nodes(&team_dir)?;
                 ensure_local_node(&mut nodes);
+                if last_node_connection_heartbeat.elapsed() >= Duration::from_secs(60) {
+                    last_node_connection_heartbeat = Instant::now();
+                    if let Err(err) =
+                        heartbeat_connected_app_server_nodes(&team_dir, &node_clients)
+                    {
+                        record_runtime_loop_error(&team_dir, "node_connection_heartbeat", err)?;
+                    }
+                    nodes = load_nodes(&team_dir)?;
+                    ensure_local_node(&mut nodes);
+                }
                 if let Some(sync_interval) = node_sync_interval {
                     if let Err(err) = maybe_sync_remote_node_assets(
                         &team_dir,
@@ -19092,6 +19103,46 @@ fn set_node_connection(
     Ok(())
 }
 
+fn heartbeat_connected_app_server_nodes(
+    team_dir: &Path,
+    node_clients: &HashMap<String, TeamAppServerNodeClient>,
+) -> Result<()> {
+    heartbeat_connected_node_ids(team_dir, node_clients.keys().map(String::as_str))
+}
+
+fn heartbeat_connected_node_ids<'a>(
+    team_dir: &Path,
+    node_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let node_ids = node_ids.into_iter().collect::<HashSet<_>>();
+    if node_ids.is_empty() {
+        return Ok(());
+    }
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
+    let now = now();
+    let mut touched = Vec::new();
+    for node in &mut nodes {
+        if node_ids.contains(node.id.as_str()) {
+            node.status = TeamNodeStatus::Online;
+            node.updated_at = now.clone();
+            touched.push(node.id.clone());
+        }
+    }
+    if touched.is_empty() {
+        return Ok(());
+    }
+    write_nodes(team_dir, &nodes)?;
+    append_event(
+        team_dir,
+        "node_connection_heartbeat",
+        serde_json::json!({
+            "nodes": touched,
+        }),
+    )?;
+    Ok(())
+}
+
 fn ensure_local_node(nodes: &mut Vec<TeamNode>) {
     if nodes.iter().any(|node| node.id == "local") {
         return;
@@ -19949,6 +20000,37 @@ mod tests {
             "remote Ssh Online url=ws://127.0.0.1:9999 last_seen=2026-05-08T06:41:31Z age="
         ));
         assert!(status.contains(" stale"));
+    }
+
+    #[test]
+    fn connected_node_heartbeat_refreshes_last_seen_and_online_status() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_nodes(
+            team_dir,
+            &[TeamNode {
+                id: "remote".to_string(),
+                kind: TeamNodeKind::Ssh,
+                url: Some("ws://127.0.0.1:9999".to_string()),
+                host: Some("remote-host".to_string()),
+                container: None,
+                cwd: Some("/work".to_string()),
+                status: TeamNodeStatus::Offline,
+                note: String::new(),
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                updated_at: "2026-05-08T06:41:31Z".to_string(),
+            }],
+        )
+        .expect("write nodes");
+
+        heartbeat_connected_node_ids(team_dir, ["remote"]).expect("heartbeat");
+        let nodes = load_nodes(team_dir).expect("nodes");
+        let remote = nodes.iter().find(|node| node.id == "remote").unwrap();
+
+        assert_eq!(remote.status, TeamNodeStatus::Online);
+        assert_ne!(remote.updated_at, "2026-05-08T06:41:31Z");
+        assert!(remote.updated_at.contains("+09:00") || remote.updated_at.ends_with('Z'));
     }
 
     #[test]
