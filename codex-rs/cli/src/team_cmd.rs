@@ -4209,6 +4209,49 @@ fn format_node_display_status(status: &TeamNodeStatus, stale: bool) -> String {
     }
 }
 
+#[derive(Clone, Debug)]
+struct NodeUnavailableReason {
+    reason: &'static str,
+    status: String,
+    age: String,
+}
+
+fn member_node_unavailable_from_nodes(
+    member: &TeamMember,
+    nodes: &[TeamNode],
+) -> Option<NodeUnavailableReason> {
+    node_unavailable_from_nodes(&member_node_id(member), nodes)
+}
+
+fn node_unavailable_from_nodes(node_id: &str, nodes: &[TeamNode]) -> Option<NodeUnavailableReason> {
+    if node_id == "local" {
+        return None;
+    }
+    let Some(node) = nodes.iter().find(|node| node.id == node_id) else {
+        return Some(NodeUnavailableReason {
+            reason: "node_missing",
+            status: "missing".to_string(),
+            age: "unknown".to_string(),
+        });
+    };
+    let (age, stale) = format_node_last_seen_age(&node.updated_at);
+    if stale {
+        return Some(NodeUnavailableReason {
+            reason: "node_stale",
+            status: format!("{:?}", node.status),
+            age,
+        });
+    }
+    if node.status != TeamNodeStatus::Online {
+        return Some(NodeUnavailableReason {
+            reason: "node_unavailable",
+            status: format!("{:?}", node.status),
+            age,
+        });
+    }
+    None
+}
+
 fn format_usage_limit_cooldowns(team_dir: &Path, config: &TeamConfig) -> Result<String> {
     let mut lines = Vec::new();
     for member in &config.members {
@@ -10058,6 +10101,8 @@ fn maybe_send_department_idle_wakeups(
 
     let now_instant = Instant::now();
     let tasks = load_tasks(team_dir)?;
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
     let members = config
         .members
         .iter()
@@ -10086,6 +10131,30 @@ fn maybe_send_department_idle_wakeups(
             })
             .count();
         let member_has_open_tasks = member_open_task_count > 0;
+        if let Some(unavailable) = member_node_unavailable_from_nodes(member, &nodes) {
+            if last_wakeup
+                .get(&member.name)
+                .is_some_and(|last| now_instant.duration_since(*last) < interval)
+            {
+                continue;
+            }
+            last_wakeup.insert(member.name.clone(), now_instant);
+            idle_since.remove(&member.name);
+            append_event(
+                team_dir,
+                "department_idle_wakeup_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": unavailable.reason,
+                    "node_status": unavailable.status,
+                    "node_age": unavailable.age,
+                    "owned_open_tasks": member_open_task_count,
+                }),
+            )?;
+            continue;
+        }
         if let Some(remaining) = recent_usage_limit_retry_remaining(team_dir, &member.name)? {
             if last_wakeup
                 .get(&member.name)
@@ -10321,6 +10390,8 @@ fn maybe_send_department_heartbeats(
 ) -> Result<()> {
     let now_instant = Instant::now();
     let tasks = load_tasks(team_dir)?;
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
     for member in config
         .members
         .iter()
@@ -10333,6 +10404,30 @@ fn maybe_send_department_heartbeats(
             .filter(|task| task_is_open(task))
             .collect::<Vec<_>>();
         let active_run = active.get(&member.name).is_some_and(|run| !run.completed);
+        if !active_run && let Some(unavailable) = member_node_unavailable_from_nodes(member, &nodes)
+        {
+            let entry = heartbeats
+                .entry(member.name.clone())
+                .or_insert(now_instant - interval);
+            if now_instant.duration_since(*entry) < interval {
+                continue;
+            }
+            *entry = now_instant;
+            append_event(
+                team_dir,
+                "department_heartbeat_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": unavailable.reason,
+                    "node_status": unavailable.status,
+                    "node_age": unavailable.age,
+                    "owned_open_tasks": member_tasks.len(),
+                }),
+            )?;
+            continue;
+        }
         if !active_run
             && let Some(remaining) = recent_usage_limit_retry_remaining(team_dir, &member.name)?
         {
@@ -12299,11 +12394,12 @@ fn render_team_ui(
             .iter()
             .map(|node| {
                 let (age, stale) = format_node_last_seen_age(&node.updated_at);
+                let status = format_node_display_status(&node.status, stale);
                 format!(
-                    "<tr><td>{}</td><td>{:?}</td><td>{:?}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td>{}</td><td>{:?}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     html_escape(&node.id),
                     node.kind,
-                    node.status,
+                    html_escape(&status),
                     html_escape(node.url.as_deref().unwrap_or("")),
                     html_escape(&timestamp_for_ui(&node.updated_at)),
                     html_escape(&age),
@@ -15676,6 +15772,14 @@ fn inspect_team_nodes(team_dir: &Path, args: NodeInspectArgs) -> Result<()> {
             println!("== {} ({:?}) ==", node.id, node.kind);
         }
         let facts = collect_node_facts(&node)?;
+        append_event(
+            team_dir,
+            "node_inspect_succeeded",
+            serde_json::json!({
+                "node": node.id,
+                "kind": node.kind,
+            }),
+        )?;
         println!("{}", facts.trim_end());
         if matches!(node.kind, TeamNodeKind::Docker | TeamNodeKind::SshDocker)
             && let Some(container) = node.container.as_deref()
@@ -20789,6 +20893,24 @@ mod tests {
     }
 
     #[test]
+    fn local_node_is_not_blocked_by_node_availability_gate() {
+        let nodes = vec![TeamNode {
+            id: "local".to_string(),
+            kind: TeamNodeKind::Local,
+            url: Some("ws://127.0.0.1:9999".to_string()),
+            host: None,
+            container: None,
+            cwd: None,
+            status: TeamNodeStatus::Offline,
+            note: String::new(),
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            updated_at: "2026-05-08T06:41:31Z".to_string(),
+        }];
+
+        assert!(node_unavailable_from_nodes("local", &nodes).is_none());
+    }
+
+    #[test]
     fn status_text_includes_member_unread_mail_counts() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -23320,6 +23442,128 @@ authoritative_predecessor:
                     .get("owned_open_tasks")
                     .and_then(|value| value.as_u64())
                     == Some(1)
+        }));
+    }
+
+    #[test]
+    fn department_pings_skip_stale_remote_nodes_before_cooldown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let now = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-stale-node".to_string(),
+            goal: "remote runtime work".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "ops".to_string(),
+                    role: "ops".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: Some("remote".to_string()),
+                },
+            ],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        write_nodes(
+            team_dir,
+            &[TeamNode {
+                id: "remote".to_string(),
+                kind: TeamNodeKind::Ssh,
+                url: Some("ws://127.0.0.1:9999".to_string()),
+                host: Some("remote-host".to_string()),
+                container: None,
+                cwd: Some("/work".to_string()),
+                status: TeamNodeStatus::Online,
+                note: String::new(),
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                updated_at: "2026-05-08T06:41:31Z".to_string(),
+            }],
+        )
+        .expect("write nodes");
+        write_test_task(
+            team_dir,
+            "1",
+            Some("ops"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            None,
+        );
+        append_event(
+            team_dir,
+            "app_server_member_usage_limited",
+            serde_json::json!({
+                "member": "lead",
+                "node": "local",
+                "thread": "thread",
+                "turn": "turn",
+                "status": "Failed",
+                "error": "You've hit your usage limit. Try again later.",
+                "retry_after_sec": 600,
+            }),
+        )
+        .expect("usage event");
+
+        let mut idle_since =
+            HashMap::from([("ops".to_string(), Instant::now() - Duration::from_secs(601))]);
+        let mut last_wakeup = HashMap::new();
+        let mut last_batch = Instant::now() - Duration::from_secs(601);
+        let mut cursor = 0_usize;
+        maybe_send_department_idle_wakeups(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut idle_since,
+            &mut last_wakeup,
+            &mut last_batch,
+            &mut cursor,
+            Duration::from_secs(600),
+            TeamPromptLanguage::En,
+        )
+        .expect("idle wakeup");
+
+        let mut heartbeats = HashMap::new();
+        maybe_send_department_heartbeats(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut heartbeats,
+            &HashMap::new(),
+            Duration::from_secs(60),
+            TeamPromptLanguage::En,
+        )
+        .expect("heartbeat");
+
+        let ops_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "ops")).unwrap_or_default();
+        assert!(ops_messages.is_empty());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "department_idle_wakeup_skipped"
+                && event.data.get("reason").and_then(|value| value.as_str()) == Some("node_stale")
+                && event.data.get("node").and_then(|value| value.as_str()) == Some("remote")
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "department_heartbeat_skipped"
+                && event.data.get("reason").and_then(|value| value.as_str()) == Some("node_stale")
+                && event.data.get("node").and_then(|value| value.as_str()) == Some("remote")
         }));
     }
 
