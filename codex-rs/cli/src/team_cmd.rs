@@ -17784,7 +17784,7 @@ fn task_required_local_output_paths(team_dir: &Path, task: &TeamTask) -> Result<
         paths.push(PathBuf::from(ownership.path));
     }
 
-    for path in extract_probable_local_paths_from_task_text(team_dir, task) {
+    for path in extract_probable_local_output_paths_from_task_text(team_dir, task) {
         paths.push(path);
     }
 
@@ -17839,16 +17839,103 @@ fn path_looks_like_task_handoff_output(path: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn extract_probable_local_paths_from_task_text(team_dir: &Path, task: &TeamTask) -> Vec<PathBuf> {
+fn extract_probable_local_output_paths_from_task_text(
+    team_dir: &Path,
+    task: &TeamTask,
+) -> Vec<PathBuf> {
     let text = format!(
         "{} {}",
         task.description,
         task.result.as_deref().unwrap_or("")
     );
     text.split_whitespace()
-        .filter_map(clean_embedded_path_token)
-        .filter(|raw| ownership_path_is_probably_local(team_dir, raw))
-        .map(PathBuf::from)
+        .scan(0usize, |cursor, token| {
+            let rel = text[*cursor..].find(token).unwrap_or(0);
+            let start = *cursor + rel;
+            *cursor = start + token.len();
+            Some((start, token))
+        })
+        .filter_map(|(token_start, token)| {
+            let raw = clean_embedded_path_token(token)?;
+            let path_start = token_start + token.find(raw).unwrap_or(0);
+            if text_path_context_is_output(&text, path_start)
+                && ownership_path_is_probably_local(team_dir, raw)
+            {
+                Some(PathBuf::from(raw))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn text_path_context_is_output(text: &str, path_start: usize) -> bool {
+    let before = text_context_before(text, path_start, 120).to_ascii_lowercase();
+    let after = text_context_after(text, path_start, 120).to_ascii_lowercase();
+    let output_before = [
+        "produce",
+        "output",
+        "output root",
+        "output_root",
+        "artifact root",
+        "artifact_root",
+        "artifacts",
+        "write to",
+        "save under",
+        "出力",
+        "出力先",
+        "成果物",
+        "保存",
+        "配下",
+    ]
+    .iter()
+    .any(|marker| before.contains(marker));
+    let output_after = [
+        "必須 artifact",
+        "必須成果物",
+        "成果物",
+        "with ",
+        "containing ",
+        "に保存",
+        "に置き",
+        "へ置き",
+        "配下",
+    ]
+    .iter()
+    .any(|marker| after.contains(marker));
+    let input_before = [
+        "input",
+        "inputs",
+        "accepted input",
+        "authoritative input",
+        "review root",
+        "入力",
+        "入力は",
+        "入力 root",
+        "accepted evidence",
+        "lead-verified",
+    ]
+    .iter()
+    .any(|marker| before.contains(marker));
+
+    output_before && (!input_before || output_after)
+}
+
+fn text_context_before(text: &str, byte_idx: usize, max_chars: usize) -> String {
+    text[..byte_idx.min(text.len())]
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn text_context_after(text: &str, byte_idx: usize, max_chars: usize) -> String {
+    text[byte_idx.min(text.len())..]
+        .chars()
+        .take(max_chars)
         .collect()
 }
 
@@ -18193,6 +18280,8 @@ Then send concise messages through the team mailbox:
 - "$CODEX_TEAM_CLI" team message --team "$CODEX_TEAM_ID" <member> "<direct question or handoff>"
 - "$CODEX_TEAM_CLI" team message --team "$CODEX_TEAM_ID" <member[,member...]> "<same message to a small explicit group>"
 
+When you send a message through a shell command, treat the message body as data. Do not put unescaped backticks, `$()`, or other command-substitution syntax inside double-quoted CLI arguments. Prefer plain identifiers without markdown backticks in shell-delivered messages, or use safe single-quote/heredoc/stdin-style quoting when available. If a sent message loses an identifier because of shell expansion, resend the exact identifier immediately and record the correction.
+
 Discuss before acting. Surface disagreements, file ownership, interface boundaries, test strategy, blockers, and dependencies. If you can make progress independently, state your plan and any assumptions. Keep this round short and concrete.
 
 Team members:
@@ -18274,6 +18363,7 @@ Coordinate through the native team store with these shell commands:
 - "$CODEX_TEAM_CLI" team message --team "$CODEX_TEAM_ID" all "<message>"
 
 The message command defaults the sender to CODEX_TEAM_MEMBER, so teammates can DM each other without passing --from. Use `all` for a broadcast.
+When you send team messages through a shell command, treat message text as data. Do not put unescaped backticks, `$()`, or other command-substitution syntax inside double-quoted CLI arguments. Prefer plain identifiers without markdown backticks in shell-delivered messages, or use safe single-quote/heredoc/stdin-style quoting when available. If a sent message loses an identifier because of shell expansion, resend the exact identifier immediately and record the correction.
 
 Start by reading your inbox, the task list, the wait list, and the ownership list. Before editing a file, claim the path with the ownership command. If another department owns the path, do not edit it until that department hands it off or lead explicitly reassigns ownership. Check your inbox again after important task updates and before finishing. Discuss disagreements, blockers, handoffs, and review findings through team messages. Own your department mission end to end. If the work is broad, research-heavy, implementation-heavy, review-heavy, or otherwise benefits from parallel thinking, actively use available subagent/agent tools, skills, MCP servers, and internal decomposition within this department; do not try to carry all substantial work in one main thread when helpers are available. Do not ask the lead to create duplicate peer departments solely for load balancing. Work on tasks assigned to your department. You may also self-claim an unassigned `ready` task with `team task claim` only when it clearly matches your department mission and you can own it end to end; after claiming, message lead with the reason and intended artifacts. When handing a file to another department, send a message and release or ask lead to reassign ownership. If you start work that cannot finish until an observable condition becomes true, register it as `team wait` unless it is already a tracked `team job`. Include the exact completion condition, current request/job/log/checkpoint identifier, owner, task, and expected evidence. Do not mark a task completed while one of its waits is open. If you are blocked waiting for another department, a research gate, credentials, an artifact, lead decision, or any other condition, set your assigned task to `blocked` or register/update a wait, message lead and the relevant department, and finish; do not mark it completed just because your current turn is waiting. If you notice a blocked, pending, or review task whose gate appears cleared, whose prerequisite artifact/handoff has arrived, or whose next owner is ambiguous, do not start owned work for another department; send lead a concise `LEAD_PROPOSAL:` message with the evidence and proposed resume/reassign/review action. If this department is assigned to a non-local node, treat that node as your operational site. If Codex authentication is requested via device code, let the team runtime's direct local browser automation handle the device URL/code; report only if that automation fails and you remain unauthenticated.
 
@@ -18428,6 +18518,7 @@ App-server managed team run:
   - "$TEAM_CLI" message --from "{member}" <member[,member...]> "<same message to a small explicit group>"
 
 When a teammate sends you a message, the orchestrator may steer this active turn with the new message. Treat that as live team discussion and respond or adjust your work if needed. Ask clarifying or review questions back to related departments whenever their judgment could improve the result; do not silently make cross-department decisions.
+When you send team messages through a shell command, treat message text as data. Do not put unescaped backticks, `$()`, or other command-substitution syntax inside double-quoted CLI arguments. Prefer plain identifiers without markdown backticks in shell-delivered messages, or use safe single-quote/heredoc/stdin-style quoting when available. If a sent message loses an identifier because of shell expansion, resend the exact identifier immediately and record the correction.
 If your work or an invoked skill creates or uses a Docker container for ongoing team work, do not leave it as an invisible side environment. Ask lead to use `team node create-docker` when possible; otherwise use a stable long-lived container name, mount the relevant workspace, publish any user-facing ports with `-p`, keep the container alive, and send lead the exact container name, host, mount paths, exposed ports, and suggested node kind (`docker` or `ssh-docker`) so lead can register or update the placement. If you cannot run the local team CLI but have enough details, also write one standalone line in this exact format: `TEAM_NODE id=<node-id> kind=<docker|ssh-docker> host=<ssh-host-or-> container=<container> cwd=<container-cwd> note=<short_note>`. The orchestrator will register the node and add a container-internal department automatically. Once the node is registered, the container-internal department owns installs, runtime execution, rendering, tests, and debugging inside that container; host-side departments should stop at image/container creation plus handoff unless lead asks for a rebuild or replacement. Avoid read-write mounting the host's entire `~/.codex` into a root-owned container; use `team node sync-assets`, a dedicated Codex home, copied credentials/config, or the existing bootstrap/auth flow. If lead has already assigned you to a Docker/SSH-Docker node, treat the execution node context above as authoritative.
 If you need a local artifact, schema package, config, generated input, report, or source matrix on a remote/Docker node and it is not mounted there, ask lead to hand it off with `team node sync-path <node-id> --src <local-path> --dest <node-path> [--replace]`. Do not silently recreate stale copies on the node, and treat missing handoff files as a blocker until the authoritative artifact is synced.
 If your assigned node lacks a normal verification tool, install it before weakening the verification. Example: for a web app, install Node.js/npm or a headless browser when needed to run smoke tests; for Python work, install the project/test dependencies in a venv when appropriate. In containers, root-level installs are acceptable. On SSH/local nodes, use user-local installs or passwordless sudo only.
@@ -18647,6 +18738,8 @@ Commands:
 - "{codex}" team message --team "{team_id}" --from lead all "<coordination, priority, or decision>"
 - "{codex}" team message --team "{team_id}" --from lead <member> "<direct instruction or clarification>"
 - "{codex}" team message --team "{team_id}" --from lead <member[,member...]> "<same decision or clarification to a small explicit group>"
+
+When you send team messages through a shell command, treat message text as data. Do not put unescaped backticks, `$()`, or other command-substitution syntax inside double-quoted CLI arguments. Prefer plain identifiers without markdown backticks in shell-delivered messages, or use safe single-quote/heredoc/stdin-style quoting when available. If a sent message loses an identifier because of shell expansion, resend the exact identifier immediately and record the correction.
 
 At the beginning, assign obvious file or directory ownership when the goal implies shared edits. Name the primary owner and handoff order instead of letting departments edit the same file at the same time. Use ownership claims for these decisions, and message the relevant departments.
 
@@ -19640,6 +19733,101 @@ mod tests {
             .as_deref(),
             Some("/workspace/team/runtime/cycle1")
         );
+    }
+
+    #[test]
+    fn completion_path_extraction_prefers_declared_output_over_input_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        let input_root = team_dir
+            .join("evaluation")
+            .join("cycle1_rbo_source_dev_review");
+        let output_root = team_dir
+            .join("research_planning")
+            .join("source_dev_schema_warning_triage");
+        fs::create_dir_all(&input_root).expect("input root");
+        fs::create_dir_all(&output_root).expect("output root");
+        let task = TeamTask {
+            id: "29".to_string(),
+            subject: "source/dev schema warning triage".to_string(),
+            description: format!(
+                "Authoritative inputs: task11 source/dev review root={}; task25 protocol_freeze root={}. Produce {} with warning_triage.md, parser_field_contract.yaml, TEAM_COMPLETION_CHECKLIST.md, manifest.sha256, manifest_check.log.",
+                input_root.display(),
+                team_dir
+                    .join("research_planning")
+                    .join("protocol_freeze")
+                    .display(),
+                output_root.display(),
+            ),
+            owner: Some("research_planning".to_string()),
+            status: TaskStatus::InProgress,
+            depends_on: Vec::new(),
+            result: None,
+            created_at: now(),
+            updated_at: now(),
+        };
+
+        let paths = extract_probable_local_output_paths_from_task_text(team_dir, &task);
+
+        assert_eq!(paths, vec![output_root]);
+    }
+
+    #[test]
+    fn completion_checker_does_not_reject_complete_output_due_to_incomplete_input_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        let input_root = team_dir
+            .join("evaluation")
+            .join("cycle1_rbo_source_dev_review");
+        let output_root = team_dir
+            .join("research_planning")
+            .join("source_dev_schema_warning_triage");
+        fs::create_dir_all(&input_root).expect("input root");
+        fs::create_dir_all(&output_root).expect("output root");
+        fs::write(output_root.join("warning_triage.md"), "# triage\n").expect("report");
+        fs::write(
+            output_root.join("parser_field_contract.yaml"),
+            "team: test\n",
+        )
+        .expect("yaml");
+        fs::write(
+            output_root.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: source_dev_schema_warning_triage\n- verification: sha256sum -c manifest.sha256 rc=0\n- messages_sent: lead/evaluation/audit\n- consumers_notified: lead/evaluation/audit\n- blockers_or_limits: none\n",
+        )
+        .expect("checklist");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "warning_triage.md",
+                "parser_field_contract.yaml",
+                "TEAM_COMPLETION_CHECKLIST.md",
+            ])
+            .current_dir(&output_root)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::write(output_root.join("manifest.sha256"), manifest.stdout).expect("manifest");
+        let task = TeamTask {
+            id: "29".to_string(),
+            subject: "source/dev schema warning triage".to_string(),
+            description: format!(
+                "Authoritative inputs: task11 source/dev review root={}. Produce {} with warning_triage.md, parser_field_contract.yaml, TEAM_COMPLETION_CHECKLIST.md, manifest.sha256.",
+                input_root.display(),
+                output_root.display(),
+            ),
+            owner: Some("research_planning".to_string()),
+            status: TaskStatus::InProgress,
+            depends_on: Vec::new(),
+            result: Some("handoff complete".to_string()),
+            created_at: now(),
+            updated_at: now(),
+        };
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
     }
 
     #[test]
