@@ -13385,7 +13385,15 @@ fn is_side_channel_generated_message(message: &str) -> bool {
 
 fn message_requests_fast_reply(from: &str, message: &str) -> bool {
     let lower = message.to_lowercase();
-    if lower.contains("no reply needed") || lower.contains("no response needed") {
+    if lower.contains("no reply needed")
+        || lower.contains("no response needed")
+        || message.contains("返信不要")
+        || message.contains("返答不要")
+        || message.contains("回答不要")
+        || message.contains("返信は不要")
+        || message.contains("返答は不要")
+        || message.contains("回答は不要")
+    {
         return false;
     }
     if from == "user" {
@@ -23604,6 +23612,20 @@ mod tests {
             from: "evaluation".to_string(),
             to: "runtime".to_string(),
             message: "受領しました。current mode は task 3 blocked / wait-2 waiting(open) 継続です。next checkpoint は runtime package 到着です。"
+                .to_string(),
+            timestamp: now(),
+            read: false,
+        };
+
+        assert!(!side_channel_message_needs_fast_reply("runtime", &message));
+    }
+
+    #[test]
+    fn side_channel_ignores_japanese_no_reply_outreach() {
+        let message = MailMessage {
+            from: "phase0_scan_recovery".to_string(),
+            to: "runtime".to_string(),
+            message: "@phase0_scan_recovery からの定期アイドル声かけ: 私はいま free/standby です。blocker、レビュー依頼、artifact 解釈など、手伝えることはありますか？問題なく進んでいるなら返信不要です。"
                 .to_string(),
             timestamp: now(),
             read: false,
