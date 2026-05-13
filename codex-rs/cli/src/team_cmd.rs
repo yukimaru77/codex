@@ -62,6 +62,8 @@ const CODEX_TEAM_HELPER_URL: &str =
     "https://raw.githubusercontent.com/yukimaru77/codex-team-tools/main/bin/codex-team";
 const MAX_DIRECT_DEVICE_AUTH_ATTEMPTS: usize = 2;
 const MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT: usize = 8;
+const MAX_APP_SERVER_THREAD_TOTAL_TOKENS: i64 = 180_000;
+const MAX_APP_SERVER_THREAD_CONTEXT_RATIO_PERCENT: i64 = 70;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[clap(rename_all = "kebab_case")]
@@ -3412,10 +3414,12 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
         &mut node_clients,
         &team_dir,
         &mut active,
+        &mut thread_to_member,
         &lead_member.name,
         lead_prompt,
         &cwd,
         args.model.clone(),
+        sandbox.clone(),
         approval_policy,
         args.dangerously_bypass_approvals_and_sandbox,
         "app_server_lead_started",
@@ -3615,8 +3619,8 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                     &mut node_processes,
                     &cwd,
                     args.model.clone(),
-                    sandbox,
-                    approval_policy,
+                    sandbox.clone(),
+                    approval_policy.clone(),
                     args.dangerously_bypass_approvals_and_sandbox,
                     &codex_exe,
                     relay.port(),
@@ -3628,10 +3632,12 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                     &config.members,
                     &mut active,
                     &mut side_replies,
+                    &mut thread_to_member,
                     &mut mailbox_counts,
                     &cwd,
                     args.model.clone(),
-                    approval_policy,
+                    sandbox.clone(),
+                    approval_policy.clone(),
                     args.dangerously_bypass_approvals_and_sandbox,
                     &codex_exe,
                     args.side_channel_replies,
@@ -3730,10 +3736,12 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             &mut node_clients,
             &team_dir,
             &mut active,
+            &mut thread_to_member,
             &lead_member.name,
             prompt,
             &cwd,
             args.model.clone(),
+            sandbox.clone(),
             approval_policy,
             args.dangerously_bypass_approvals_and_sandbox,
             "app_server_lead_synthesis_started",
@@ -7634,15 +7642,106 @@ fn record_token_usage_update(
     Ok(())
 }
 
+fn latest_thread_token_usage(
+    team_dir: &Path,
+    node: &str,
+    thread: &str,
+) -> Result<Option<TeamTokenUsageRecord>> {
+    Ok(
+        read_jsonl::<TeamTokenUsageRecord>(&team_token_usage_path(team_dir))?
+            .into_iter()
+            .rev()
+            .find(|record| record.node == node && record.thread == thread),
+    )
+}
+
+fn thread_usage_exceeds_rotation_limit(record: &TeamTokenUsageRecord) -> bool {
+    if record.total.total_tokens >= MAX_APP_SERVER_THREAD_TOTAL_TOKENS {
+        return true;
+    }
+    let Some(context_window) = record.model_context_window else {
+        return false;
+    };
+    if context_window <= 0 {
+        return false;
+    }
+    record.total.total_tokens.saturating_mul(100)
+        >= context_window.saturating_mul(MAX_APP_SERVER_THREAD_CONTEXT_RATIO_PERCENT)
+}
+
+async fn maybe_rotate_app_server_thread_before_turn(
+    node_client: &mut TeamAppServerNodeClient,
+    team_dir: &Path,
+    run: &mut AppServerMemberRun,
+    thread_to_member: &mut HashMap<String, String>,
+    model: Option<String>,
+    sandbox: Option<SandboxMode>,
+    approval_policy: Option<AskForApproval>,
+) -> Result<()> {
+    if !run.completed {
+        return Ok(());
+    }
+    let Some(usage) = latest_thread_token_usage(team_dir, &run.node_id, &run.thread_id)? else {
+        return Ok(());
+    };
+    if !thread_usage_exceeds_rotation_limit(&usage) {
+        return Ok(());
+    }
+    let old_thread = run.thread_id.clone();
+    let new_thread: ThreadStartResponse = node_client
+        .client
+        .request_typed(ClientRequest::ThreadStart {
+            request_id: next_request_id(&mut node_client.request_counter),
+            params: ThreadStartParams {
+                model,
+                cwd: Some(run.cwd.display().to_string()),
+                sandbox,
+                approval_policy,
+                ephemeral: Some(false),
+                ..ThreadStartParams::default()
+            },
+        })
+        .await
+        .map_err(|err| anyhow!(err))?;
+    thread_to_member.remove(&thread_key(&run.node_id, &old_thread));
+    thread_to_member.insert(
+        thread_key(&run.node_id, &new_thread.thread.id),
+        run.member.name.clone(),
+    );
+    run.thread_id = new_thread.thread.id.clone();
+    run.turn_id.clear();
+    run.usage_category = "thread_rotated".to_string();
+    run.team_message_scan_offset = 0;
+    run.side_context_ids.clear();
+    set_member_thread(team_dir, &run.member.name, &run.thread_id)?;
+    append_event(
+        team_dir,
+        "app_server_thread_rotated",
+        serde_json::json!({
+            "member": run.member.name,
+            "role": run.member.role,
+            "node": run.node_id,
+            "old_thread": old_thread,
+            "new_thread": run.thread_id,
+            "total_tokens": usage.total.total_tokens,
+            "model_context_window": usage.model_context_window,
+            "reason": "thread token usage exceeded rotation limit before starting next turn",
+        }),
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_app_server_member_turn(
     node_clients: &mut HashMap<String, TeamAppServerNodeClient>,
     team_dir: &Path,
     active: &mut HashMap<String, AppServerMemberRun>,
+    thread_to_member: &mut HashMap<String, String>,
     member_name: &str,
     prompt: String,
     _cwd: &Path,
     model: Option<String>,
+    sandbox: Option<SandboxMode>,
     approval_policy: Option<AskForApproval>,
     dangerously_bypass_approvals_and_sandbox: bool,
     event_name: &str,
@@ -7689,6 +7788,16 @@ async fn start_app_server_member_turn(
         set_member_status(team_dir, member_name, MemberStatus::Standby)?;
         return Ok(false);
     };
+    maybe_rotate_app_server_thread_before_turn(
+        node_client,
+        team_dir,
+        run,
+        thread_to_member,
+        model.clone(),
+        sandbox,
+        approval_policy.clone(),
+    )
+    .await?;
     let turn_cwd = run.cwd.clone();
     let language = load_config(team_dir)?.language.unwrap_or_default();
     let (prompt, side_context_ids) =
@@ -12564,9 +12673,11 @@ async fn steer_new_team_messages(
     members: &[TeamMember],
     active: &mut HashMap<String, AppServerMemberRun>,
     side_replies: &mut HashMap<String, AppServerSideReply>,
+    thread_to_member: &mut HashMap<String, String>,
     mailbox_counts: &mut HashMap<String, usize>,
     cwd: &Path,
     model: Option<String>,
+    sandbox: Option<SandboxMode>,
     approval_policy: Option<AskForApproval>,
     dangerously_bypass_approvals_and_sandbox: bool,
     codex_exe: &Path,
@@ -12615,10 +12726,12 @@ async fn steer_new_team_messages(
                     node_clients,
                     team_dir,
                     active,
+                    thread_to_member,
                     &member_name,
                     prompt,
                     cwd,
                     model.clone(),
+                    sandbox.clone(),
                     approval_policy,
                     dangerously_bypass_approvals_and_sandbox,
                     "app_server_lead_reactive_started",
@@ -12657,10 +12770,12 @@ async fn steer_new_team_messages(
                     node_clients,
                     team_dir,
                     active,
+                    thread_to_member,
                     &member_name,
                     prompt,
                     cwd,
                     model.clone(),
+                    sandbox.clone(),
                     approval_policy,
                     dangerously_bypass_approvals_and_sandbox,
                     "app_server_member_reactive_started",
@@ -30324,6 +30439,37 @@ authoritative_predecessor:
         assert!(html.contains("capped at 8"));
         assert!(html.contains(">25</"));
         assert!(!html.contains(">40</"));
+    }
+
+    #[test]
+    fn thread_usage_rotation_limit_uses_total_and_context_ratio() {
+        let mut record = TeamTokenUsageRecord {
+            timestamp: now(),
+            member: "lead".to_string(),
+            role: "lead".to_string(),
+            node: "local".to_string(),
+            thread: "thread-1".to_string(),
+            turn: "turn-1".to_string(),
+            category: "lead_tick".to_string(),
+            source: "active_turn".to_string(),
+            total: TeamTokenUsageBreakdown {
+                total_tokens: MAX_APP_SERVER_THREAD_TOTAL_TOKENS - 1,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+            },
+            last: TeamTokenUsageBreakdown::default(),
+            model_context_window: Some(1_000_000),
+        };
+        assert!(!thread_usage_exceeds_rotation_limit(&record));
+
+        record.total.total_tokens = MAX_APP_SERVER_THREAD_TOTAL_TOKENS;
+        assert!(thread_usage_exceeds_rotation_limit(&record));
+
+        record.total.total_tokens = 700;
+        record.model_context_window = Some(1_000);
+        assert!(thread_usage_exceeds_rotation_limit(&record));
     }
 
     #[test]
