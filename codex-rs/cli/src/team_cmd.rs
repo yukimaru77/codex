@@ -61,6 +61,7 @@ use std::time::Instant;
 const CODEX_TEAM_HELPER_URL: &str =
     "https://raw.githubusercontent.com/yukimaru77/codex-team-tools/main/bin/codex-team";
 const MAX_DIRECT_DEVICE_AUTH_ATTEMPTS: usize = 2;
+const MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[clap(rename_all = "kebab_case")]
@@ -8819,9 +8820,20 @@ fn append_side_channel_context_prompt(
     prompt: String,
     language: TeamPromptLanguage,
 ) -> Result<(String, Vec<String>)> {
-    let contexts = pending_side_channel_contexts_for_turn(team_dir, member_name, turn_id)?;
+    let mut contexts = pending_side_channel_contexts_for_turn(team_dir, member_name, turn_id)?;
     if contexts.is_empty() {
         return Ok((prompt, Vec::new()));
+    }
+    let omitted_contexts = contexts
+        .len()
+        .saturating_sub(MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT);
+    if omitted_contexts > 0 {
+        contexts = contexts
+            .into_iter()
+            .rev()
+            .take(MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT)
+            .collect::<Vec<_>>();
+        contexts.reverse();
     }
     let mut out = prompt;
     if language.is_ja() {
@@ -8832,6 +8844,13 @@ fn append_side_channel_context_prompt(
         out.push_str(
             "続行する前に、現在の plan と artifact をこれらの side-channel commitment と突き合わせてください。停止、fail closed、claim scope 変更、evidence 保持、handoff 更新などを約束している場合は、その更新を実施して機械可読 artifact/manifest を検証するか、理由付きで撤回/訂正する team message を直ちに送ってください。side-channel commitment と矛盾する古い artifact に依存したり、handoff/task 完了をしないでください。\n",
         );
+        if omitted_contexts > 0 {
+            out.push_str(&format!(
+                "トークン節約のため、古い side-channel context {} 件はこの prompt では本文を省略しています。必要なら team state の side_channel_contexts/{}.jsonl を参照してください。\n",
+                omitted_contexts,
+                sanitize_id(member_name)
+            ));
+        }
     } else {
         out.push_str("\n\nPending side-channel context for your main turn:\n");
         out.push_str(
@@ -8840,6 +8859,13 @@ fn append_side_channel_context_prompt(
         out.push_str(
             "Before you continue, reconcile your current plan and artifacts against these side-channel commitments. If a side-channel reply promised to stop, fail closed, change claim scope, preserve evidence, or update a handoff, you must either perform that update and verify the resulting machine-readable artifacts/manifests, or immediately send a team message explicitly retracting/correcting the side-channel reply with the reason. Do not hand off, complete a task, or rely on stale artifacts that contradict a side-channel commitment.\n",
         );
+        if omitted_contexts > 0 {
+            out.push_str(&format!(
+                "To keep this turn compact, {} older side-channel context record(s) are omitted from this prompt body. Inspect side_channel_contexts/{}.jsonl in the team state only if those older commitments are relevant.\n",
+                omitted_contexts,
+                sanitize_id(member_name)
+            ));
+        }
     }
     for context in &contexts {
         if language.is_ja() {
@@ -27866,6 +27892,51 @@ authoritative_predecessor:
         )
         .expect("after ack prompt");
         assert!(after_ack_ids.is_empty());
+    }
+
+    #[test]
+    fn side_channel_context_prompt_caps_reinjection_volume() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        let now = now();
+        for idx in 0..(MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT + 5) {
+            append_jsonl(
+                &side_channel_context_path(team_dir, "worker"),
+                &SideChannelContextRecord {
+                    id: format!("ctx-{idx:02}"),
+                    member: "worker".to_string(),
+                    node: "local".to_string(),
+                    source_thread: "thread-main".to_string(),
+                    side_thread: format!("thread-side-{idx}"),
+                    side_turn: format!("turn-side-{idx}"),
+                    recipients: vec!["reviewer".to_string()],
+                    incoming_summary: format!("incoming summary {idx}"),
+                    reply: format!("reply {idx}"),
+                    created_at: now.clone(),
+                    status: SideChannelContextStatus::Pending,
+                    injected_turns: Vec::new(),
+                    injected_at: None,
+                    acknowledged_at: None,
+                },
+            )
+            .expect("append context");
+        }
+
+        let (prompt, ids) = append_side_channel_context_prompt(
+            team_dir,
+            "worker",
+            "turn-main",
+            "base prompt".to_string(),
+            TeamPromptLanguage::En,
+        )
+        .expect("append context prompt");
+
+        assert_eq!(ids.len(), MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT);
+        assert_eq!(ids.first().map(String::as_str), Some("ctx-05"));
+        assert_eq!(ids.last().map(String::as_str), Some("ctx-12"));
+        assert!(prompt.contains("5 older side-channel context record(s) are omitted"));
+        assert!(!prompt.contains("[ctx-00]"));
+        assert!(prompt.contains("[ctx-12]"));
     }
 
     #[test]
