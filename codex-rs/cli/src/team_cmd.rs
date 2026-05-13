@@ -19848,6 +19848,17 @@ fn handle_wait_status_change(
             )?;
             resume_wait_owner_after_wait_status_change(team_dir, wait, task_id)?;
         }
+        TeamWaitStatus::Cancelled if task_has_other_open_wait(team_dir, task_id, &wait.id)? => {
+            append_task_result_note_if_open(
+                team_dir,
+                task_id,
+                &format!(
+                    "Wait `{}` was cancelled while another wait for this task is still open. Treat this wait as obsolete/duplicate and keep following the remaining open wait(s). Progress: {}",
+                    wait.id, wait.progress
+                ),
+            )?;
+            resume_wait_owner_after_wait_status_change(team_dir, wait, task_id)?;
+        }
         TeamWaitStatus::Failed | TeamWaitStatus::Cancelled | TeamWaitStatus::Blocked => {
             set_task_status_if_open(
                 team_dir,
@@ -19866,6 +19877,46 @@ fn handle_wait_status_change(
         set_member_status(team_dir, owner, MemberStatus::Online)?;
     }
     Ok(())
+}
+
+fn task_has_other_open_wait(team_dir: &Path, task_id: &str, current_wait_id: &str) -> Result<bool> {
+    Ok(load_waits(team_dir)?.into_iter().any(|other| {
+        other.id != current_wait_id
+            && other.task_id.as_deref() == Some(task_id)
+            && other.status.is_open()
+    }))
+}
+
+fn append_task_result_note_if_open(team_dir: &Path, task_id: &str, note: &str) -> Result<bool> {
+    let mut tasks = load_tasks(team_dir)?;
+    let mut changed = false;
+    for task in &mut tasks {
+        if task.id != task_id
+            || matches!(
+                task.status,
+                TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Failed
+            )
+        {
+            continue;
+        }
+        if task
+            .result
+            .as_deref()
+            .is_some_and(|result| result.contains(note))
+        {
+            continue;
+        }
+        task.result = Some(append_result_note(task.result.as_deref(), note));
+        task.updated_at = now();
+        changed = true;
+    }
+    if changed {
+        for task in &tasks {
+            write_json_atomic(&task_path(team_dir, &task.id), task)?;
+        }
+        touch_config(team_dir)?;
+    }
+    Ok(changed)
 }
 
 fn resume_wait_owner_after_wait_status_change(
@@ -25000,6 +25051,50 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Waiting);
         assert!(task.result.as_deref().is_some_and(|result| {
             result.contains("wait-1") && result.contains("Do not READY_TO_START")
+        }));
+    }
+
+    #[test]
+    fn cancelled_duplicate_wait_preserves_task_when_other_wait_is_open() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "2",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("runtime is producing artifacts"),
+        );
+        write_test_wait(
+            team_dir,
+            "wait-duplicate",
+            Some("engineering"),
+            Some("2"),
+            TeamWaitStatus::Cancelled,
+        );
+        write_test_wait(
+            team_dir,
+            "wait-canonical",
+            Some("engineering"),
+            Some("2"),
+            TeamWaitStatus::Running,
+        );
+        let wait = read_json::<TeamWait>(&wait_path(team_dir, "wait-duplicate")).expect("wait");
+
+        handle_wait_status_change(team_dir, &wait, TeamWaitStatus::Waiting).expect("handle wait");
+
+        let task = read_json::<TeamTask>(&task_path(team_dir, "2")).expect("task");
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert!(task.result.as_deref().is_some_and(|result| {
+            result.contains("wait-duplicate") && result.contains("obsolete/duplicate")
+        }));
+        let messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering")).expect("mailbox");
+        assert!(messages.iter().any(|message| {
+            message.message.contains("wait `wait-duplicate`")
+                && message.message.contains("cancelled")
         }));
     }
 
