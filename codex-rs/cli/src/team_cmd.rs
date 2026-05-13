@@ -14374,6 +14374,8 @@ fn render_token_usage_panel(team_dir: &Path) -> String {
     let category_rows = render_token_usage_rows(by_category, total.total_tokens, 12);
     let member_rows = render_token_usage_rows(by_member, total.total_tokens, 12);
     let node_rows = render_token_usage_rows(by_node, total.total_tokens, 8);
+    let hotspot_rows = render_token_usage_hotspot_rows(&updates, 12);
+    let side_context_rows = render_side_channel_context_pressure_rows(team_dir);
     let recent_rows = updates
         .iter()
         .take(20)
@@ -14410,8 +14412,10 @@ fn render_token_usage_panel(team_dir: &Path) -> String {
   <details><summary>By Member</summary><table><tr><th>Member</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{member_rows}</table></details>
   <details><summary>By Node</summary><table><tr><th>Node</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{node_rows}</table></details>
 </div>
+<details open><summary>Token Bottlenecks</summary><table><tr><th>Time</th><th>Feature</th><th>Member</th><th>Node</th><th>Turn</th><th>Last Total</th><th>Uncached</th><th>Context</th></tr>{hotspot_rows}</table></details>
+{side_context_rows}
 <details><summary>Recent Usage Updates</summary><table><tr><th>Time</th><th>Feature</th><th>Member</th><th>Node</th><th>Turn</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th></tr>{recent_rows}</table></details>
-<p class="hint">Aggregation deduplicates repeated cumulative app-server notifications, then sums each model-call `last` usage by the active Teams feature category. Uncached input is shown separately because it is the best quick signal for context that was not served from cache.</p>
+<p class="hint">Aggregation deduplicates repeated cumulative app-server notifications, then sums each model-call `last` usage by the active Teams feature category. Bottlenecks are sorted by single model-call cost. Uncached input and context share are the quickest signals for prompt bloat that is not being served from cache.</p>
 </section>"#,
         total_tokens = html_escape(&format_tokens(total.total_tokens)),
         input_tokens = html_escape(&format_tokens(total.input_tokens)),
@@ -14422,6 +14426,8 @@ fn render_token_usage_panel(team_dir: &Path) -> String {
         category_rows = category_rows,
         member_rows = member_rows,
         node_rows = node_rows,
+        hotspot_rows = hotspot_rows,
+        side_context_rows = side_context_rows,
         recent_rows = recent_rows,
     )
 }
@@ -14461,6 +14467,123 @@ fn token_usage_share_cell(value: i64, grand_total: i64) -> String {
     let pct = (value as f64 / grand_total as f64 * 100.0).clamp(0.0, 100.0);
     format!(
         r#"<div class="usage-share"><span style="width:{pct:.1}%"></span><em>{pct:.1}%</em></div>"#
+    )
+}
+
+fn render_token_usage_hotspot_rows(records: &[TeamTokenUsageRecord], limit: usize) -> String {
+    let mut rows = records.iter().collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.last
+            .total_tokens
+            .cmp(&a.last.total_tokens)
+            .then(
+                b.last
+                    .uncached_input_tokens()
+                    .cmp(&a.last.uncached_input_tokens()),
+            )
+            .then(b.timestamp.cmp(&a.timestamp))
+    });
+    rows.into_iter()
+        .take(limit)
+        .map(|record| {
+            let context = record
+                .model_context_window
+                .map(|window| token_context_share_cell(record.last.total_tokens, window))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&timestamp_for_ui(&record.timestamp)),
+                html_escape(&record.category),
+                html_escape(&record.member),
+                html_escape(&record.node),
+                html_escape(&record.turn),
+                html_escape(&format_tokens(record.last.total_tokens)),
+                html_escape(&format_tokens(record.last.uncached_input_tokens())),
+                context,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn token_context_share_cell(value: i64, context_window: i64) -> String {
+    if value <= 0 || context_window <= 0 {
+        return "-".to_string();
+    }
+    let pct = (value as f64 / context_window as f64 * 100.0).clamp(0.0, 999.0);
+    let class = if pct >= 80.0 {
+        "hot"
+    } else if pct >= 50.0 {
+        "warn"
+    } else {
+        "ok"
+    };
+    format!(r#"<span class="usage-context {class}">{pct:.1}%</span>"#)
+}
+
+fn render_side_channel_context_pressure_rows(team_dir: &Path) -> String {
+    let side_dir = team_dir.join("side_channel_contexts");
+    let Ok(entries) = std::fs::read_dir(&side_dir) else {
+        return String::new();
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let member = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let contexts = read_jsonl::<SideChannelContextRecord>(&path).unwrap_or_default();
+        if contexts.is_empty() {
+            continue;
+        }
+        let total = contexts.len();
+        let pending = contexts
+            .iter()
+            .filter(|context| context.status == SideChannelContextStatus::Pending)
+            .count();
+        let injected = contexts
+            .iter()
+            .filter(|context| context.status == SideChannelContextStatus::Injected)
+            .count();
+        let acknowledged = contexts
+            .iter()
+            .filter(|context| context.status == SideChannelContextStatus::Acknowledged)
+            .count();
+        rows.push((member, total, pending, injected, acknowledged));
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+    let body = rows
+        .into_iter()
+        .take(12)
+        .map(|(member, total, pending, injected, acknowledged)| {
+            let pressure = if pending >= MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT {
+                format!(r#"<span class="pill warn">capped at {}</span>"#, MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT)
+            } else {
+                r#"<span class="pill">ok</span>"#.to_string()
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&member),
+                html_escape(&total.to_string()),
+                html_escape(&pending.to_string()),
+                html_escape(&injected.to_string()),
+                html_escape(&acknowledged.to_string()),
+                pressure,
+                html_escape(&format!("side_channel_contexts/{}.jsonl", sanitize_id(&member))),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<details><summary>Side-channel Context Pressure</summary><table><tr><th>Member</th><th>Total</th><th>Pending</th><th>Injected</th><th>Acknowledged</th><th>Prompt</th><th>Source</th></tr>{body}</table><p class="hint">Pending side-channel context is now capped before prompt reinjection. High pending counts are still shown here because they explain historical token spikes and may require a human audit of older commitments.</p></details>"#
     )
 }
 
@@ -14731,6 +14854,10 @@ pre{{background:#111827;color:#d1d5db;padding:12px;border-radius:6px;overflow:au
 .usage-share{{min-width:120px;position:relative;height:18px;background:#eef2f7;border-radius:4px;overflow:hidden}}
 .usage-share span{{position:absolute;inset:0 auto 0 0;background:#9ec5fe}}
 .usage-share em{{position:relative;z-index:1;display:block;text-align:right;padding-right:5px;font-style:normal;font-size:12px;line-height:18px;color:#24292f}}
+.usage-context{{display:inline-block;border:1px solid #d8dee4;border-radius:999px;padding:1px 7px;background:#f6f8fa;color:#39424e;font-size:12px}}
+.usage-context.warn{{background:#fff8c5;border-color:#d4a72c;color:#7d4e00}}
+.usage-context.hot{{background:#ffebe9;border-color:#ff8182;color:#82071e}}
+.usage-context.ok{{background:#dafbe1;border-color:#4ac26b;color:#116329}}
 .messages{{display:grid;gap:8px;max-height:520px;overflow:auto}}
 .msg{{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px}}
 .lead-chat .msg{{border-left:4px solid #8c959f}}
@@ -30166,10 +30293,35 @@ authoritative_predecessor:
             )
             .expect("record usage");
         }
+        for idx in 0..MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT {
+            append_jsonl(
+                &side_channel_context_path(team_dir, "research"),
+                &SideChannelContextRecord {
+                    id: format!("ctx-{idx}"),
+                    member: "research".to_string(),
+                    node: "local".to_string(),
+                    source_thread: "thread-1".to_string(),
+                    side_thread: format!("side-thread-{idx}"),
+                    side_turn: format!("side-turn-{idx}"),
+                    recipients: vec!["lead".to_string()],
+                    incoming_summary: "please confirm".to_string(),
+                    reply: "confirmed".to_string(),
+                    created_at: now(),
+                    status: SideChannelContextStatus::Pending,
+                    injected_turns: Vec::new(),
+                    injected_at: None,
+                    acknowledged_at: None,
+                },
+            )
+            .expect("append context");
+        }
 
         let html = render_token_usage_panel(team_dir);
         assert!(html.contains("lead_tick"));
         assert!(html.contains("research"));
+        assert!(html.contains("Token Bottlenecks"));
+        assert!(html.contains("Side-channel Context Pressure"));
+        assert!(html.contains("capped at 8"));
         assert!(html.contains(">25</"));
         assert!(!html.contains(">40</"));
     }
