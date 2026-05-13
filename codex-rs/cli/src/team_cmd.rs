@@ -4435,6 +4435,10 @@ fn build_autoresearch_audit_report(team_dir: &Path) -> Result<String> {
         .iter()
         .filter(|dir| autoresearch_scan_dir_has_strong_content(dir))
         .count();
+    let scan_dirs_with_wait_or_command_records = scan_dirs
+        .iter()
+        .filter(|dir| autoresearch_scan_dir_has_wait_or_command_record(dir))
+        .count();
     items.push(AutoresearchAuditItem {
         id: "phase0_scans",
         requirement:
@@ -4527,11 +4531,16 @@ fn build_autoresearch_audit_report(team_dir: &Path) -> Result<String> {
         .iter()
         .filter(|wait| wait.status.is_open())
         .count();
+    let deep_wait_gate_passes = open_deep_waits == 0
+        && (completed_deep_waits >= 6
+            || (completed_deep_waits > 0
+                && strong_scan_dirs >= 6
+                && scan_dirs_with_wait_or_command_records >= 6));
     items.push(AutoresearchAuditItem {
         id: "mcp_waits",
         requirement:
             "deep_thinker/deep_researcher など長時間外部思考を wait として登録し、結果を待つ",
-        status: if completed_deep_waits >= 6 && open_deep_waits == 0 {
+        status: if deep_wait_gate_passes {
             AutoresearchAuditStatus::Pass
         } else if completed_deep_waits > 0 {
             AutoresearchAuditStatus::Warn
@@ -4539,15 +4548,16 @@ fn build_autoresearch_audit_report(team_dir: &Path) -> Result<String> {
             AutoresearchAuditStatus::Fail
         },
         evidence: format!(
-            "deep_waits={} completed={} open={}",
+            "deep_waits={} completed={} open={} scan_wait_or_command_records={}",
             deep_waits.len(),
             completed_deep_waits,
-            open_deep_waits
+            open_deep_waits,
+            scan_dirs_with_wait_or_command_records
         ),
-        gap: if completed_deep_waits >= 6 && open_deep_waits == 0 {
+        gap: if deep_wait_gate_passes {
             "-".to_string()
         } else if completed_deep_waits > 0 {
-            "一部の deep_thinker/deep_researcher wait は完了していますが、Fixed-4 + Flexible-2 全体を覆う 6 件には不足しています".to_string()
+            "一部の deep_thinker/deep_researcher wait は完了していますが、6 scan の wait/command 証跡または deep wait coverage が不足しています".to_string()
         } else {
             "完了済み deep_thinker/deep_researcher wait が見つかりません".to_string()
         },
@@ -5077,6 +5087,18 @@ fn autoresearch_scan_dir_has_strong_content(dir: &Path) -> bool {
                 "environment",
                 "handoff",
                 "experiment",
+                "runtime",
+                "build",
+                "run",
+                "gating",
+                "gate",
+                "claim",
+                "paper",
+                "poc",
+                "fallback",
+                "dataset",
+                "license",
+                "access",
                 "次",
                 "統合",
                 "実験",
@@ -5100,6 +5122,30 @@ fn autoresearch_scan_dir_has_strong_content(dir: &Path) -> bool {
         )
         && audit_text_has_min_words(&record, 12)
         && audit_text_has_min_words(&manifest, 2)
+}
+
+fn autoresearch_scan_dir_has_wait_or_command_record(dir: &Path) -> bool {
+    let Some(record) = read_small_audit_text(&dir.join("command_or_mcp_record.md"), 256 * 1024)
+    else {
+        return false;
+    };
+    audit_text_has_min_words(&record, 12)
+        && audit_text_contains_any(
+            &record,
+            &[
+                "deep_thinker",
+                "deep_research",
+                "deepresearch",
+                "mcp",
+                "team wait",
+                "request",
+                "job",
+                "command",
+                "rc=",
+                "exit=",
+                "completed",
+            ],
+        )
 }
 
 fn format_status_text(team_dir: &Path) -> Result<String> {
@@ -23743,6 +23789,121 @@ mod tests {
         assert!(report.contains("| phase0_scans | PASS |"));
         assert!(report.contains("| container_runtime_evidence | PASS |"));
         assert!(report.contains("| loop_continuation | PASS |"));
+    }
+
+    #[test]
+    fn autoresearch_audit_accepts_scan_command_records_without_six_deep_waits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let now = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-autoresearch-scan-records".to_string(),
+            goal: "Autoresearch loop for laboratory instrument digital twin / 実験装置デジタルツイン using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
+                .to_string(),
+            lead: "lead".to_string(),
+            members: vec![TeamMember {
+                name: "lead".to_string(),
+                role: "lead".to_string(),
+                status: MemberStatus::Standby,
+                joined_at: now.clone(),
+                thread_id: None,
+                workspace_path: None,
+                node: None,
+            }],
+            language: Some(TeamPromptLanguage::Ja),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("config");
+
+        let phase0 = team_dir.join("research_planning").join("phase0_scans");
+        for i in 1..=6 {
+            let dir = phase0.join(format!("scan{i:02}"));
+            fs::create_dir_all(&dir).expect("scan dir");
+            fs::write(
+                dir.join("prompt.md"),
+                format!(
+                    "Research scan {i}: investigate evidence, datasets, models, evaluation, implementation, deployment constraints, licensing, failure modes, integration targets, and validation requirements for an auditable articulated digital twin research loop with source-backed outputs.\n"
+                ),
+            )
+            .expect("prompt");
+            fs::write(
+                dir.join("result.md"),
+                format!(
+                    "Substantive scan {i} result. The scan records concrete findings, source-backed limits, runtime assumptions, research risks, alternatives, and how the evidence affects the next bounded experiment and validation plan. It distinguishes confirmed, likely, speculative, and unknown items and preserves enough detail to avoid being a placeholder. {}\n",
+                    "evidence ".repeat(50)
+                ),
+            )
+            .expect("result");
+            fs::write(
+                dir.join("source_evidence.md"),
+                format!(
+                    "Source evidence scan {i}: https://example.com/source-{i} timestamp=2026-05-13 request_id=req-{i} provenance=fetched source=url metadata saved with title, access status, retrieval notes, license notes, and cross-check summary for the downstream phase1 synthesis.\n"
+                ),
+            )
+            .expect("source");
+            fs::write(
+                dir.join("confidence.md"),
+                "confirmed: source snapshot exists\nlikely: useful for first PoC\nspeculative: transfer to real lab remains unknown\nunknown: final benchmark strength\n",
+            )
+            .expect("confidence");
+            let integration = if i == 5 {
+                "Use this scan as build/run gating. Dockerfile may install code packages but must not embed gated assets. Runtime should preserve access logs. If a dataset returns 401/403, mark it blocked and use fallback. Paper/PoC claims must state limitations.\n"
+            } else {
+                "phase1 synthesis target: use this scan for environment handoff, bounded experiment choice, runtime validation, and next task planning.\n"
+            };
+            fs::write(dir.join("integration_target.md"), integration).expect("integration");
+            fs::write(
+                dir.join("command_or_mcp_record.md"),
+                format!(
+                    "scan {i} used saved MCP/deep_thinker command records and team wait evidence. request=req-{i} status=completed rc=0 evidence=result.md source=source_evidence.md\n"
+                ),
+            )
+            .expect("record");
+            fs::write(
+                dir.join("manifest.sha256"),
+                "0123456789abcdef  result.md\nfedcba9876543210  source_evidence.md\n",
+            )
+            .expect("manifest");
+        }
+        fs::write(phase0.join("MANIFEST.sha256"), "manifest\n").expect("phase0 manifest");
+        fs::write(
+            phase0.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "TEAM_COMPLETION_CHECKLIST\n",
+        )
+        .expect("phase0 checklist");
+
+        fs::create_dir_all(waits_dir(team_dir)).expect("waits dir");
+        for i in 1..=3 {
+            write_json_atomic(
+                &wait_path(team_dir, &format!("wait-deep-{i}")),
+                &TeamWait {
+                    id: format!("wait-deep-{i}"),
+                    title: format!("deep_thinker research bundle {i}"),
+                    owner: Some("research_planning".to_string()),
+                    task_id: Some("1".to_string()),
+                    node: None,
+                    condition: "deep_thinker/deep_research returns with source-backed result"
+                        .to_string(),
+                    status: TeamWaitStatus::Completed,
+                    progress: format!("saved bundled result {i} covering multiple scans"),
+                    evidence: Some(format!(
+                        "research_planning/phase0_scans/scan{i:02}/source_evidence.md"
+                    )),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .expect("wait");
+        }
+
+        let report = build_autoresearch_audit_report(team_dir).expect("audit");
+
+        assert!(report.contains("| phase0_scans | PASS |"));
+        assert!(report.contains("| mcp_waits | PASS |"));
+        assert!(report.contains("scan_wait_or_command_records=6"));
     }
 
     #[test]
