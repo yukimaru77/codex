@@ -42,7 +42,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -11396,7 +11395,7 @@ fn maybe_send_lead_autonomy_tick(
         .iter()
         .filter(|wait| wait.status.is_open())
         .collect::<Vec<_>>();
-    let next_action_lines = collect_recent_next_action_signals(team_dir, 8)?;
+    let next_action_lines = collect_recent_next_action_signals(team_dir, 4)?;
     let goal_requests_continuation = team_goal_requests_continuation(&config.goal);
     if open_tasks.is_empty()
         && open_waits.is_empty()
@@ -11432,7 +11431,7 @@ fn maybe_send_lead_autonomy_tick(
                 name = run.member.name,
                 role = run.member.role,
                 node = run.node_id,
-                last = compact_one_line(&run.last_activity_kind, 100)
+                last = compact_one_line(&run.last_activity_kind, 80)
             )
         })
         .collect::<Vec<_>>();
@@ -11440,13 +11439,13 @@ fn maybe_send_lead_autonomy_tick(
 
     let open_task_lines = open_tasks
         .iter()
-        .take(12)
+        .take(8)
         .map(|task| {
             let owner = task.owner.as_deref().unwrap_or("unassigned");
             let age = task_age_secs(task)
                 .map(|age| format!("{age}s"))
                 .unwrap_or_else(|| "unknown".to_string());
-            let subject = compact_one_line(&task.subject, 220);
+            let subject = compact_one_line(&task.subject, 160);
             format!(
                 "- task {id} [{status}] @{owner} age={age}: {subject}",
                 id = task.id,
@@ -11490,10 +11489,10 @@ fn maybe_send_lead_autonomy_tick(
     };
     let open_wait_lines = open_waits
         .iter()
-        .take(10)
+        .take(6)
         .map(|wait| {
-            let condition = compact_one_line(&wait.condition, 180);
-            let progress = compact_one_line(&wait.progress, 180);
+            let condition = compact_one_line(&wait.condition, 120);
+            let progress = compact_one_line(&wait.progress, 120);
             format!(
                 "- wait {id} [{status}] owner=@{owner} task={task} node={node} condition={condition} progress={progress}",
                 id = wait.id,
@@ -11512,7 +11511,7 @@ fn maybe_send_lead_autonomy_tick(
     } else {
         String::new()
     };
-    let proposal_lines = collect_recent_lead_proposals(team_dir, &config.lead, 4)?;
+    let proposal_lines = collect_recent_lead_proposals(team_dir, &config.lead, 3)?;
     let proposal_block = if proposal_lines.is_empty() {
         "- none".to_string()
     } else {
@@ -11542,7 +11541,7 @@ fn maybe_send_lead_autonomy_tick(
     };
     let message = if language.is_ja() {
         format!(
-            "Lead autonomy tick: あなたがこの team の意思決定オーケストレーターです。runtime は状態を届けているだけです。\n\nAction checklist: open task/wait/mailbox/job/artifact を見て、必要な steer/resume/reassign/review/standby を1つ以上具体化してください。open wait がある task は完了扱いにせず、completed/failed/blocked wait は owner を resume して実結果を確認させてください。`LEAD_PROPOSAL:` は採用/却下を明示してください。{continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nArtifact next actions:\n{next_action_block}\n\nActive turns:\n{}",
+            "Lead autonomy tick: あなたがこの team の意思決定オーケストレーターです。runtime は状態を届けているだけです。\n\nAction checklist: open task/wait/mailbox/job/artifact を見て、必要な steer/resume/reassign/review/standby を1つ以上具体化してください。open wait がある task は完了扱いにせず、completed/failed/blocked wait は owner を resume して実結果を確認させてください。`LEAD_PROPOSAL:` は採用/却下を明示してください。{continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nActive turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -11561,7 +11560,7 @@ fn maybe_send_lead_autonomy_tick(
         )
     } else {
         format!(
-            "Lead autonomy tick: you are the decision-making orchestrator for this team. The runtime is only delivering state.\n\nAction checklist: inspect open tasks/waits/mailboxes/jobs/artifacts, then make any concrete steer/resume/reassign/review/standby decision needed. Never complete a task with an open wait; when a wait is completed/failed/blocked, resume its owner to inspect the real result. Explicitly accept or reject each `LEAD_PROPOSAL:`. {continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nArtifact next actions:\n{next_action_block}\n\nActive turns:\n{}",
+            "Lead autonomy tick: you are the decision-making orchestrator for this team. The runtime is only delivering state.\n\nAction checklist: inspect open tasks/waits/mailboxes/jobs/artifacts, then make any concrete steer/resume/reassign/review/standby decision needed. Never complete a task with an open wait; when a wait is completed/failed/blocked, resume its owner to inspect the real result. Explicitly accept or reject each `LEAD_PROPOSAL:`. {continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nActive turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -11847,20 +11846,25 @@ fn collect_recent_next_action_signals(team_dir: &Path, limit: usize) -> Result<V
         right_mtime.cmp(&left_mtime)
     });
 
-    let mut seen = HashSet::new();
+    let mut seen_paths = HashSet::new();
+    let mut seen_signals = HashSet::new();
     let mut signals = Vec::new();
     for path in candidates {
         if signals.len() >= limit {
             break;
         }
-        if !seen.insert(path.clone()) {
+        if !seen_paths.insert(path.clone()) {
             continue;
         }
         for line in extract_next_action_lines(&path)? {
+            let normalized = compact_one_line(&line, 160).to_ascii_lowercase();
+            if normalized.is_empty() || !seen_signals.insert(normalized) {
+                continue;
+            }
             signals.push(format!(
                 "- {}: {}",
                 path.display(),
-                compact_one_line(&line, 320)
+                compact_one_line(&line, 180)
             ));
             if signals.len() >= limit {
                 break;
@@ -11894,10 +11898,12 @@ fn collect_next_action_candidate_files(dir: &Path, depth: usize, candidates: &mu
 }
 
 fn is_next_action_candidate_file(path: &Path) -> bool {
-    if path
-        .components()
-        .any(|component| component.as_os_str() == OsStr::new("live_messages"))
-    {
+    if path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("live_messages" | "last_messages" | "mailboxes" | "job_status_notifications")
+        )
+    }) {
         return false;
     }
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -11905,14 +11911,7 @@ fn is_next_action_candidate_file(path: &Path) -> bool {
     };
     let lower = name.to_ascii_lowercase();
     let has_report_name = [
-        "audit",
-        "report",
-        "summary",
-        "handoff",
-        "status",
-        "outcome",
-        "checklist",
-        "progress",
+        "audit", "report", "summary", "handoff", "status", "outcome", "progress",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
