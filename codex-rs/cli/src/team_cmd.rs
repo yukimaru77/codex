@@ -27,6 +27,8 @@ use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
+use codex_app_server_protocol::TokenUsageBreakdown;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
@@ -144,6 +146,9 @@ enum TeamSubcommand {
 
     /// Track generic long-running waits, requests, gates, or external work.
     Wait(WaitCli),
+
+    /// Audit an autoresearch team against phase/research/runtime evidence gates.
+    AutoresearchAudit(AutoresearchAuditArgs),
 
     /// Manage the dedicated local browser profile used for remote device auth.
     AuthBrowser(AuthBrowserCli),
@@ -714,6 +719,9 @@ enum NodeSubcommand {
     /// Sync a local file or directory to a node path for artifact handoff.
     SyncPath(NodeSyncPathArgs),
 
+    /// Pull a node-side file or directory into a local path for artifact consumption.
+    PullPath(NodePullPathArgs),
+
     /// Register or update an execution node.
     Add(NodeAddArgs),
 
@@ -862,6 +870,29 @@ struct NodeSyncPathArgs {
     dest: String,
 
     /// Replace an existing destination path after backing it up.
+    #[arg(long, default_value_t = false)]
+    replace: bool,
+
+    /// Print the generated command without running it.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct NodePullPathArgs {
+    /// Node id.
+    #[arg(value_name = "ID")]
+    id: String,
+
+    /// File or directory path on the node to pull.
+    #[arg(long)]
+    src: String,
+
+    /// Local destination path.
+    #[arg(long)]
+    dest: PathBuf,
+
+    /// Replace an existing local destination path after backing it up.
     #[arg(long, default_value_t = false)]
     replace: bool,
 
@@ -1192,6 +1223,20 @@ struct StopArgs {
     no_remote_nodes: bool,
 }
 
+#[derive(Debug, Args)]
+struct AutoresearchAuditArgs {
+    #[command(flatten)]
+    selector: TeamSelector,
+
+    /// Write the audit report into the team state directory and print its path.
+    #[arg(long, default_value_t = false)]
+    write: bool,
+
+    /// Custom report output path. Implies --write.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TeamConfig {
     version: u32,
@@ -1514,6 +1559,70 @@ struct UiDebugTimelineItem {
     meta: serde_json::Value,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TeamTurnUsageIndexRecord {
+    timestamp: String,
+    member: String,
+    role: String,
+    node: String,
+    thread: String,
+    turn: String,
+    category: String,
+    source_event: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TeamTokenUsageRecord {
+    timestamp: String,
+    member: String,
+    role: String,
+    node: String,
+    thread: String,
+    turn: String,
+    category: String,
+    source: String,
+    total: TeamTokenUsageBreakdown,
+    last: TeamTokenUsageBreakdown,
+    model_context_window: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct TeamTokenUsageBreakdown {
+    total_tokens: i64,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+impl TeamTokenUsageBreakdown {
+    fn add_assign(&mut self, other: Self) {
+        self.total_tokens += other.total_tokens;
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_output_tokens += other.reasoning_output_tokens;
+    }
+
+    fn uncached_input_tokens(&self) -> i64 {
+        self.input_tokens
+            .saturating_sub(self.cached_input_tokens)
+            .max(0)
+    }
+}
+
+impl From<TokenUsageBreakdown> for TeamTokenUsageBreakdown {
+    fn from(value: TokenUsageBreakdown) -> Self {
+        Self {
+            total_tokens: value.total_tokens,
+            input_tokens: value.input_tokens,
+            cached_input_tokens: value.cached_input_tokens,
+            output_tokens: value.output_tokens,
+            reasoning_output_tokens: value.reasoning_output_tokens,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct AppServerRegistry {
     url: String,
@@ -1584,6 +1693,7 @@ impl TeamCli {
             Some(TeamSubcommand::Node(cli)) => run_node(&root, cli),
             Some(TeamSubcommand::Job(cli)) => run_job(&root, cli),
             Some(TeamSubcommand::Wait(cli)) => run_wait(&root, cli),
+            Some(TeamSubcommand::AutoresearchAudit(args)) => run_autoresearch_audit(&root, args),
             Some(TeamSubcommand::AuthBrowser(cli)) => run_auth_browser(&codex_home, cli),
             Some(TeamSubcommand::Message(args)) => send_message(&root, args),
             Some(TeamSubcommand::Inbox(args)) => read_inbox(&root, args),
@@ -2262,6 +2372,7 @@ fn build_lead_department_design_prompt(
     placement_candidates: &[LeadNodeDesign],
     language: TeamPromptLanguage,
 ) -> String {
+    let autoresearch_policy = build_autoresearch_department_design_policy(goal, language);
     let candidates = if placement_candidates.is_empty() {
         "(none explicitly provided by CLI/UI advanced options)".to_string()
     } else {
@@ -2308,6 +2419,8 @@ CLI/UI の advanced option から明示された配置候補だけ:
 - 部署は、自分の execution site で必要な task tool や library を install できます。環境セットアップだけを理由に peer department を増やさないでください。
 - goal が public/open-source model、dataset、package、API、service に依存する場合、research/ops は transitive runtime artifact や model dependency が現在の環境で実際に access 可能か確認してください。未提供の gated credential が必要な新しい選択肢より、少し新規性が低くても end-to-end で動く選択肢を優先してください。
 - product、engineering、design、quality、research、docs、ops、security、data などの domain ownership を優先してください。
+- 自動研究 goal の追加制約:
+{autoresearch_policy}
 - department name と role は lowercase ASCII identifier にしてください。
 - 配置も department design の一部として決めてください。local department は `"node": "local"` または省略を使ってください。ユーザー要求が到達可能な SSH site を明確に呼ぶ場合は SSH node を使ってください。
 - ユーザー goal が到達可能な SSH host または既存 Docker/container execution site を名指しする場合、`nodes` に含めてください。
@@ -2337,6 +2450,7 @@ CLI/UI の advanced option から明示された配置候補だけ:
 "#,
             goal = goal,
             candidates = candidates,
+            autoresearch_policy = autoresearch_policy,
         );
     }
 
@@ -2366,6 +2480,8 @@ Design a small department structure:
 - Departments are allowed to install missing task tools and libraries in their own execution site when that is the best way to complete or verify the work. Do not create extra peer departments just because an environment needs setup.
 - If the goal depends on a public external model, dataset, package, or service, research/ops must verify that all required runtime artifacts and transitive model dependencies are actually accessible in the current environment. Prefer a slightly less novel option that can run end-to-end over a newer option that requires unprovided gated credentials.
 - Prefer domain ownership such as product, engineering, design, quality, research, docs, ops, security, data, etc.
+- Additional constraints for autoresearch goals:
+{autoresearch_policy}
 - Use lowercase ASCII identifiers for department names and roles.
 - Decide placement as part of the department design. Use `"node": "local"` or omit `node` for local departments. Use an SSH node when the user's request clearly calls for a reachable SSH site.
 - Include nodes in `nodes` when the user goal names a reachable SSH host or an already-existing Docker/container execution site.
@@ -2395,6 +2511,7 @@ Return only valid JSON, no Markdown, no commentary:
 "#,
         goal = goal,
         candidates = candidates,
+        autoresearch_policy = autoresearch_policy,
     )
 }
 
@@ -3103,6 +3220,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             completed: true,
             failed: false,
             standby_after_turn: false,
+            usage_category: "lead_thread".to_string(),
             team_message_scan_offset: 0,
             last_activity_at: Instant::now(),
             last_activity_kind: "thread_started".to_string(),
@@ -3237,13 +3355,14 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             member.name.clone(),
             AppServerMemberRun {
                 member: member.clone(),
-                node_id,
+                node_id: node_id.clone(),
                 cwd: worker_cwd,
-                thread_id: thread.thread.id,
-                turn_id: turn.turn.id,
+                thread_id: thread.thread.id.clone(),
+                turn_id: turn.turn.id.clone(),
                 completed: false,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "department_start".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now(),
                 last_activity_kind: "turn_started".to_string(),
@@ -3252,6 +3371,15 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                 side_context_ids: Vec::new(),
             },
         );
+        record_turn_usage_index(
+            &team_dir,
+            member,
+            &node_id,
+            &thread.thread.id,
+            &turn.turn.id,
+            "department_start",
+            "app_server_member_started",
+        )?;
         started_workers += 1;
     }
 
@@ -3945,6 +4073,109 @@ fn handle_team_relay_request(team_dir: &Path, stream: &mut std::net::TcpStream) 
                 "Job started\n",
             )?;
         }
+        ("GET", "/wait/list") => {
+            let list_args = WaitListArgs {
+                owner: request
+                    .query
+                    .get("owner")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned(),
+                task: request
+                    .query
+                    .get("task")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned(),
+                status: request
+                    .query
+                    .get("status")
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| parse_wait_status(value))
+                    .transpose()?,
+                limit: request
+                    .query
+                    .get("limit")
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| value.parse::<usize>())
+                    .transpose()
+                    .context("invalid wait list limit")?,
+            };
+            write_http_response(
+                stream,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                &format_waits_text_filtered(team_dir, &list_args)?,
+            )?;
+        }
+        ("POST", "/wait/add") => {
+            let form = parse_form(&request.body);
+            add_team_wait(
+                team_dir,
+                WaitAddArgs {
+                    title: form_value(&form, "title")?,
+                    owner: form
+                        .get("owner")
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned(),
+                    task: form
+                        .get("task")
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned(),
+                    node: form
+                        .get("node")
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned(),
+                    condition: form.get("condition").cloned().unwrap_or_default(),
+                    status: form
+                        .get("status")
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| parse_wait_status(value))
+                        .transpose()?
+                        .unwrap_or(TeamWaitStatus::Waiting),
+                    progress: form.get("progress").cloned().unwrap_or_default(),
+                    evidence: form
+                        .get("evidence")
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned(),
+                },
+            )?;
+            write_http_response(
+                stream,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                "Wait registered\n",
+            )?;
+        }
+        ("POST", "/wait/set") => {
+            let form = parse_form(&request.body);
+            set_team_wait(
+                team_dir,
+                WaitSetArgs {
+                    id: form_value(&form, "id")?,
+                    status: form
+                        .get("status")
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| parse_wait_status(value))
+                        .transpose()?,
+                    progress: form
+                        .get("progress")
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned(),
+                    evidence: form
+                        .get("evidence")
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned(),
+                    clear_evidence: form
+                        .get("clear_evidence")
+                        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
+                },
+            )?;
+            write_http_response(
+                stream,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                "Wait updated\n",
+            )?;
+        }
         ("GET", "/job/status") => {
             let id = request.query.get("id").context("missing id")?;
             write_http_response(
@@ -4062,13 +4293,812 @@ fn send_team_message_to_dir(
     Ok(recipients)
 }
 
+fn run_autoresearch_audit(root: &Path, args: AutoresearchAuditArgs) -> Result<()> {
+    let team_dir = resolve_team_dir(root, args.selector.team.as_deref())?;
+    let report = build_autoresearch_audit_report(&team_dir)?;
+    print!("{report}");
+    if args.write || args.output.is_some() {
+        let output = args.output.unwrap_or_else(|| {
+            team_dir.join(format!(
+                "autoresearch_audit_{}.md",
+                sanitize_id(&now()).replace('-', "_")
+            ))
+        });
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&output, &report)
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        println!("\nWrote audit report: {}", output.display());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoresearchAuditStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl AutoresearchAuditStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            AutoresearchAuditStatus::Pass => "PASS",
+            AutoresearchAuditStatus::Warn => "WARN",
+            AutoresearchAuditStatus::Fail => "FAIL",
+        }
+    }
+}
+
+struct AutoresearchAuditItem {
+    id: &'static str,
+    requirement: &'static str,
+    status: AutoresearchAuditStatus,
+    evidence: String,
+    gap: String,
+}
+
+fn build_autoresearch_audit_report(team_dir: &Path) -> Result<String> {
+    let config = load_config(team_dir)?;
+    let tasks = load_tasks(team_dir)?;
+    let waits = load_waits(team_dir)?;
+    let jobs = load_jobs(team_dir)?;
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
+    let ownerships = load_ownerships(team_dir)?;
+    let roots = autoresearch_candidate_roots(team_dir, &config, &ownerships);
+    let files = collect_audit_files(&roots, 5, 1200)?;
+    let mut items = Vec::new();
+
+    let goal_lower = config.goal.to_ascii_lowercase();
+    let theme_present = config.goal.chars().count() > 120
+        && (goal_lower.contains("digital twin")
+            || config.goal.contains("デジタルツイン")
+            || config.goal.contains("実験装置"));
+    items.push(AutoresearchAuditItem {
+        id: "theme",
+        requirement: "研究テーマが提示され、質問だけで停止せず phase0 に進める状態である",
+        status: if theme_present {
+            AutoresearchAuditStatus::Pass
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!("goal_chars={}", config.goal.chars().count()),
+        gap: if theme_present {
+            "-".to_string()
+        } else {
+            "goal から研究テーマを十分に確認できません".to_string()
+        },
+    });
+
+    let phase0_contract = Path::new("/home/yukimaru/research_prompt/phase0.md");
+    let phase1_contract = Path::new("/home/yukimaru/research_prompt/phase1.md");
+    items.push(AutoresearchAuditItem {
+        id: "contracts",
+        requirement: "phase0.md と phase1.md を外部契約として参照できる",
+        status: if phase0_contract.exists() && phase1_contract.exists() {
+            AutoresearchAuditStatus::Pass
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "phase0_exists={} phase1_exists={}",
+            phase0_contract.exists(),
+            phase1_contract.exists()
+        ),
+        gap: if phase0_contract.exists() && phase1_contract.exists() {
+            "-".to_string()
+        } else {
+            "research_prompt の契約ファイルが不足しています".to_string()
+        },
+    });
+
+    let scan_dirs = files
+        .iter()
+        .filter_map(|path| path.parent())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("scan"))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let phase0_manifest = find_audit_file(&files, &["phase0", "manifest"]);
+    let phase0_checklist = find_audit_file(&files, &["phase0", "team_completion_checklist"]);
+    let structurally_complete_scan_dirs = scan_dirs
+        .iter()
+        .filter(|dir| {
+            [
+                "prompt.md",
+                "result.md",
+                "source_evidence.md",
+                "confidence.md",
+                "integration_target.md",
+                "command_or_mcp_record.md",
+                "manifest.sha256",
+            ]
+            .iter()
+            .all(|name| dir.join(name).exists())
+        })
+        .count();
+    let strong_scan_dirs = scan_dirs
+        .iter()
+        .filter(|dir| autoresearch_scan_dir_has_strong_content(dir))
+        .count();
+    items.push(AutoresearchAuditItem {
+        id: "phase0_scans",
+        requirement:
+            "Fixed-4 + Flexible-2 の 6 scan が実行され、prompt/result/source/confidence/integration/wait-or-command/manifest を持つ",
+        status: if strong_scan_dirs >= 6 && phase0_manifest.is_some() && phase0_checklist.is_some()
+        {
+            AutoresearchAuditStatus::Pass
+        } else if structurally_complete_scan_dirs > 0 || strong_scan_dirs > 0 {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "strong_scan_dirs={} structural_scan_dirs={} phase0_manifest={} phase0_checklist={}",
+            strong_scan_dirs,
+            structurally_complete_scan_dirs,
+            phase0_manifest
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            phase0_checklist
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        gap: if strong_scan_dirs >= 6 && phase0_manifest.is_some() && phase0_checklist.is_some()
+        {
+            "-".to_string()
+        } else {
+            "6本すべての scan package、phase0 manifest/checklist、または source/confidence/MCP記録などの中身が不足しています".to_string()
+        },
+    });
+
+    let phase1_manifest = find_audit_file(&files, &["phase1", "manifest"]);
+    let phase1_text_hit = files.iter().any(|path| {
+        path.to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("phase1")
+            && file_contains_any(
+                path,
+                &[
+                    "killer experiment",
+                    "bounded experiment",
+                    "environment_handoff",
+                    "最初に潰すべき",
+                    "最初の killer",
+                ],
+            )
+    });
+    items.push(AutoresearchAuditItem {
+        id: "phase1_synthesis",
+        requirement:
+            "phase0 の結果を統合し、phase1 synthesis で bounded/killer experiment と環境 handoff を決める",
+        status: if phase1_manifest.is_some() && phase1_text_hit {
+            AutoresearchAuditStatus::Pass
+        } else if phase1_manifest.is_some() || phase1_text_hit {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "phase1_manifest={} synthesis_terms_found={}",
+            phase1_manifest
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            phase1_text_hit
+        ),
+        gap: if phase1_manifest.is_some() && phase1_text_hit {
+            "-".to_string()
+        } else {
+            "phase1 の manifest または killer/bounded experiment/environment handoff 証拠が弱いです"
+                .to_string()
+        },
+    });
+
+    let deep_waits = waits
+        .iter()
+        .filter(|wait| {
+            let text =
+                format!("{} {} {}", wait.title, wait.condition, wait.progress).to_ascii_lowercase();
+            text.contains("deep_thinker") || text.contains("deep_research")
+        })
+        .collect::<Vec<_>>();
+    let completed_deep_waits = deep_waits
+        .iter()
+        .filter(|wait| matches!(wait.status, TeamWaitStatus::Completed))
+        .count();
+    let open_deep_waits = deep_waits
+        .iter()
+        .filter(|wait| wait.status.is_open())
+        .count();
+    items.push(AutoresearchAuditItem {
+        id: "mcp_waits",
+        requirement:
+            "deep_thinker/deep_researcher など長時間外部思考を wait として登録し、結果を待つ",
+        status: if completed_deep_waits >= 6 && open_deep_waits == 0 {
+            AutoresearchAuditStatus::Pass
+        } else if completed_deep_waits > 0 {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "deep_waits={} completed={} open={}",
+            deep_waits.len(),
+            completed_deep_waits,
+            open_deep_waits
+        ),
+        gap: if completed_deep_waits >= 6 && open_deep_waits == 0 {
+            "-".to_string()
+        } else if completed_deep_waits > 0 {
+            "一部の deep_thinker/deep_researcher wait は完了していますが、Fixed-4 + Flexible-2 全体を覆う 6 件には不足しています".to_string()
+        } else {
+            "完了済み deep_thinker/deep_researcher wait が見つかりません".to_string()
+        },
+    });
+
+    let saitou_node = nodes
+        .iter()
+        .any(|node| node.id == "saitou" || node.host.as_deref() == Some("saitou"));
+    let docker_jobs = jobs
+        .iter()
+        .filter(|job| {
+            job.node == "saitou"
+                && format!("{} {}", job.id, job.command)
+                    .to_ascii_lowercase()
+                    .contains("docker")
+        })
+        .collect::<Vec<_>>();
+    let completed_docker_jobs = docker_jobs
+        .iter()
+        .filter(|job| matches!(job.status, TeamJobStatus::Completed))
+        .count();
+    items.push(AutoresearchAuditItem {
+        id: "saitou_docker_build",
+        requirement:
+            "ssh saitou 上で Dockerfile/image/container 作成を行い、Docker build を team job として追跡する",
+        status: if saitou_node && completed_docker_jobs > 0 {
+            AutoresearchAuditStatus::Pass
+        } else if saitou_node || !docker_jobs.is_empty() {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "saitou_node={} docker_jobs={} completed={}",
+            saitou_node,
+            docker_jobs.len(),
+            completed_docker_jobs
+        ),
+        gap: if saitou_node && completed_docker_jobs > 0 {
+            "-".to_string()
+        } else {
+            "saitou node または完了済み Docker job が不足しています".to_string()
+        },
+    });
+
+    let container_nodes = nodes
+        .iter()
+        .filter(|node| matches!(node.kind, TeamNodeKind::Docker | TeamNodeKind::SshDocker))
+        .collect::<Vec<_>>();
+    let container_members = config
+        .members
+        .iter()
+        .filter(|member| {
+            member
+                .node
+                .as_deref()
+                .is_some_and(|node_id| container_nodes.iter().any(|node| node.id == node_id))
+        })
+        .collect::<Vec<_>>();
+    items.push(AutoresearchAuditItem {
+        id: "container_node_department",
+        requirement:
+            "container 作成後に long-lived Docker/ssh-docker node を登録し、container 内部署を立てる",
+        status: if !container_nodes.is_empty() && !container_members.is_empty() {
+            AutoresearchAuditStatus::Pass
+        } else if !container_nodes.is_empty() {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "container_nodes={} container_members={}",
+            container_nodes
+                .iter()
+                .map(|node| format!(
+                    "{}:{:?}:{:?}:{}",
+                    node.id,
+                    node.kind,
+                    node.status,
+                    node.container.as_deref().unwrap_or("-")
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+            container_members
+                .iter()
+                .map(|member| member.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        gap: if !container_nodes.is_empty() && !container_members.is_empty() {
+            "-".to_string()
+        } else {
+            "container node または container 内部署が不足しています".to_string()
+        },
+    });
+
+    let runtime_wait = waits.iter().find(|wait| {
+        let text =
+            format!("{} {} {}", wait.title, wait.condition, wait.progress).to_ascii_lowercase();
+        text.contains("runtime package") || text.contains("container runtime")
+    });
+    let runtime_package_local = files.iter().any(|path| {
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        (lower.contains("runtime_container") || lower.contains("runtime"))
+            && (lower.ends_with("manifest.sha256")
+                || lower.contains("runtime_report")
+                || lower.contains("claim_evidence")
+                || lower.contains("visualization"))
+    });
+    items.push(AutoresearchAuditItem {
+        id: "container_runtime_evidence",
+        requirement:
+            "container 内で実験を行い、commands/logs/metrics/visualizations/claim-evidence/日本語report/manifest を保存する",
+        status: if runtime_wait.is_some_and(|wait| matches!(wait.status, TeamWaitStatus::Completed))
+            && runtime_package_local
+        {
+            AutoresearchAuditStatus::Pass
+        } else if runtime_wait.is_some() || runtime_package_local {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "runtime_wait={} runtime_wait_status={} local_runtime_package_terms={}",
+            runtime_wait.map(|wait| wait.id.as_str()).unwrap_or("-"),
+            runtime_wait
+                .map(|wait| wait.status.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            runtime_package_local
+        ),
+        gap: if runtime_wait.is_some_and(|wait| matches!(wait.status, TeamWaitStatus::Completed))
+            && runtime_package_local
+        {
+            "-".to_string()
+        } else {
+            "runtime package は未完了またはローカルに pull/検証された成果物がありません".to_string()
+        },
+    });
+
+    let evaluation_task_done = tasks.iter().any(|task| {
+        task.owner.as_deref() == Some("evaluation") && matches!(task.status, TaskStatus::Completed)
+    });
+    let audit_task_done = tasks.iter().any(|task| {
+        task.owner.as_deref() == Some("audit") && matches!(task.status, TaskStatus::Completed)
+    });
+    let eval_audit_files = files.iter().any(|path| {
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        (lower.contains("/evaluation/") || lower.contains("/audit/"))
+            && (lower.ends_with("manifest.sha256")
+                || lower.contains("team_completion_checklist")
+                || lower.contains("claim"))
+    });
+    items.push(AutoresearchAuditItem {
+        id: "evaluation_audit",
+        requirement:
+            "runtime 結果を evaluation/audit が独立評価し、allowed/blocked claims と次アクションを出す",
+        status: if evaluation_task_done && audit_task_done && eval_audit_files {
+            AutoresearchAuditStatus::Pass
+        } else if eval_audit_files || evaluation_task_done || audit_task_done {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "evaluation_task_done={} audit_task_done={} eval_or_audit_files={}",
+            evaluation_task_done, audit_task_done, eval_audit_files
+        ),
+        gap: if evaluation_task_done && audit_task_done && eval_audit_files {
+            "-".to_string()
+        } else {
+            "evaluation/audit の完了または claim boundary 証拠が不足しています".to_string()
+        },
+    });
+
+    let next_action_files = files.iter().any(|path| {
+        file_contains_any(
+            path,
+            &[
+                "recommended next action",
+                "next bounded",
+                "next experiment",
+                "次の bounded",
+                "次実験",
+                "次アクション",
+            ],
+        )
+    });
+    let open_non_blocked_tasks = tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Pending
+                    | TaskStatus::Waiting
+                    | TaskStatus::Ready
+                    | TaskStatus::InProgress
+                    | TaskStatus::Review
+            )
+        })
+        .count();
+    items.push(AutoresearchAuditItem {
+        id: "loop_continuation",
+        requirement:
+            "1 iteration 後に final audit/recommended next action を出し、次 bounded task へ進む",
+        status: if next_action_files && open_non_blocked_tasks > 0 {
+            AutoresearchAuditStatus::Pass
+        } else if next_action_files || open_non_blocked_tasks > 0 {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Fail
+        },
+        evidence: format!(
+            "next_action_terms_in_files={} open_non_blocked_tasks={}",
+            next_action_files, open_non_blocked_tasks
+        ),
+        gap: if next_action_files && open_non_blocked_tasks > 0 {
+            "-".to_string()
+        } else {
+            "次サイクル判断または次 bounded task が確認できません".to_string()
+        },
+    });
+
+    Ok(format_autoresearch_audit_report(
+        &config, team_dir, &roots, &items, &tasks, &waits, &jobs, &nodes,
+    ))
+}
+
+fn format_autoresearch_audit_report(
+    config: &TeamConfig,
+    team_dir: &Path,
+    roots: &[PathBuf],
+    items: &[AutoresearchAuditItem],
+    tasks: &[TeamTask],
+    waits: &[TeamWait],
+    jobs: &[TeamJob],
+    nodes: &[TeamNode],
+) -> String {
+    let pass = items
+        .iter()
+        .filter(|item| item.status == AutoresearchAuditStatus::Pass)
+        .count();
+    let warn = items
+        .iter()
+        .filter(|item| item.status == AutoresearchAuditStatus::Warn)
+        .count();
+    let fail = items
+        .iter()
+        .filter(|item| item.status == AutoresearchAuditStatus::Fail)
+        .count();
+    let overall = if fail > 0 {
+        "FAIL"
+    } else if warn > 0 {
+        "WARN"
+    } else {
+        "PASS"
+    };
+    let mut out = String::new();
+    out.push_str(&format!("# Autoresearch Audit: {}\n\n", config.id));
+    out.push_str(&format!("- generated_at: {}\n", now()));
+    out.push_str(&format!("- team_state: {}\n", team_dir.display()));
+    out.push_str(&format!(
+        "- overall: {overall} ({pass} pass / {warn} warn / {fail} fail)\n"
+    ));
+    out.push_str(&format!(
+        "- tasks: {}\n- waits: {} open / {} total\n- jobs: {}\n- nodes: {}\n\n",
+        format_task_status_counts(tasks),
+        waits.iter().filter(|wait| wait.status.is_open()).count(),
+        waits.len(),
+        jobs.len(),
+        nodes.len()
+    ));
+    out.push_str("## Inspected Roots\n\n");
+    for root in roots {
+        out.push_str(&format!("- {}\n", root.display()));
+    }
+    out.push_str("\n## Prompt-To-Artifact Checklist\n\n");
+    out.push_str("| ID | Status | Requirement | Evidence | Gap |\n");
+    out.push_str("| --- | --- | --- | --- | --- |\n");
+    for item in items {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            item.id,
+            item.status.as_str(),
+            md_table_cell(item.requirement),
+            md_table_cell(&item.evidence),
+            md_table_cell(&item.gap)
+        ));
+    }
+    out.push_str("\n## Open Waits\n\n");
+    for wait in waits.iter().filter(|wait| wait.status.is_open()) {
+        out.push_str(&format!(
+            "- {} [{}] owner={} task={} evidence={} title={}\n",
+            wait.id,
+            wait.status,
+            wait.owner.as_deref().unwrap_or("-"),
+            wait.task_id.as_deref().unwrap_or("-"),
+            wait.evidence.as_deref().unwrap_or("-"),
+            wait.title
+        ));
+    }
+    out.push_str("\n## Non-Completed Jobs\n\n");
+    for job in jobs
+        .iter()
+        .filter(|job| !matches!(job.status, TeamJobStatus::Completed))
+    {
+        out.push_str(&format!(
+            "- {} [{:?}] node={} owner={} task={} log={}\n",
+            job.id,
+            job.status,
+            job.node,
+            job.owner.as_deref().unwrap_or("-"),
+            job.task_id.as_deref().unwrap_or("-"),
+            job.log_path
+        ));
+    }
+    out.push_str("\n## Interpretation\n\n");
+    out.push_str(
+        "This audit reads team state and locally visible artifacts only. Remote/container paths are not treated as verified final evidence unless they have been pulled into an inspected local root or represented by completed wait/job artifacts with final manifests. A PASS here means the required gate has concrete local/team-state evidence; WARN means partial or remote-unverified evidence; FAIL means the gate is missing or still open.\n",
+    );
+    out
+}
+
+fn md_table_cell(value: &str) -> String {
+    value
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
+        .chars()
+        .take(900)
+        .collect()
+}
+
+fn autoresearch_candidate_roots(
+    team_dir: &Path,
+    config: &TeamConfig,
+    ownerships: &[FileOwnership],
+) -> Vec<PathBuf> {
+    let mut roots = vec![team_dir.to_path_buf()];
+    let research_root = PathBuf::from("/home/yukimaru/research").join(&config.id);
+    if research_root.exists() {
+        roots.push(research_root);
+    }
+    for ownership in ownerships {
+        let path = PathBuf::from(&ownership.path);
+        if path.is_absolute() && path.exists() && is_local_autoresearch_path(&path) {
+            roots.push(if path.is_file() {
+                path.parent().unwrap_or(path.as_path()).to_path_buf()
+            } else {
+                path
+            });
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn is_local_autoresearch_path(path: &Path) -> bool {
+    path.starts_with("/home/yukimaru") || path.starts_with("/tmp")
+}
+
+fn collect_audit_files(roots: &[PathBuf], max_depth: usize, limit: usize) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for root in roots {
+        collect_audit_files_inner(root, 0, max_depth, limit, &mut files)?;
+        if files.len() >= limit {
+            break;
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn collect_audit_files_inner(
+    path: &Path,
+    depth: usize,
+    max_depth: usize,
+    limit: usize,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if files.len() >= limit || depth > max_depth || !path.exists() {
+        return Ok(());
+    }
+    if path.is_file() {
+        files.push(path.to_path_buf());
+        return Ok(());
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let child = entry.path();
+        let name = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name == ".git" || name == "target" || name == "node_modules" {
+            continue;
+        }
+        if child.is_dir() {
+            collect_audit_files_inner(&child, depth + 1, max_depth, limit, files)?;
+        } else if child.is_file() {
+            files.push(child);
+        }
+        if files.len() >= limit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn find_audit_file(files: &[PathBuf], needles: &[&str]) -> Option<PathBuf> {
+    files.iter().find_map(|path| {
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        if needles.iter().all(|needle| lower.contains(needle)) {
+            Some(path.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn file_contains_any(path: &Path, needles: &[&str]) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    needles
+        .iter()
+        .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+}
+
+fn read_small_audit_text(path: &Path, max_bytes: u64) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() == 0 || metadata.len() > max_bytes {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn audit_text_contains_any(text: &str, needles: &[&str]) -> bool {
+    let lower = text.to_ascii_lowercase();
+    needles
+        .iter()
+        .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+}
+
+fn audit_text_has_min_words(text: &str, min_words: usize) -> bool {
+    text.split_whitespace().take(min_words).count() >= min_words
+}
+
+fn autoresearch_scan_dir_has_strong_content(dir: &Path) -> bool {
+    const REQUIRED: [&str; 7] = [
+        "prompt.md",
+        "result.md",
+        "source_evidence.md",
+        "confidence.md",
+        "integration_target.md",
+        "command_or_mcp_record.md",
+        "manifest.sha256",
+    ];
+    if !REQUIRED.iter().all(|name| dir.join(name).exists()) {
+        return false;
+    }
+
+    let Some(prompt) = read_small_audit_text(&dir.join("prompt.md"), 256 * 1024) else {
+        return false;
+    };
+    let Some(result) = read_small_audit_text(&dir.join("result.md"), 1024 * 1024) else {
+        return false;
+    };
+    let Some(source) = read_small_audit_text(&dir.join("source_evidence.md"), 512 * 1024) else {
+        return false;
+    };
+    let Some(confidence) = read_small_audit_text(&dir.join("confidence.md"), 128 * 1024) else {
+        return false;
+    };
+    let Some(integration) = read_small_audit_text(&dir.join("integration_target.md"), 128 * 1024)
+    else {
+        return false;
+    };
+    let Some(record) = read_small_audit_text(&dir.join("command_or_mcp_record.md"), 256 * 1024)
+    else {
+        return false;
+    };
+    let Some(manifest) = read_small_audit_text(&dir.join("manifest.sha256"), 256 * 1024) else {
+        return false;
+    };
+
+    audit_text_has_min_words(&prompt, 20)
+        && audit_text_has_min_words(&result, 80)
+        && audit_text_has_min_words(&source, 20)
+        && audit_text_contains_any(
+            &source,
+            &[
+                "http://",
+                "https://",
+                "doi:",
+                "arxiv",
+                "request",
+                "source",
+                "provenance",
+                "fetched",
+                "timestamp",
+                "url",
+            ],
+        )
+        && audit_text_contains_any(
+            &confidence,
+            &[
+                "confirmed",
+                "likely",
+                "speculative",
+                "unknown",
+                "確認",
+                "高",
+                "中",
+                "低",
+            ],
+        )
+        && audit_text_contains_any(
+            &integration,
+            &[
+                "phase1",
+                "synthesis",
+                "environment",
+                "handoff",
+                "experiment",
+                "次",
+                "統合",
+                "実験",
+            ],
+        )
+        && audit_text_contains_any(
+            &record,
+            &[
+                "deep_thinker",
+                "deep_research",
+                "deepresearch",
+                "mcp",
+                "team wait",
+                "request",
+                "job",
+                "command",
+                "rc=",
+                "exit=",
+                "completed",
+            ],
+        )
+        && audit_text_has_min_words(&record, 12)
+        && audit_text_has_min_words(&manifest, 2)
+}
+
 fn format_status_text(team_dir: &Path) -> Result<String> {
     auto_promote_dependency_waits(team_dir)?;
     let config = load_config(team_dir)?;
     let tasks = load_tasks(team_dir)?;
     let mut out = String::new();
     out.push_str(&format!("Team: {}\n", config.id));
-    out.push_str(&format!("Goal: {}\n", config.goal));
+    out.push_str(&format!("Goal: {}\n", compact_one_line(&config.goal, 500)));
     out.push_str(&format!("Members: {}\n", config.members.len()));
     for member in &config.members {
         let task_status = member_task_status_summary(&tasks, &member.name);
@@ -4298,6 +5328,20 @@ fn format_compact_duration(seconds: u64) -> String {
     }
 }
 
+fn format_tokens(value: i64) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    let digits = value.abs().to_string();
+    let mut out = String::new();
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    let formatted = out.chars().rev().collect::<String>();
+    format!("{sign}{formatted}")
+}
+
 fn member_task_status_summary(tasks: &[TeamTask], member_name: &str) -> String {
     let mut owned = tasks
         .iter()
@@ -4332,9 +5376,10 @@ fn format_task_line(task: &TeamTask) -> String {
     } else {
         format!(" deps:{}", task.depends_on.join(","))
     };
+    let subject = compact_one_line(&task.subject, 260);
     format!(
         "  {:>3} {:<11} {:<16} {}{}",
-        task.id, task.status, owner, task.subject, deps
+        task.id, task.status, owner, subject, deps
     )
 }
 
@@ -4597,6 +5642,7 @@ fn spawn_ssh_node_app_server(
     let remote_relay_port = reserve_ephemeral_port().context("reserve ssh relay port")?;
     let relay_url = format!("http://127.0.0.1:{remote_relay_port}");
     let config = load_config(team_dir)?;
+    cleanup_node_app_servers_before_spawn(team_dir, node, &config.id);
     let url = format!("ws://127.0.0.1:{local_port}");
     let log_path = team_dir.join("logs").join(format!("node-{}.log", node.id));
     let stderr =
@@ -4688,6 +5734,7 @@ fn spawn_docker_node_app_server(
     )?;
     let relay_url = format!("http://{}:{relay_port}", gateway.trim());
     let config = load_config(team_dir)?;
+    cleanup_node_app_servers_before_spawn(team_dir, node, &config.id);
     let url = format!("ws://{}:{remote_port}", container_ip.trim());
     let log_path = team_dir.join("logs").join(format!("node-{}.log", node.id));
     let stderr =
@@ -4803,6 +5850,7 @@ fn spawn_ssh_docker_node_app_server(
         format!("http://{gateway}:{remote_relay_port}")
     };
     let config = load_config(team_dir)?;
+    cleanup_node_app_servers_before_spawn(team_dir, node, &config.id);
     let url = format!("ws://127.0.0.1:{local_port}");
     let log_path = team_dir.join("logs").join(format!("node-{}.log", node.id));
     let stderr =
@@ -4951,6 +5999,103 @@ if [ -z "\${{CODEX_TEAM_MEMBER:-}}" ]; then
 fi
 script_dir="\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
 helper_real="\${{CODEX_TEAM_HELPER_REAL:-\$script_dir/.codex-team-real}}"
+if [ "\${{1:-}}" = "wait" ]; then
+  shift
+  sub="\${{1:-}}"
+  shift || true
+  case "\$sub" in
+    list)
+      owner=""
+      task=""
+      status=""
+      limit=""
+      while [ "\$#" -gt 0 ]; do
+        case "\$1" in
+          --owner) owner="\${{2:-}}"; shift 2 ;;
+          --task) task="\${{2:-}}"; shift 2 ;;
+          --status) status="\${{2:-}}"; shift 2 ;;
+          --limit) limit="\${{2:-}}"; shift 2 ;;
+          *) echo "codex-team wait list: unknown argument \$1" >&2; exit 2 ;;
+        esac
+      done
+      args=(-G "\$CODEX_TEAM_RELAY_URL/wait/list" --data-urlencode "team=\$CODEX_TEAM_ID")
+      [ -n "\$owner" ] && args+=(--data-urlencode "owner=\$owner")
+      [ -n "\$task" ] && args+=(--data-urlencode "task=\$task")
+      [ -n "\$status" ] && args+=(--data-urlencode "status=\$status")
+      [ -n "\$limit" ] && args+=(--data-urlencode "limit=\$limit")
+      exec curl -fsS "\${{args[@]}}"
+      ;;
+    add)
+      title="\${{1:-}}"
+      shift || true
+      if [ -z "\$title" ]; then
+        echo "codex-team wait add requires a title" >&2
+        exit 2
+      fi
+      owner=""
+      task=""
+      node=""
+      condition=""
+      status="waiting"
+      progress=""
+      evidence=""
+      while [ "\$#" -gt 0 ]; do
+        case "\$1" in
+          --owner) owner="\${{2:-}}"; shift 2 ;;
+          --task) task="\${{2:-}}"; shift 2 ;;
+          --node) node="\${{2:-}}"; shift 2 ;;
+          --condition) condition="\${{2:-}}"; shift 2 ;;
+          --status) status="\${{2:-}}"; shift 2 ;;
+          --progress) progress="\${{2:-}}"; shift 2 ;;
+          --evidence) evidence="\${{2:-}}"; shift 2 ;;
+          *) echo "codex-team wait add: unknown argument \$1" >&2; exit 2 ;;
+        esac
+      done
+      exec curl -fsS -X POST "\$CODEX_TEAM_RELAY_URL/wait/add" \
+        --data-urlencode "team=\$CODEX_TEAM_ID" \
+        --data-urlencode "title=\$title" \
+        --data-urlencode "owner=\$owner" \
+        --data-urlencode "task=\$task" \
+        --data-urlencode "node=\$node" \
+        --data-urlencode "condition=\$condition" \
+        --data-urlencode "status=\$status" \
+        --data-urlencode "progress=\$progress" \
+        --data-urlencode "evidence=\$evidence"
+      ;;
+    set)
+      id="\${{1:-}}"
+      shift || true
+      if [ -z "\$id" ]; then
+        echo "codex-team wait set requires an id" >&2
+        exit 2
+      fi
+      status=""
+      progress=""
+      evidence=""
+      clear_evidence="false"
+      while [ "\$#" -gt 0 ]; do
+        case "\$1" in
+          --status) status="\${{2:-}}"; shift 2 ;;
+          --progress) progress="\${{2:-}}"; shift 2 ;;
+          --evidence) evidence="\${{2:-}}"; shift 2 ;;
+          --clear-evidence) clear_evidence="true"; shift ;;
+          *) echo "codex-team wait set: unknown argument \$1" >&2; exit 2 ;;
+        esac
+      done
+      exec curl -fsS -X POST "\$CODEX_TEAM_RELAY_URL/wait/set" \
+        --data-urlencode "team=\$CODEX_TEAM_ID" \
+        --data-urlencode "id=\$id" \
+        --data-urlencode "status=\$status" \
+        --data-urlencode "progress=\$progress" \
+        --data-urlencode "evidence=\$evidence" \
+        --data-urlencode "clear_evidence=\$clear_evidence"
+      ;;
+    *)
+      echo "Usage: codex-team wait {{list|add|set}}" >&2
+      exit 2
+      ;;
+  esac
+fi
 if command -v timeout >/dev/null 2>&1; then
   exec timeout "\${{CODEX_TEAM_HELPER_TIMEOUT:-30s}}" "\$helper_real" "\$@"
 fi
@@ -6216,6 +7361,7 @@ struct AppServerMemberRun {
     completed: bool,
     failed: bool,
     standby_after_turn: bool,
+    usage_category: String,
     team_message_scan_offset: usize,
     last_activity_at: Instant,
     last_activity_kind: String,
@@ -6235,10 +7381,205 @@ struct AppServerSideReply {
     source_thread_id: String,
     side_thread_id: String,
     turn_id: String,
+    usage_category: String,
     recipients: Vec<String>,
     messages: Vec<MailMessage>,
     buffer: String,
     started_at: Instant,
+}
+
+fn usage_category_for_event(event_name: &str) -> &'static str {
+    match event_name {
+        "app_server_lead_started" => "lead_initial",
+        "app_server_lead_reactive_started" => "lead_reactive",
+        "app_server_member_reactive_started" => "member_reactive",
+        "app_server_dynamic_member_started" => "dynamic_member_start",
+        "app_server_member_started" => "department_start",
+        event if event.contains("idle_wakeup") => "idle_wakeup",
+        event if event.contains("heartbeat") => "department_heartbeat",
+        event if event.contains("lead") => "lead_turn",
+        event if event.contains("reactive") => "reactive_turn",
+        _ => "member_turn",
+    }
+}
+
+fn usage_category_for_messages(default: &str, messages: &[MailMessage]) -> String {
+    if messages.iter().any(|message| message.from == "user") {
+        return "user_message".to_string();
+    }
+    if messages
+        .iter()
+        .any(|message| message.message.starts_with("Lead autonomy tick:"))
+    {
+        return "lead_tick".to_string();
+    }
+    if messages
+        .iter()
+        .any(|message| message.message.starts_with("Department idle wakeup"))
+    {
+        return "idle_wakeup".to_string();
+    }
+    if messages
+        .iter()
+        .any(|message| message.message.starts_with("Department heartbeat"))
+    {
+        return "department_heartbeat".to_string();
+    }
+    if messages
+        .iter()
+        .any(|message| message.message.starts_with("Task watchdog:"))
+    {
+        return "task_watchdog".to_string();
+    }
+    if messages
+        .iter()
+        .any(|message| message.message.starts_with("Periodic idle outreach"))
+    {
+        return "idle_outreach".to_string();
+    }
+    if messages
+        .iter()
+        .any(|message| message.message.starts_with("Stale active turn attention:"))
+    {
+        return "stale_active_turn".to_string();
+    }
+    if messages.iter().any(|message| message.from != "system") {
+        return "team_message".to_string();
+    }
+    default.to_string()
+}
+
+fn update_active_turn_usage_category(
+    team_dir: &Path,
+    active: &mut HashMap<String, AppServerMemberRun>,
+    member_name: &str,
+    category: String,
+    source_event: &str,
+) -> Result<()> {
+    let Some(run) = active.get_mut(member_name) else {
+        return Ok(());
+    };
+    run.usage_category = category;
+    record_turn_usage_index(
+        team_dir,
+        &run.member,
+        &run.node_id,
+        &run.thread_id,
+        &run.turn_id,
+        &run.usage_category,
+        source_event,
+    )
+}
+
+fn team_turn_usage_index_path(team_dir: &Path) -> PathBuf {
+    team_dir.join("turn_usage_index.jsonl")
+}
+
+fn team_token_usage_path(team_dir: &Path) -> PathBuf {
+    team_dir.join("token_usage.jsonl")
+}
+
+fn record_turn_usage_index(
+    team_dir: &Path,
+    member: &TeamMember,
+    node: &str,
+    thread: &str,
+    turn: &str,
+    category: &str,
+    source_event: &str,
+) -> Result<()> {
+    append_jsonl(
+        &team_turn_usage_index_path(team_dir),
+        &TeamTurnUsageIndexRecord {
+            timestamp: now(),
+            member: member.name.clone(),
+            role: member.role.clone(),
+            node: node.to_string(),
+            thread: thread.to_string(),
+            turn: turn.to_string(),
+            category: category.to_string(),
+            source_event: source_event.to_string(),
+        },
+    )
+}
+
+fn lookup_turn_usage_index(
+    team_dir: &Path,
+    node: &str,
+    thread: &str,
+    turn: &str,
+) -> Result<Option<TeamTurnUsageIndexRecord>> {
+    Ok(
+        read_jsonl::<TeamTurnUsageIndexRecord>(&team_turn_usage_index_path(team_dir))?
+            .into_iter()
+            .rev()
+            .find(|record| record.node == node && record.thread == thread && record.turn == turn),
+    )
+}
+
+fn record_token_usage_update(
+    team_dir: &Path,
+    node: &str,
+    notification: ThreadTokenUsageUpdatedNotification,
+    active: &HashMap<String, AppServerMemberRun>,
+    side_replies: &HashMap<String, AppServerSideReply>,
+    thread_to_member: &HashMap<String, String>,
+) -> Result<()> {
+    let key = thread_key(node, &notification.thread_id);
+    let indexed = lookup_turn_usage_index(
+        team_dir,
+        node,
+        &notification.thread_id,
+        &notification.turn_id,
+    )?;
+    let (member, role, category, source) = if let Some(reply) = side_replies.get(&key) {
+        (
+            reply.member.name.clone(),
+            reply.member.role.clone(),
+            reply.usage_category.clone(),
+            "side_channel_live".to_string(),
+        )
+    } else if let Some(member_name) = thread_to_member.get(&key)
+        && let Some(run) = active.get(member_name)
+    {
+        (
+            run.member.name.clone(),
+            run.member.role.clone(),
+            run.usage_category.clone(),
+            "active_turn".to_string(),
+        )
+    } else if let Some(indexed) = indexed {
+        (
+            indexed.member,
+            indexed.role,
+            indexed.category,
+            "turn_index".to_string(),
+        )
+    } else {
+        (
+            "unknown".to_string(),
+            "unknown".to_string(),
+            "unknown".to_string(),
+            "unmapped".to_string(),
+        )
+    };
+    append_jsonl(
+        &team_token_usage_path(team_dir),
+        &TeamTokenUsageRecord {
+            timestamp: now(),
+            member,
+            role,
+            node: node.to_string(),
+            thread: notification.thread_id,
+            turn: notification.turn_id,
+            category,
+            source,
+            total: notification.token_usage.total.into(),
+            last: notification.token_usage.last.into(),
+            model_context_window: notification.token_usage.model_context_window,
+        },
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6324,6 +7665,7 @@ async fn start_app_server_member_turn(
     run.completed = false;
     run.failed = false;
     run.standby_after_turn = false;
+    run.usage_category = usage_category_for_event(event_name).to_string();
     run.retry_not_before = None;
     run.last_activity_at = Instant::now();
     run.last_activity_kind = "turn_started".to_string();
@@ -6347,6 +7689,15 @@ async fn start_app_server_member_turn(
             "turn": turn.turn.id,
             "cwd": turn_cwd,
         }),
+    )?;
+    record_turn_usage_index(
+        team_dir,
+        &run.member,
+        &run.node_id,
+        &run.thread_id,
+        &turn.turn.id,
+        &run.usage_category,
+        event_name,
     )?;
     Ok(true)
 }
@@ -6967,9 +8318,15 @@ async fn handle_app_server_event(
             if let Some(member) = thread_to_member.get(&key)
                 && let Some(run) = active.get_mut(member)
             {
-                if reset_member_turn_buffer_if_new(run, assistant_buffers, member, &started.turn.id)
-                {
+                let new_untracked_turn = reset_member_turn_buffer_if_new(
+                    run,
+                    assistant_buffers,
+                    member,
+                    &started.turn.id,
+                );
+                if new_untracked_turn {
                     reset_member_live_message_for_new_turn(team_dir, member, &started.turn.id)?;
+                    run.usage_category = "external_turn".to_string();
                 }
                 run.turn_id = started.turn.id.clone();
                 run.completed = false;
@@ -6989,7 +8346,30 @@ async fn handle_app_server_event(
                         "turn": started.turn.id,
                     }),
                 )?;
+                if new_untracked_turn {
+                    record_turn_usage_index(
+                        team_dir,
+                        &run.member,
+                        node_id,
+                        &started.thread_id,
+                        &started.turn.id,
+                        &run.usage_category,
+                        "app_server_member_external_turn_started",
+                    )?;
+                }
             }
+        }
+        AppServerEvent::ServerNotification(ServerNotification::ThreadTokenUsageUpdated(
+            notification,
+        )) => {
+            record_token_usage_update(
+                team_dir,
+                node_id,
+                notification,
+                active,
+                side_replies,
+                thread_to_member,
+            )?;
         }
         AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(completed)) => {
             let key = thread_key(node_id, &completed.thread_id);
@@ -7773,17 +9153,53 @@ fn member_turn_active_task_completion_issue(
 fn checklist_field_value(text: &str, field: &str) -> Option<String> {
     let start = text.find(field)? + field.len();
     let rest = &text[start..];
-    let end = rest
-        .find('\n')
-        .map(|idx| start + idx)
-        .unwrap_or_else(|| text.len());
+    let mut values = Vec::new();
+    let mut lines = rest.lines();
+    if let Some(first) = lines.next() {
+        let first = normalize_checklist_field_line(first);
+        if !first.is_empty() {
+            values.push(first);
+        }
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if values.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let normalized = lower.strip_prefix("- ").unwrap_or(&lower);
+        if [
+            "artifacts:",
+            "verification:",
+            "messages_sent:",
+            "consumers_notified:",
+            "blockers_or_limits:",
+        ]
+        .iter()
+        .any(|known| normalized.starts_with(known))
+        {
+            break;
+        }
+        if line.starts_with(char::is_whitespace) || trimmed.starts_with('-') {
+            values.push(normalize_checklist_field_line(line));
+        } else {
+            break;
+        }
+    }
     Some(
-        text[start..end]
-            .trim()
-            .trim_start_matches('-')
-            .trim()
-            .to_string(),
+        values
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
+}
+
+fn normalize_checklist_field_line(line: &str) -> String {
+    line.trim().trim_start_matches('-').trim().to_string()
 }
 
 fn checklist_value_is_empty_or_unknown(value: Option<&str>) -> bool {
@@ -8195,12 +9611,7 @@ fn ingest_team_wait_fallback(
         if !tasks.iter().any(|task| task.id == task_id) {
             bail!("task `{task_id}` does not exist");
         }
-        set_task_status_if_open(
-            team_dir,
-            task_id,
-            TaskStatus::Waiting,
-            Some(&format!("Waiting on `{id}`: {}", wait_update.title)),
-        )?;
+        record_task_wait_registration(team_dir, task_id, &id, &wait_update.title)?;
     }
     let now = now();
     let wait = TeamWait {
@@ -8518,6 +9929,7 @@ async fn sync_dynamic_app_server_members(
                 completed: false,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "dynamic_member_start".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now(),
                 last_activity_kind: "turn_started".to_string(),
@@ -8541,6 +9953,15 @@ async fn sync_dynamic_app_server_members(
                 "node": node_id,
                 "cwd": member_cwd,
             }),
+        )?;
+        record_turn_usage_index(
+            team_dir,
+            member,
+            &node_id,
+            &thread.thread.id,
+            &turn.turn.id,
+            "dynamic_member_start",
+            "app_server_dynamic_member_started",
         )?;
     }
     *config = load_config(team_dir)?;
@@ -8891,6 +10312,8 @@ fn maybe_warn_unattended_tasks(
     let tasks = load_tasks(team_dir)?;
     let jobs = load_jobs(team_dir)?;
     let waits = load_waits(team_dir)?;
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
     let running_job_tasks = jobs
         .iter()
         .filter(|job| matches!(job.status, TeamJobStatus::Running))
@@ -9055,10 +10478,85 @@ fn maybe_warn_unattended_tasks(
             }),
         )?;
     }
+    warn_open_waits_on_unavailable_nodes(team_dir, &config, &waits, &nodes, warned, language)?;
     warn_review_tasks_missing_local_handoff_artifacts(team_dir, &config, &tasks, warned)?;
     if config_changed {
         write_json_atomic(&team_dir.join("config.json"), &config)?;
         touch_config(team_dir)?;
+    }
+    Ok(())
+}
+
+fn warn_open_waits_on_unavailable_nodes(
+    team_dir: &Path,
+    config: &TeamConfig,
+    waits: &[TeamWait],
+    nodes: &[TeamNode],
+    warned: &mut HashSet<String>,
+    language: TeamPromptLanguage,
+) -> Result<()> {
+    for wait in waits.iter().filter(|wait| wait.status.is_open()) {
+        let Some(node_id) = wait.node.as_deref() else {
+            continue;
+        };
+        let Some(unavailable) = node_unavailable_from_nodes(node_id, nodes) else {
+            continue;
+        };
+        if wait_age_secs(wait).is_some_and(|age| age < 90) {
+            continue;
+        }
+        let warning_key = format!(
+            "wait-node:{}:{}:{}:{}",
+            wait.id, wait.status, wait.updated_at, unavailable.reason
+        );
+        if !warned.insert(warning_key) {
+            continue;
+        }
+        let owner = wait.owner.as_deref().unwrap_or("unassigned");
+        let task = wait.task_id.as_deref().unwrap_or("-");
+        let message = if language.is_ja() {
+            format!(
+                "Wait node watchdog: wait {id} は `{status}` のままですが、node `{node}` が利用できません reason={reason} raw_status={raw_status} age={age}。condition={condition} progress={progress}\n\nlead は node を復旧/再接続するか、wait を concrete blocker 付きで blocked/failed にするか、owner を再割当てしてください。node が復旧するまで、この wait に依存する task {task} を完了扱いにしないでください。",
+                id = wait.id,
+                status = wait.status,
+                node = node_id,
+                reason = unavailable.reason,
+                raw_status = unavailable.status,
+                age = unavailable.age,
+                condition = compact_one_line(&wait.condition, 500),
+                progress = compact_one_line(&wait.progress, 500),
+            )
+        } else {
+            format!(
+                "Wait node watchdog: wait {id} is still `{status}`, but node `{node}` is unavailable reason={reason} raw_status={raw_status} age={age}. condition={condition} progress={progress}\n\nLead should restore/reconnect the node, mark the wait blocked/failed with a concrete blocker, or reassign the owner. Do not complete dependent task {task} while this wait's node is unavailable.",
+                id = wait.id,
+                status = wait.status,
+                node = node_id,
+                reason = unavailable.reason,
+                raw_status = unavailable.status,
+                age = unavailable.age,
+                condition = compact_one_line(&wait.condition, 500),
+                progress = compact_one_line(&wait.progress, 500),
+            )
+        };
+        send_team_message_to_dir(team_dir, "system", &config.lead, &message)?;
+        if config.members.iter().any(|member| member.name == owner) {
+            send_team_message_to_dir(team_dir, "system", owner, &message)?;
+        }
+        append_event(
+            team_dir,
+            "wait_node_unavailable_attention",
+            serde_json::json!({
+                "wait": wait.id,
+                "owner": owner,
+                "task": task,
+                "node": node_id,
+                "status": wait.status,
+                "reason": unavailable.reason,
+                "node_status": unavailable.status,
+                "node_age": unavailable.age,
+            }),
+        )?;
     }
     Ok(())
 }
@@ -9282,7 +10780,7 @@ fn inspect_local_handoff_path(
         missing.push("report markdown/text");
     }
     if !stats.has_structured {
-        missing.push("JSON/YAML ledger/report");
+        missing.push("structured ledger/report");
     }
     if missing.is_empty() {
         if let Some(issue) = inspect_handoff_checklists(&stats)? {
@@ -9333,7 +10831,9 @@ fn inspect_handoff_checklists(stats: &HandoffArtifactStats) -> Result<Option<Str
                     checklist_path.display()
                 )));
             }
-            if checklist_value_has_unresolved_marker(value.as_deref()) {
+            if field != "blockers_or_limits:"
+                && checklist_value_has_unresolved_marker(value.as_deref())
+            {
                 return Ok(Some(format!(
                     "{} has pending/unresolved `{field}` field",
                     checklist_path.display()
@@ -9524,13 +11024,24 @@ fn collect_handoff_artifact_stats(
             continue;
         }
         stats.files += 1;
-        if let Some(name) = path.file_name().and_then(|name| name.to_str())
-            && let Some(kind) = handoff_file_kind(name)
-        {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            let lower_name = name.to_ascii_lowercase();
+            if lower_name.ends_with(".md") || lower_name.ends_with(".txt") {
+                stats.has_report = true;
+            }
+            if handoff_text_file_contains_completion_checklist(&path)? {
+                stats.has_checklist = true;
+                stats.checklist_paths.push(path.clone());
+            }
+            let Some(kind) = handoff_file_kind(name) else {
+                continue;
+            };
             match kind {
                 HandoffFileKind::Checklist => {
                     stats.has_checklist = true;
-                    stats.checklist_paths.push(path.clone());
+                    if !stats.checklist_paths.iter().any(|seen| seen == &path) {
+                        stats.checklist_paths.push(path.clone());
+                    }
                 }
                 HandoffFileKind::Manifest => {
                     stats.has_manifest = true;
@@ -9542,6 +11053,24 @@ fn collect_handoff_artifact_stats(
         }
     }
     Ok(())
+}
+
+fn handoff_text_file_contains_completion_checklist(path: &Path) -> Result<bool> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    let lower = name.to_ascii_lowercase();
+    if !(lower.ends_with(".md") || lower.ends_with(".txt")) {
+        return Ok(false);
+    }
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if metadata.len() > 2_000_000 {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(content
+        .to_ascii_lowercase()
+        .contains("team_completion_checklist:"))
 }
 
 enum HandoffFileKind {
@@ -9567,10 +11096,40 @@ fn handoff_file_kind(name: &str) -> Option<HandoffFileKind> {
     if lower.ends_with(".json") || lower.ends_with(".yaml") || lower.ends_with(".yml") {
         return Some(HandoffFileKind::Structured);
     }
+    if lower.ends_with(".csv") {
+        return Some(HandoffFileKind::Structured);
+    }
+    if lower.ends_with(".log")
+        && (lower.contains("manifest_check") || lower.contains("sha256_manifest_check"))
+    {
+        return Some(HandoffFileKind::Report);
+    }
+    if handoff_markdown_name_looks_structured(&lower) {
+        return Some(HandoffFileKind::Structured);
+    }
     if lower.ends_with(".md") || lower.ends_with(".txt") {
         return Some(HandoffFileKind::Report);
     }
     None
+}
+
+fn handoff_markdown_name_looks_structured(lower_name: &str) -> bool {
+    if !(lower_name.ends_with(".md") || lower_name.ends_with(".txt")) {
+        return false;
+    }
+    [
+        "audit_status",
+        "claim_evidence",
+        "evidence_review",
+        "gate_matrix",
+        "ledger",
+        "manifest_validation",
+        "metrics",
+        "status",
+        "validation_report",
+    ]
+    .iter()
+    .any(|marker| lower_name.contains(marker))
 }
 
 fn maybe_send_lead_autonomy_tick(
@@ -9633,7 +11192,7 @@ fn maybe_send_lead_autonomy_tick(
                 name = run.member.name,
                 role = run.member.role,
                 node = run.node_id,
-                last = run.last_activity_kind
+                last = compact_one_line(&run.last_activity_kind, 100)
             )
         })
         .collect::<Vec<_>>();
@@ -9641,17 +11200,18 @@ fn maybe_send_lead_autonomy_tick(
 
     let open_task_lines = open_tasks
         .iter()
-        .take(20)
+        .take(12)
         .map(|task| {
             let owner = task.owner.as_deref().unwrap_or("unassigned");
             let age = task_age_secs(task)
                 .map(|age| format!("{age}s"))
                 .unwrap_or_else(|| "unknown".to_string());
+            let subject = compact_one_line(&task.subject, 220);
             format!(
                 "- task {id} [{status}] @{owner} age={age}: {subject}",
                 id = task.id,
                 status = task.status,
-                subject = task.subject
+                subject = subject
             )
         })
         .collect::<Vec<_>>();
@@ -9690,8 +11250,10 @@ fn maybe_send_lead_autonomy_tick(
     };
     let open_wait_lines = open_waits
         .iter()
-        .take(20)
+        .take(10)
         .map(|wait| {
+            let condition = compact_one_line(&wait.condition, 180);
+            let progress = compact_one_line(&wait.progress, 180);
             format!(
                 "- wait {id} [{status}] owner=@{owner} task={task} node={node} condition={condition} progress={progress}",
                 id = wait.id,
@@ -9699,8 +11261,8 @@ fn maybe_send_lead_autonomy_tick(
                 owner = wait.owner.as_deref().unwrap_or("unassigned"),
                 task = wait.task_id.as_deref().unwrap_or("-"),
                 node = wait.node.as_deref().unwrap_or("-"),
-                condition = wait.condition,
-                progress = wait.progress
+                condition = condition,
+                progress = progress
             )
         })
         .collect::<Vec<_>>();
@@ -9710,7 +11272,7 @@ fn maybe_send_lead_autonomy_tick(
     } else {
         String::new()
     };
-    let proposal_lines = collect_recent_lead_proposals(team_dir, &config.lead, 5)?;
+    let proposal_lines = collect_recent_lead_proposals(team_dir, &config.lead, 4)?;
     let proposal_block = if proposal_lines.is_empty() {
         "- none".to_string()
     } else {
@@ -9721,7 +11283,13 @@ fn maybe_send_lead_autonomy_tick(
     } else {
         next_action_lines.join("\n")
     };
-    let continuation_policy = if goal_requests_continuation {
+    let continuation_policy = if team_goal_requests_autoresearch_loop(&config.goal) {
+        if language.is_ja() {
+            "自動研究ループが有効です。初期 lead policy と autoresearch skill に従い、phase0/phase1、saitou Docker build、container runtime、評価/監査、reflection、次 bounded task を継続してください。ただし詳細ポリシーを mailbox に再掲せず、必要な artifact path / wait / job / owner だけを扱ってください。".to_string()
+        } else {
+            "Autoresearch loop is active. Follow the initial lead policy and autoresearch skill for phase0/phase1, saitou Docker build, container runtime, evaluation/audit, reflection, and next bounded tasks. Do not repeat the full policy in mailbox messages; use artifact paths, waits, jobs, and owners.".to_string()
+        }
+    } else if goal_requests_continuation {
         if language.is_ja() {
             "この team の goal は継続・反復を明示しています。open task/open wait がなく、監査・評価・handoff に recommended next action / follow-up がある場合、idle とみなさず、lead が次の許可済み task/owner/wait/job を作るか、ユーザー入力が必要な blocker を明示してください。研究 skill が明示的に要求する場合だけ、研究サイクルとして扱ってください。".to_string()
         } else {
@@ -9734,7 +11302,7 @@ fn maybe_send_lead_autonomy_tick(
     };
     let message = if language.is_ja() {
         format!(
-            "Lead autonomy tick: あなたはこの team の意思決定オーケストレーターです。team runtime は状態を報告し、この tick を届けているだけです。runtime があなたの代わりにオーケストレーション判断をしているわけではありません。\n\n必須の lead action:\n- 未完了 task、open wait、部署 mailbox、live message、job、artifact を確認してください。\n- ユーザーの現在の task に向けて協調してください。必要なら部署を steer / resume / reassign し、具体的な artifact、blocker、handoff を求めてください。\n- 部署が完了条件を持つ待機対象を始めたら、種類に決め打ちせず `team wait add` で condition / owner / task / progress / evidence を登録させてください。PID付きコマンドは `team job`、PIDを持たない外部待機や非同期依存は `team wait` で追跡してください。\n- open wait がある task は完了扱いにしないでください。wait が completed/failed/blocked になったら owner を resume し、結果を見て handoff、次 action、または blocker を出させてください。\n- teammate が `LEAD_PROPOSAL:` を送っているなら、resume / reassign / review action として明示的に採用するか、具体的な理由付きで却下してください。\n- {continuation_policy}\n- action が必要な task がなければ、team が idle のままでよい理由、または user input 待ちである理由を明示的に記録してください。active instruction や domain skill が明示的に要求しない限り、新しい改善 loop を勝手に作らないでください。\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nCurrent app-server turns:\n{}",
+            "Lead autonomy tick: あなたがこの team の意思決定オーケストレーターです。runtime は状態を届けているだけです。\n\nAction checklist: open task/wait/mailbox/job/artifact を見て、必要な steer/resume/reassign/review/standby を1つ以上具体化してください。open wait がある task は完了扱いにせず、completed/failed/blocked wait は owner を resume して実結果を確認させてください。`LEAD_PROPOSAL:` は採用/却下を明示してください。{continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nArtifact next actions:\n{next_action_block}\n\nActive turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -9753,7 +11321,7 @@ fn maybe_send_lead_autonomy_tick(
         )
     } else {
         format!(
-            "Lead autonomy tick: you are the decision-making orchestrator for this team. The team runtime is only reporting state and delivering this tick; it is not making orchestration decisions for you.\n\nRequired lead action:\n- Inspect unfinished tasks, open waits, department mailboxes, live messages, jobs, and artifacts.\n- Coordinate toward the user's current task: steer, resume, reassign, or ask departments for concrete artifacts, blockers, or handoffs.\n- When a department starts a waitable item with a completion condition, do not categorize it narrowly; register it with `team wait add` including condition / owner / task / progress / evidence. Use `team job` for PID-backed commands and `team wait` for PID-less external waits or async dependencies.\n- Do not treat a task with an open wait as complete. When a wait becomes completed/failed/blocked, resume the owner to inspect the result and publish a handoff, next action, or blocker.\n- If a teammate sent `LEAD_PROPOSAL:`, explicitly accept it with a resume/reassign/review action or reject it with the concrete reason.\n- {continuation_policy}\n- If no task needs action, explicitly record why the team should remain idle or wait for user input. Do not invent a new improvement loop unless the active instructions or a domain skill explicitly require one.\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nCurrent app-server turns:\n{}",
+            "Lead autonomy tick: you are the decision-making orchestrator for this team. The runtime is only delivering state.\n\nAction checklist: inspect open tasks/waits/mailboxes/jobs/artifacts, then make any concrete steer/resume/reassign/review/standby decision needed. Never complete a task with an open wait; when a wait is completed/failed/blocked, resume its owner to inspect the real result. Explicitly accept or reject each `LEAD_PROPOSAL:`. {continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nArtifact next actions:\n{next_action_block}\n\nActive turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -9788,11 +11356,19 @@ fn maybe_send_lead_autonomy_tick(
 }
 
 fn team_goal_requests_continuation(goal: &str) -> bool {
+    if team_goal_requests_autoresearch_loop(goal) {
+        return true;
+    }
     let lower = goal.to_ascii_lowercase();
     [
         "keep iterating",
+        "continue iterating",
+        "continue to iterate",
         "continue until",
         "continue the autoresearch loop",
+        "continue the actual autoresearch loop",
+        "iterate research",
+        "iterate:",
         "keep cycling",
         "next cycle",
         "rerun",
@@ -9805,6 +11381,64 @@ fn team_goal_requests_continuation(goal: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+}
+
+fn team_goal_requests_autoresearch_loop(goal: &str) -> bool {
+    let lower = goal.to_lowercase();
+    if lower.contains("autoresearch")
+        || lower.contains("auto research")
+        || lower.contains("自動研究")
+        || lower.contains("自動実験")
+        || lower.contains("研究サイクル")
+    {
+        return true;
+    }
+    if lower.contains("phase0.md") && lower.contains("phase1.md") {
+        return true;
+    }
+    let mentions_deep_tool = lower.contains("deep_thinker")
+        || lower.contains("deepthinker")
+        || lower.contains("deep_research")
+        || lower.contains("deepresearch");
+    let mentions_runtime = lower.contains("docker")
+        || lower.contains("dockerfile")
+        || lower.contains("container")
+        || lower.contains("コンテナ")
+        || lower.contains("saitou")
+        || lower.contains("ssh");
+    let mentions_experiment_loop = lower.contains("実験し続け")
+        || lower.contains("繰り返")
+        || lower.contains("永遠")
+        || lower.contains("ずっと")
+        || lower.contains("満足するまで")
+        || lower.contains("experiment")
+        || lower.contains("iterate");
+    mentions_deep_tool && mentions_runtime && mentions_experiment_loop
+}
+
+fn build_autoresearch_department_design_policy(goal: &str, language: TeamPromptLanguage) -> String {
+    if !team_goal_requests_autoresearch_loop(goal) {
+        return if language.is_ja() {
+            "- この goal は自動研究ループとしては検出されていません。通常の domain ownership で設計してください。".to_string()
+        } else {
+            "- This goal was not detected as an autoresearch loop. Use normal domain ownership."
+                .to_string()
+        };
+    }
+    if language.is_ja() {
+        return "- local research/planning 部署を必ず置き、phase0.md / phase1.md、deep_thinker/deep_researcher、先行研究・データセット・評価・次実験判断を担当させてください。\n- SSH host `saitou` が goal に現れる場合、host-side environment/build 部署を `saitou` node に置き、Dockerfile、image build、container 作成、container node 登録だけを担当させてください。\n- container 内 runtime 実験部署は初期 departments に捏造しないでください。実 container が作成・登録された後に自動追加/追加部署として作る前提にしてください。\n- evaluation と audit は独立 ownership として置いてください。実験成功 claim は runtime の自己申告だけではなく、evaluation/audit の manifest・可視化・claim boundary 確認後に限定してください。\n- workload balancing 目的で research を複数人に割らないでください。phase0 の Fixed-4 + Flexible-2 のような重い調査は research 部署が MCP/subagent/tools を内部利用して管理します。\n- active external wait が長く続いても、それだけを理由に同じ research ownership の永続 peer 部署を増やさないでください。どうしても進捗維持が必要な場合だけ、範囲を artifact recovery/helper に限定した一時部署にし、phase1/environment_handoff/build clearance には進ませないでください。".to_string();
+    }
+    "- Always include a local research/planning department that owns phase0.md / phase1.md, deep_thinker/deep_researcher calls, prior-work scans, dataset/model/evaluation scans, and next-experiment decisions.\n- If the goal mentions SSH host `saitou`, place a host-side environment/build department on the `saitou` node. It owns Dockerfile design, image builds, container creation, and container-node registration only.\n- Do not invent a container-internal runtime department in the initial department list. It should be added only after a real long-lived container exists and is registered as a Docker/ssh-docker node.\n- Keep evaluation and audit as independent ownership domains. Runtime success claims are limited until evaluation/audit verify manifests, visualizations, and claim boundaries.\n- Do not split research into duplicate peer departments just for load balancing. Heavy Fixed-4 + Flexible-2 scans should be managed inside the research department using MCP/subagents/tools.\n- Do not create a permanent peer department with the same research ownership merely because an active external wait is long. If progress truly needs help, create only a temporary artifact recovery/helper department with a narrow scope, and forbid it from phase1 synthesis, environment handoff, or build clearance.".to_string()
+}
+
+fn build_autoresearch_loop_policy_block(goal: &str, language: TeamPromptLanguage) -> String {
+    if !team_goal_requests_autoresearch_loop(goal) {
+        return String::new();
+    }
+    if language.is_ja() {
+        return "\nAutoresearch loop policy:\n- この team は one-shot 実装ではなく、自動研究ループです。user input が本当に必要な blocker でない限り、lead は audit/evaluation の recommended next action を次の bounded task に変換し続けてください。\n- 研究テーマが未提示なら最初にユーザーへ確認します。提示済みなら質問で止まらず、合理的仮定を artifact に明記して phase0 に進みます。\n- Phase 0: /home/yukimaru/research_prompt/phase0.md を contract として読み、Fixed-4 + Flexible-2 の各 scan を実際に実行します。各 scan は prompt artifact、result artifact、source/provenance、confidence labels、integration target、wait/job record を持つ必要があります。scan prompt の一覧だけでは完了ではありません。\n- Phase 1: すべての required scan が完了または明示的 blocker 化された後だけ、/home/yukimaru/research_prompt/phase1.md で統合し、最初の bounded experiment / killer experiment / next action を決めます。\n- Environment phase: SSH `saitou` 上で Dockerfile を作成・build します。CUDA、Python、torch、モデル、dataset、renderer、driver 条件が不明な場合は local research/lead 側の deep_thinker/deep_researcher で確認し、build は team job と logs/artifacts で追跡します。build 失敗は修復 task にし、成功 claim にしません。\n- Runtime phase: image/container ができたら必ず long-lived Docker/ssh-docker node を登録し、container-internal department を作ります。実験、install、render、debug、verification は container 部署が担当し、research/planning と相談しながら進めます。host/SSH 部署が `docker exec` で本実験を継続するのは不可です。\n- Experiment phase: 入力、config、commands、logs、outputs、metrics、visualizations、failed attempts、hash manifests、日本語レポートを保存します。結果が弱い場合でも捏造せず、allowed claims / blocked claims を分けます。\n- Reflection phase: 実験結果を deep_thinker/deep_researcher または local research の批判的統合へ戻し、container 再利用なら Runtime phase、環境作り直しなら Environment phase、研究設計変更なら Phase 0/1 repair へ戻します。\n- 完了扱いはしません。各 research iteration は final audit artifact と recommended next action を出し、lead は次 cycle を作るか、具体的な user-input blocker を記録します。\n- 長時間 MCP/API/wait 中の research_planning を「失敗」や「永続的停滞」と早合点しないでください。補助が必要なら、一時的な recovery/helper 部署だけを作り、既存 research ownership を置き換えず、6 scan artifact など非重複の限定成果物だけを担当させ、phase1/environment_handoff/build clearance は元の research_planning/lead の確認まで禁止してください。\n".to_string();
+    }
+    "\nAutoresearch loop policy:\n- This team is an autonomous research loop, not a one-shot implementation. Unless a real user-input blocker exists, lead must keep converting audit/evaluation recommended next actions into bounded tasks.\n- If the research theme is missing, ask the user first. If it is already provided, do not stop with questions; record reasonable assumptions and start phase0.\n- Phase 0: Treat /home/yukimaru/research_prompt/phase0.md as a contract and actually run Fixed-4 + Flexible-2 scans. Each scan needs a prompt artifact, result artifact, source/provenance, confidence labels, integration target, and wait/job record. A list of scan prompts is not completion.\n- Phase 1: Run /home/yukimaru/research_prompt/phase1.md synthesis only after required scans are completed or explicitly blocked. Choose the first bounded experiment / killer experiment / next action.\n- Environment phase: Build the Dockerfile on SSH `saitou`. If CUDA/Python/torch/model/dataset/renderer/driver choices are uncertain, ask local research/lead-side deep_thinker/deep_researcher first. Track builds with team jobs, logs, and artifacts. Failed builds become repair tasks, not success claims.\n- Runtime phase: After the image/container exists, register a long-lived Docker/ssh-docker node and create a container-internal department. Experiments, installs, rendering, debugging, and verification belong inside the container department, in conversation with research/planning. The host/SSH department must not continue the main experiment through docker exec after the container should be a node.\n- Experiment phase: Save inputs, configs, commands, logs, outputs, metrics, visualizations, failed attempts, hash manifests, and Japanese reports. Separate allowed claims from blocked claims.\n- Reflection phase: Feed experiment results back to deep_thinker/deep_researcher or local research synthesis. Reuse the container for the next runtime experiment, rebuild the environment if needed, or repair phase0/phase1 if the research framing changed.\n- Do not treat the loop as done. Each iteration ends with a final audit artifact and recommended next action; lead then creates the next cycle or records a concrete user-input blocker.\n- Do not misclassify a long MCP/API/wait in research_planning as failure or permanent staleness. If help is truly needed, create only a temporary recovery/helper department with a narrow non-overlapping artifact scope; it must not replace the original research owner or advance phase1 synthesis, environment handoff, or build clearance until the original research/lead gate accepts the package.\n".to_string()
 }
 
 fn collect_recent_lead_proposals(team_dir: &Path, lead: &str, limit: usize) -> Result<Vec<String>> {
@@ -9931,7 +11565,7 @@ fn format_lead_proposal_summary(message: &MailMessage) -> String {
         "- [{}] @{}: {}",
         message.timestamp,
         message.from,
-        compact_one_line(&message.message, 700)
+        compact_one_line(&message.message, 320)
     )
 }
 
@@ -9979,7 +11613,7 @@ fn collect_recent_next_action_signals(team_dir: &Path, limit: usize) -> Result<V
             signals.push(format!(
                 "- {}: {}",
                 path.display(),
-                compact_one_line(&line, 700)
+                compact_one_line(&line, 320)
             ));
             if signals.len() >= limit {
                 break;
@@ -10255,18 +11889,28 @@ fn maybe_send_department_idle_wakeups(
             .iter()
             .filter(|task| task.owner.as_deref() == Some(member.name.as_str()))
             .filter(|task| task_is_open(task))
-            .take(8)
-            .map(|task| format!("- task {} [{}]: {}", task.id, task.status, task.subject))
+            .take(5)
+            .map(|task| {
+                format!(
+                    "- task {} [{}]: {}",
+                    task.id,
+                    task.status,
+                    compact_one_line(&task.subject, 180)
+                )
+            })
             .collect::<Vec<_>>();
         let team_open_tasks = tasks
             .iter()
             .filter(|task| task_is_open(task))
-            .take(12)
+            .take(8)
             .map(|task| {
                 let owner = task.owner.as_deref().unwrap_or("-");
                 format!(
                     "- task {} [{}] @{}: {}",
-                    task.id, task.status, owner, task.subject
+                    task.id,
+                    task.status,
+                    owner,
+                    compact_one_line(&task.subject, 180)
                 )
             })
             .collect::<Vec<_>>();
@@ -10274,7 +11918,7 @@ fn maybe_send_department_idle_wakeups(
             "{}",
             if language.is_ja() {
                 format!(
-                    "Department idle wakeup for @{name}: この部署には {idle}s の間 active な app-server turn がありません。\n\n必須 action:\n- 自分の inbox、担当中の open task、最近の handoff、job、artifact を読んでください。\n- 自分の blocked/pending/review task が再開可能なら、resume/reassign/review action の evidence とともに `LEAD_PROPOSAL:` を lead に送ってください。\n- 他部署の task が ready、重複、stale、owner 不明だと気づいた場合も、task id、evidence、suggested action とともに `LEAD_PROPOSAL:` を lead に送ってください。\n- action が不要なら、lead に `STAY:` と一行理由を送り、終了してください。busywork を作らないでください。\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks:\n{team_tasks}",
+                    "Department idle wakeup for @{name}: {idle}s active turn がありません。inbox/open task/handoff/job/artifact を確認し、再開可能・誤割当・重複・ready gate があれば evidence 付き `LEAD_PROPOSAL:` を lead へ。不要なら `STAY:` 一行で終了。busywork は作らないでください。\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks:\n{team_tasks}",
                     name = member.name,
                     idle = idle_for.as_secs(),
                     member_tasks = if member_tasks.is_empty() {
@@ -10290,7 +11934,7 @@ fn maybe_send_department_idle_wakeups(
                 )
             } else {
                 format!(
-                    "Department idle wakeup for @{name}: this department has had no active app-server turn for {idle}s.\n\nRequired action:\n- Read your inbox, owned open tasks, recent handoffs, jobs, and artifacts.\n- If your own blocked/pending/review task is now ready, message lead with `LEAD_PROPOSAL:` and evidence for the resume/reassign/review action.\n- If you notice another department's task is ready, duplicated, stale, or missing an owner, send lead a `LEAD_PROPOSAL:` with task id, evidence, and suggested action.\n- If no action is needed, send lead `STAY:` with a one-line reason and finish. Do not invent busywork.\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks:\n{team_tasks}",
+                    "Department idle wakeup for @{name}: no active app-server turn for {idle}s. Check inbox/open tasks/handoffs/jobs/artifacts; send lead `LEAD_PROPOSAL:` with evidence if a resume/reassign/review/ready-gate action is useful. If no action is needed, send one-line `STAY:` and finish. Do not invent busywork.\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks:\n{team_tasks}",
                     name = member.name,
                     idle = idle_for.as_secs(),
                     member_tasks = if member_tasks.is_empty() {
@@ -10411,6 +12055,71 @@ fn maybe_send_department_heartbeats(
             .filter(|task| task_is_open(task))
             .collect::<Vec<_>>();
         let active_run = active.get(&member.name).is_some_and(|run| !run.completed);
+        if recent_idle_wakeups
+            .get(&member.name)
+            .is_some_and(|last| now_instant.duration_since(*last) < interval)
+        {
+            let entry = heartbeats
+                .entry(member.name.clone())
+                .or_insert(now_instant - interval);
+            if now_instant.duration_since(*entry) < interval {
+                continue;
+            }
+            *entry = now_instant;
+            append_event(
+                team_dir,
+                "department_heartbeat_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "recent_idle_wakeup",
+                }),
+            )?;
+            continue;
+        }
+        if member_tasks.is_empty() && matches!(member.status, MemberStatus::Completed) {
+            let entry = heartbeats
+                .entry(member.name.clone())
+                .or_insert(now_instant - interval);
+            if now_instant.duration_since(*entry) < interval {
+                continue;
+            }
+            *entry = now_instant;
+            append_event(
+                team_dir,
+                "department_heartbeat_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "completed_no_open_tasks",
+                    "active_turn": active_run,
+                }),
+            )?;
+            continue;
+        }
+        if member_tasks.is_empty() && !active_run {
+            let entry = heartbeats
+                .entry(member.name.clone())
+                .or_insert(now_instant - interval);
+            if now_instant.duration_since(*entry) < interval {
+                continue;
+            }
+            *entry = now_instant;
+            append_event(
+                team_dir,
+                "department_heartbeat_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "no_open_tasks",
+                    "status": format!("{:?}", member.status),
+                }),
+            )?;
+            continue;
+        }
         if !active_run && let Some(unavailable) = member_node_unavailable_from_nodes(member, &nodes)
         {
             let entry = heartbeats
@@ -10458,12 +12167,6 @@ fn maybe_send_department_heartbeats(
                     "cooldown_source": "member",
                 }),
             )?;
-            continue;
-        }
-        if member_tasks.is_empty()
-            && !active_run
-            && !matches!(member.status, MemberStatus::Running | MemberStatus::Standby)
-        {
             continue;
         }
         if let Some(remaining) = should_suppress_empty_department_ping_during_cooldown(
@@ -10526,8 +12229,15 @@ fn maybe_send_department_heartbeats(
 
         let task_lines = member_tasks
             .iter()
-            .take(8)
-            .map(|task| format!("- task {} [{}]: {}", task.id, task.status, task.subject))
+            .take(5)
+            .map(|task| {
+                format!(
+                    "- task {} [{}]: {}",
+                    task.id,
+                    task.status,
+                    compact_one_line(&task.subject, 180)
+                )
+            })
             .collect::<Vec<_>>();
         let node = member_node_id(member);
         let owned_tasks = if task_lines.is_empty() {
@@ -10537,12 +12247,12 @@ fn maybe_send_department_heartbeats(
         };
         let message = if language.is_ja() {
             format!(
-                "Department heartbeat for @{name}: あなたの mission または担当 task が完全に完了していない場合、今すぐ進捗を報告してください。\n\n必須 department action:\n- lead と relevant consumers に簡潔な status update を送ってください。\n- artifact/log/config/job/request path がある場合は具体的に含めてください。\n- 実行中の重い command、download、build、render、training、API/tool 待ち、remote/container 内処理などがある場合、それが team job または team wait に登録済みか明記してください。未登録なら今すぐ登録するか、登録できない具体的理由と代替 progress artifact path を lead に報告してください。\n- Docker/container node の部署は、成果がまだ未完成でも runtime workspace 内に status/progress artifact を作り、command transcript、manifest、metrics、visualization の予定 path を報告してください。\n- manifest や checksum を持つ package を作った場合、最後の追記・script修正・report/status/progress更新後に再度 `sha256sum -c` を実行し、fresh rc と現 disk hash を報告してください。live transcript、manifest check log、handoff log、progress/status file、helper/finalizer script を hash 後に追記または修正した可能性があるなら、完了扱いにせず再生成してください。\n- 他部署、MCP、remote host、Docker/container、long job、user input を待っている場合、正確な dependency と next action を書いてください。\n- 自部署または他部署の blocked/pending/review task について、gate が cleared に見える、または next owner が不明なら、自分で勝手に開始せず、evidence と suggested resume/reassign/review action を含む `LEAD_PROPOSAL:` を lead に送ってください。\n- 前回 heartbeat から進捗がない場合、黙って待たず lead に介入を求めてください。\n- 完了している場合は TEAM_COMPLETION_CHECKLIST を提示し、follow-up question に答えられる状態で残ってください。\n\nOwned open tasks:\n{owned_tasks}",
+                "Department heartbeat for @{name}: 未完了 mission/task がある場合だけ、lead と consumer に短い status を送ってください。artifact/log/job/wait/request path、blocker、next checkpoint、必要な `LEAD_PROPOSAL:` を含めます。重い処理は team job/wait 登録を確認してください。manifest/checksum package は最終追記後に再検証してください。完了なら TEAM_COMPLETION_CHECKLIST と具体 artifact を出してください。\n\nOwned open tasks:\n{owned_tasks}",
                 name = member.name
             )
         } else {
             format!(
-                "Department heartbeat for @{name}: if your mission or any owned task is not fully complete, report progress now.\n\nRequired department action:\n- Send lead and relevant consumers a concise status update.\n- Include concrete artifact/log/config/job/request paths when they exist.\n- If a heavy command, download, build, render, training run, API/tool wait, remote/container process, or other long operation is running, state whether it is registered as a team job or team wait. If it is not registered, register it now or report the exact reason plus a fallback progress artifact path to lead.\n- Docker/container-node departments must create a status/progress artifact in the runtime workspace even before final output exists, and report planned command transcript, manifest, metrics, and visualization paths.\n- If you produced a manifest or checksum package, rerun `sha256sum -c` after the final append, script edit, report/status/progress update and report the fresh rc plus current on-disk hashes. If a live transcript, manifest check log, handoff log, progress/status file, or helper/finalizer script may have been changed after hashing, do not complete; regenerate the package.\n- If waiting on another department, MCP, remote host, Docker/container, long job, or user input, state the exact dependency and next action.\n- If you notice any blocked/pending/review task, including another department's task, whose gate appears cleared or whose next owner is unclear, do not start it yourself; send lead a `LEAD_PROPOSAL:` message with evidence and the suggested resume/reassign/review action.\n- If you have made no progress since the previous heartbeat, ask lead for intervention instead of silently waiting.\n- If complete, provide TEAM_COMPLETION_CHECKLIST and remain available for follow-up questions.\n\nOwned open tasks:\n{owned_tasks}",
+                "Department heartbeat for @{name}: if your mission/task is still incomplete, send lead/consumers a short status with artifact/log/job/wait/request paths, blocker, next checkpoint, and any needed `LEAD_PROPOSAL:`. Ensure heavy work is tracked as team job/wait. Recheck manifests/checksums after final writes. If complete, provide TEAM_COMPLETION_CHECKLIST with concrete artifacts.\n\nOwned open tasks:\n{owned_tasks}",
                 name = member.name
             )
         };
@@ -10685,6 +12395,92 @@ fn task_age_secs(task: &TeamTask) -> Option<i64> {
         .map(|updated| (Utc::now() - updated.with_timezone(&Utc)).num_seconds())
 }
 
+fn wait_age_secs(wait: &TeamWait) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(&wait.updated_at)
+        .ok()
+        .map(|updated| (Utc::now() - updated.with_timezone(&Utc)).num_seconds())
+}
+
+fn active_external_wait_ids_for_member(team_dir: &Path, member_name: &str) -> Result<Vec<String>> {
+    Ok(load_waits(team_dir)?
+        .into_iter()
+        .filter(|wait| wait.owner.as_deref() == Some(member_name))
+        .filter(|wait| {
+            matches!(
+                wait.status,
+                TeamWaitStatus::Running | TeamWaitStatus::Polling
+            )
+        })
+        .filter(wait_looks_like_external_long_wait)
+        .map(|wait| wait.id)
+        .collect())
+}
+
+fn record_deferred_active_turn_context(
+    team_dir: &Path,
+    run: &AppServerMemberRun,
+    messages: &[MailMessage],
+    wait_ids: &[String],
+    language: TeamPromptLanguage,
+) -> Result<Option<String>> {
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    let path = side_channel_context_path(team_dir, &run.member.name);
+    let sequence = read_jsonl::<SideChannelContextRecord>(&path)?.len() + 1;
+    let id = sanitize_id(&format!(
+        "deferredctx-{}-{}-{}",
+        run.member.name, run.turn_id, sequence
+    ));
+    let wait_summary = if wait_ids.is_empty() {
+        "-".to_string()
+    } else {
+        wait_ids.join(", ")
+    };
+    let reply = if language.is_ja() {
+        format!(
+            "この message 群は main turn が外部長期待ち ({wait_summary}) の間に届いたため、実行中 turn へ直接 steer せず保留されました。次に @{name} の main turn が再開・新規開始されたら、通常の team message と同じ制約/相談として取り込んでください。",
+            name = run.member.name
+        )
+    } else {
+        format!(
+            "These messages arrived while the main turn was waiting on external long-running work ({wait_summary}), so they were not steered into the active turn. When @{name}'s main turn resumes or starts again, incorporate them as normal team-message constraints or questions.",
+            name = run.member.name
+        )
+    };
+    let record = SideChannelContextRecord {
+        id: id.clone(),
+        member: run.member.name.clone(),
+        node: run.node_id.clone(),
+        source_thread: run.thread_id.clone(),
+        side_thread: String::new(),
+        side_turn: String::new(),
+        recipients: vec![run.member.name.clone()],
+        incoming_summary: summarize_side_reply_messages(messages, language),
+        reply,
+        created_at: now(),
+        status: SideChannelContextStatus::Pending,
+        injected_turns: Vec::new(),
+        injected_at: None,
+        acknowledged_at: None,
+    };
+    append_jsonl(&path, &record)?;
+    append_event(
+        team_dir,
+        "active_turn_mailbox_context_deferred",
+        serde_json::json!({
+            "member": run.member.name,
+            "node": run.node_id,
+            "thread": run.thread_id,
+            "turn": run.turn_id,
+            "context_id": id,
+            "messages": messages.len(),
+            "waits": wait_ids,
+        }),
+    )?;
+    Ok(Some(id))
+}
+
 async fn steer_new_team_messages(
     node_clients: &mut HashMap<String, TeamAppServerNodeClient>,
     team_dir: &Path,
@@ -10752,6 +12548,14 @@ async fn steer_new_team_messages(
                 )
                 .await?;
                 if started {
+                    let category = usage_category_for_messages("lead_reactive", &messages);
+                    update_active_turn_usage_category(
+                        team_dir,
+                        active,
+                        &member_name,
+                        category,
+                        "app_server_lead_reactive_classified",
+                    )?;
                     acknowledge_mailbox_delivery(
                         team_dir,
                         mailbox_counts,
@@ -10789,6 +12593,14 @@ async fn steer_new_team_messages(
                     run.standby_after_turn = matches!(status, MemberStatus::Standby);
                 }
                 if started {
+                    let category = usage_category_for_messages("member_reactive", &messages);
+                    update_active_turn_usage_category(
+                        team_dir,
+                        active,
+                        &member_name,
+                        category,
+                        "app_server_member_reactive_classified",
+                    )?;
                     acknowledge_mailbox_delivery(
                         team_dir,
                         mailbox_counts,
@@ -10798,6 +12610,64 @@ async fn steer_new_team_messages(
                     )?;
                 }
             }
+            continue;
+        }
+        let active_external_waits = active_external_wait_ids_for_member(team_dir, &member_name)?;
+        if let Some(run) = active.get_mut(&member_name) {
+            run.usage_category = usage_category_for_messages(&run.usage_category, &messages);
+        }
+        if !active_external_waits.is_empty() {
+            let mut side_started = false;
+            if side_channel_replies {
+                let side_messages = messages
+                    .iter()
+                    .filter(|message| side_channel_message_needs_fast_reply(&member_name, message))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !side_messages.is_empty() {
+                    side_started = start_app_server_side_channel_reply(
+                        node_clients,
+                        team_dir,
+                        side_replies,
+                        &run,
+                        side_messages,
+                        model.clone(),
+                        approval_policy.clone(),
+                        dangerously_bypass_approvals_and_sandbox,
+                        language,
+                        false,
+                    )
+                    .await?;
+                }
+            }
+            let context_id = record_deferred_active_turn_context(
+                team_dir,
+                &run,
+                &messages,
+                &active_external_waits,
+                language,
+            )?;
+            append_event(
+                team_dir,
+                "app_server_turn_steer_deferred_external_wait",
+                serde_json::json!({
+                    "member": member_name,
+                    "node": run.node_id,
+                    "thread": run.thread_id,
+                    "turn": run.turn_id,
+                    "messages": messages.len(),
+                    "waits": active_external_waits,
+                    "side_channel_reply_started": side_started,
+                    "deferred_context": context_id,
+                }),
+            )?;
+            acknowledge_mailbox_delivery(
+                team_dir,
+                mailbox_counts,
+                &member_name,
+                pending.seen,
+                messages.len(),
+            )?;
             continue;
         }
         let mut delivered = false;
@@ -10818,6 +12688,7 @@ async fn steer_new_team_messages(
                     approval_policy,
                     dangerously_bypass_approvals_and_sandbox,
                     language,
+                    true,
                 )
                 .await?;
                 if side_started {
@@ -11041,9 +12912,29 @@ async fn start_app_server_side_channel_reply(
     approval_policy: Option<AskForApproval>,
     dangerously_bypass_approvals_and_sandbox: bool,
     language: TeamPromptLanguage,
+    fork_source_thread: bool,
 ) -> Result<bool> {
     let recipients = side_channel_reply_recipients(&run.member.name, &messages);
     if recipients.is_empty() {
+        return Ok(false);
+    }
+    if side_replies.values().any(|reply| {
+        reply.member.name == run.member.name
+            && reply.node_id == run.node_id
+            && reply.source_thread_id == run.thread_id
+    }) {
+        append_event(
+            team_dir,
+            "app_server_side_channel_reply_skipped",
+            serde_json::json!({
+                "member": run.member.name,
+                "node": run.node_id,
+                "thread": run.thread_id,
+                "reason": "side_channel_reply_already_running",
+                "messages": messages.len(),
+                "recipients": recipients,
+            }),
+        )?;
         return Ok(false);
     }
     let Some(node_client) = node_clients.get_mut(&run.node_id) else {
@@ -11060,28 +12951,51 @@ async fn start_app_server_side_channel_reply(
         )?;
         return Ok(false);
     };
-    let fork: ThreadForkResponse = node_client
-        .client
-        .request_typed(ClientRequest::ThreadFork {
-            request_id: next_request_id(&mut node_client.request_counter),
-            params: ThreadForkParams {
-                thread_id: run.thread_id.clone(),
-                model: model.clone(),
-                cwd: Some(run.cwd.display().to_string()),
-                approval_policy: approval_policy.clone(),
-                sandbox: if dangerously_bypass_approvals_and_sandbox {
-                    Some(SandboxMode::DangerFullAccess)
-                } else {
-                    None
+    let side_thread_id = if fork_source_thread {
+        let fork: ThreadForkResponse = node_client
+            .client
+            .request_typed(ClientRequest::ThreadFork {
+                request_id: next_request_id(&mut node_client.request_counter),
+                params: ThreadForkParams {
+                    thread_id: run.thread_id.clone(),
+                    model: model.clone(),
+                    cwd: Some(run.cwd.display().to_string()),
+                    approval_policy: approval_policy.clone(),
+                    sandbox: if dangerously_bypass_approvals_and_sandbox {
+                        Some(SandboxMode::DangerFullAccess)
+                    } else {
+                        None
+                    },
+                    ephemeral: true,
+                    exclude_turns: true,
+                    ..ThreadForkParams::default()
                 },
-                ephemeral: true,
-                exclude_turns: true,
-                ..ThreadForkParams::default()
-            },
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
-    let side_thread_id = fork.thread.id.clone();
+            })
+            .await
+            .map_err(|err| anyhow!(err))?;
+        fork.thread.id.clone()
+    } else {
+        let thread: ThreadStartResponse = node_client
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: next_request_id(&mut node_client.request_counter),
+                params: ThreadStartParams {
+                    model: model.clone(),
+                    cwd: Some(run.cwd.display().to_string()),
+                    sandbox: if dangerously_bypass_approvals_and_sandbox {
+                        Some(SandboxMode::DangerFullAccess)
+                    } else {
+                        None
+                    },
+                    approval_policy: approval_policy.clone(),
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .map_err(|err| anyhow!(err))?;
+        thread.thread.id.clone()
+    };
     let prompt = build_side_channel_reply_prompt(&run.member, &messages, language);
     let turn: TurnStartResponse = node_client
         .client
@@ -11111,6 +13025,7 @@ async fn start_app_server_side_channel_reply(
             source_thread_id: run.thread_id.clone(),
             side_thread_id: side_thread_id.clone(),
             turn_id: turn.turn.id.clone(),
+            usage_category: "side_channel_reply".to_string(),
             recipients: recipients.clone(),
             messages: messages.clone(),
             buffer: String::new(),
@@ -11128,7 +13043,17 @@ async fn start_app_server_side_channel_reply(
             "turn": turn.turn.id,
             "recipients": recipients,
             "messages": messages.len(),
+            "mode": if fork_source_thread { "fork" } else { "independent" },
         }),
+    )?;
+    record_turn_usage_index(
+        team_dir,
+        &run.member,
+        &run.node_id,
+        &side_thread_id,
+        &turn.turn.id,
+        "side_channel_reply",
+        "app_server_side_channel_reply_started",
     )?;
     Ok(true)
 }
@@ -11137,6 +13062,7 @@ fn side_channel_message_needs_fast_reply(member_name: &str, message: &MailMessag
     message.from != "system"
         && message.from != member_name
         && !is_side_channel_generated_message(&message.message)
+        && !message_is_status_or_handoff_update(&message.message)
         && message_requests_fast_reply(&message.from, &message.message)
 }
 
@@ -11158,12 +13084,7 @@ fn message_requests_fast_reply(from: &str, message: &str) -> bool {
     if from == "user" {
         return true;
     }
-    message.contains('?')
-        || message.contains('？')
-        || lower.contains("question")
-        || lower.contains("ask ")
-        || lower.contains("reply")
-        || lower.contains("respond")
+    message_has_explicit_question_or_reply_request(message)
         || lower.contains("can you")
         || lower.contains("could you")
         || lower.contains("should ")
@@ -11171,14 +13092,69 @@ fn message_requests_fast_reply(from: &str, message: &str) -> bool {
         || lower.contains("which ")
         || lower.contains("why ")
         || lower.contains("how ")
+}
+
+fn message_has_explicit_question_or_reply_request(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    message.contains('?')
+        || message.contains('？')
+        || lower.contains("question")
         || message.contains("相談")
-        || message.contains("確認")
         || message.contains("質問")
-        || message.contains("返事")
-        || message.contains("返信")
         || message.contains("教えて")
         || message.contains("どう")
         || message.contains("何")
+        || message.contains("なぜ")
+        || message.contains("どれ")
+        || message.contains("どちら")
+        || message.contains("返信してください")
+        || message.contains("返答してください")
+        || message.contains("回答してください")
+        || lower.contains("please reply")
+        || lower.contains("reply requested")
+        || lower.contains("please respond")
+}
+
+fn message_is_status_or_handoff_update(message: &str) -> bool {
+    if message_has_explicit_question_or_reply_request(message) {
+        return false;
+    }
+    let lower = message.to_lowercase();
+    let status_like = [
+        "current mode",
+        "status:",
+        "status update",
+        "heartbeat",
+        "next checkpoint",
+        "blocker は",
+        "blocker、",
+        "blocker なし",
+        "no blocker",
+        "no blockers",
+        "standby",
+        "completed / standby",
+        "task ",
+        "wait-",
+        "handoff",
+        "manifest hash",
+        "sha256sum",
+        "verification gate",
+        "受領しました",
+        "継続です",
+        "継続します",
+        "保持します",
+        "保持中",
+        "として扱います",
+        "確認済み",
+        "作成済み",
+        "未到着",
+        "到着まで",
+        "待ち",
+        "証跡",
+        "次 checkpoint",
+        "次チェックポイント",
+    ];
+    status_like.iter().any(|needle| lower.contains(needle))
 }
 
 fn side_channel_reply_recipients(member_name: &str, messages: &[MailMessage]) -> Vec<String> {
@@ -11472,7 +13448,12 @@ fn list_teams(root: &Path) -> Result<()> {
     }
     teams.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     for team in teams {
-        println!("{}  {}  {}", team.id, team.updated_at, team.goal);
+        println!(
+            "{}  {}  {}",
+            team.id,
+            team.updated_at,
+            compact_one_line(&team.goal, 240)
+        );
     }
     Ok(())
 }
@@ -11481,7 +13462,7 @@ fn print_status(team_dir: &Path) -> Result<()> {
     let config = load_config(team_dir)?;
     let tasks = load_tasks(team_dir)?;
     println!("Team: {}", config.id);
-    println!("Goal: {}", config.goal);
+    println!("Goal: {}", compact_one_line(&config.goal, 500));
     println!("Members: {}", config.members.len());
     for member in &config.members {
         let task_status = member_task_status_summary(&tasks, &member.name);
@@ -12276,6 +14257,140 @@ fn write_redirect_response(stream: &mut std::net::TcpStream, location: &str) -> 
     Ok(())
 }
 
+fn render_token_usage_panel(team_dir: &Path) -> String {
+    let records =
+        read_jsonl::<TeamTokenUsageRecord>(&team_token_usage_path(team_dir)).unwrap_or_default();
+    if records.is_empty() {
+        return r#"<section class="usage-panel"><h3>Token Usage</h3><p class="hint">No token usage records yet. New app-server turns will populate this panel.</p></section>"#
+            .to_string();
+    }
+
+    let mut usage_updates = HashMap::<String, TeamTokenUsageRecord>::new();
+    for record in records {
+        // App-server may emit the same cumulative usage update more than once.
+        // Deduplicate exact cumulative positions, then sum `last` across model calls.
+        let key = format!(
+            "{}|{}|{}|{}",
+            record.node, record.thread, record.turn, record.total.total_tokens
+        );
+        usage_updates.insert(key, record);
+    }
+
+    let mut total = TeamTokenUsageBreakdown::default();
+    let mut by_category = HashMap::<String, TeamTokenUsageBreakdown>::new();
+    let mut by_member = HashMap::<String, TeamTokenUsageBreakdown>::new();
+    let mut by_node = HashMap::<String, TeamTokenUsageBreakdown>::new();
+    let mut updates = usage_updates.into_values().collect::<Vec<_>>();
+    updates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    for record in &updates {
+        total.add_assign(record.last);
+        by_category
+            .entry(record.category.clone())
+            .or_default()
+            .add_assign(record.last);
+        by_member
+            .entry(format!("{} ({})", record.member, record.role))
+            .or_default()
+            .add_assign(record.last);
+        by_node
+            .entry(record.node.clone())
+            .or_default()
+            .add_assign(record.last);
+    }
+
+    let category_rows = render_token_usage_rows(by_category, total.total_tokens, 12);
+    let member_rows = render_token_usage_rows(by_member, total.total_tokens, 12);
+    let node_rows = render_token_usage_rows(by_node, total.total_tokens, 8);
+    let recent_rows = updates
+        .iter()
+        .take(20)
+        .map(|record| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&timestamp_for_ui(&record.timestamp)),
+                html_escape(&record.category),
+                html_escape(&record.member),
+                html_escape(&record.node),
+                html_escape(&record.turn),
+                html_escape(&format_tokens(record.last.total_tokens)),
+                html_escape(&format_tokens(record.last.input_tokens)),
+                html_escape(&format_tokens(record.last.cached_input_tokens)),
+                html_escape(&format_tokens(record.last.uncached_input_tokens())),
+                html_escape(&format_tokens(record.last.output_tokens)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    format!(
+        r#"<section class="usage-panel"><h3>Token Usage</h3>
+<div class="usage-summary">
+  <div><strong>{total_tokens}</strong><span>Total</span></div>
+  <div><strong>{input_tokens}</strong><span>Input</span></div>
+  <div><strong>{cached_input_tokens}</strong><span>Cached Input</span></div>
+  <div><strong>{uncached_input_tokens}</strong><span>Uncached Input</span></div>
+  <div><strong>{output_tokens}</strong><span>Output</span></div>
+  <div><strong>{reasoning_output_tokens}</strong><span>Reasoning</span></div>
+</div>
+<div class="usage-grid">
+  <details open><summary>By Feature</summary><table><tr><th>Feature</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{category_rows}</table></details>
+  <details><summary>By Member</summary><table><tr><th>Member</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{member_rows}</table></details>
+  <details><summary>By Node</summary><table><tr><th>Node</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{node_rows}</table></details>
+</div>
+<details><summary>Recent Usage Updates</summary><table><tr><th>Time</th><th>Feature</th><th>Member</th><th>Node</th><th>Turn</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th></tr>{recent_rows}</table></details>
+<p class="hint">Aggregation deduplicates repeated cumulative app-server notifications, then sums each model-call `last` usage by the active Teams feature category. Uncached input is shown separately because it is the best quick signal for context that was not served from cache.</p>
+</section>"#,
+        total_tokens = html_escape(&format_tokens(total.total_tokens)),
+        input_tokens = html_escape(&format_tokens(total.input_tokens)),
+        cached_input_tokens = html_escape(&format_tokens(total.cached_input_tokens)),
+        uncached_input_tokens = html_escape(&format_tokens(total.uncached_input_tokens())),
+        output_tokens = html_escape(&format_tokens(total.output_tokens)),
+        reasoning_output_tokens = html_escape(&format_tokens(total.reasoning_output_tokens)),
+        category_rows = category_rows,
+        member_rows = member_rows,
+        node_rows = node_rows,
+        recent_rows = recent_rows,
+    )
+}
+
+fn render_token_usage_rows(
+    values: HashMap<String, TeamTokenUsageBreakdown>,
+    grand_total: i64,
+    limit: usize,
+) -> String {
+    let mut rows = values.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.1.total_tokens.cmp(&a.1.total_tokens).then(a.0.cmp(&b.0)));
+    rows.into_iter()
+        .take(limit)
+        .map(|(label, usage)| {
+            let share = token_usage_share_cell(usage.total_tokens, grand_total);
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&label),
+                share,
+                html_escape(&format_tokens(usage.total_tokens)),
+                html_escape(&format_tokens(usage.input_tokens)),
+                html_escape(&format_tokens(usage.cached_input_tokens)),
+                html_escape(&format_tokens(usage.uncached_input_tokens())),
+                html_escape(&format_tokens(usage.output_tokens)),
+                html_escape(&format_tokens(usage.reasoning_output_tokens)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn token_usage_share_cell(value: i64, grand_total: i64) -> String {
+    if grand_total <= 0 || value <= 0 {
+        return r#"<div class="usage-share"><span style="width:0%"></span><em>0.0%</em></div>"#
+            .to_string();
+    }
+    let pct = (value as f64 / grand_total as f64 * 100.0).clamp(0.0, 100.0);
+    format!(
+        r#"<div class="usage-share"><span style="width:{pct:.1}%"></span><em>{pct:.1}%</em></div>"#
+    )
+}
+
 fn render_team_ui(
     root: &Path,
     args: &UiArgs,
@@ -12461,6 +14576,10 @@ fn render_team_ui(
             .map(|dir| render_thread_board(dir, &config, &node_by_id))
             .transpose()?
             .unwrap_or_default();
+        let token_usage_panel = selected_dir
+            .as_ref()
+            .map(|dir| render_token_usage_panel(dir))
+            .unwrap_or_default();
         let realtime_view = render_realtime_view(&config.id, &config);
         let debug_timeline = render_debug_timeline_view(&config.id);
         format!(
@@ -12468,6 +14587,7 @@ fn render_team_ui(
 <h3>Lead Chat</h3>{lead_chat}
 {realtime_view}
 {debug_timeline}
+{token_usage_panel}
 <h3>Members</h3><table><tr><th>Name</th><th>Role</th><th>Session</th><th>Tasks</th><th>Node</th><th>Location</th><th>Unread/Direct</th><th>Cooldown</th><th>Thread</th></tr>{members}</table>
 <h3>Nodes</h3><table><tr><th>ID</th><th>Kind</th><th>Status</th><th>URL</th><th>Last Seen</th><th>Age</th><th>Health</th><th>Host</th><th>Container</th><th>CWD</th></tr>{nodes}</table>
 <h3>Tasks</h3><table><tr><th>ID</th><th>Status</th><th>Owner</th><th>Subject</th></tr>{tasks}</table>
@@ -12479,6 +14599,7 @@ fn render_team_ui(
             lead_chat = lead_chat,
             realtime_view = realtime_view,
             debug_timeline = debug_timeline,
+            token_usage_panel = token_usage_panel,
             members = members,
             nodes = nodes,
             tasks = tasks,
@@ -12516,6 +14637,17 @@ label{{display:grid;gap:4px}} input,textarea{{font:inherit;padding:8px;border:1p
 .dir-current{{font-weight:600;word-break:break-all}}
 table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{padding:8px;border:1px solid #d8dee4;text-align:left;vertical-align:top}}
 pre{{background:#111827;color:#d1d5db;padding:12px;border-radius:6px;overflow:auto;max-height:360px}}
+.usage-panel{{margin:14px 0}}
+.usage-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:8px 0 12px}}
+.usage-summary div{{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px}}
+.usage-summary strong{{display:block;font-size:20px;line-height:1.2}}
+.usage-summary span{{display:block;color:#59636e;font-size:12px;margin-top:3px}}
+.usage-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}}
+.usage-grid details,.usage-panel details{{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px;margin:8px 0}}
+.usage-panel summary{{cursor:pointer;font-weight:600}}
+.usage-share{{min-width:120px;position:relative;height:18px;background:#eef2f7;border-radius:4px;overflow:hidden}}
+.usage-share span{{position:absolute;inset:0 auto 0 0;background:#9ec5fe}}
+.usage-share em{{position:relative;z-index:1;display:block;text-align:right;padding-right:5px;font-style:normal;font-size:12px;line-height:18px;color:#24292f}}
 .messages{{display:grid;gap:8px;max-height:520px;overflow:auto}}
 .msg{{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px}}
 .lead-chat .msg{{border-left:4px solid #8c959f}}
@@ -14412,6 +16544,24 @@ fn stop_remote_node_app_servers(team_dir: &Path) -> Result<Vec<String>> {
     Ok(stopped)
 }
 
+fn cleanup_node_app_servers_before_spawn(team_dir: &Path, node: &TeamNode, team_id: &str) {
+    if matches!(node.kind, TeamNodeKind::Local | TeamNodeKind::Manual) {
+        return;
+    }
+    let cleaned = cleanup_remote_node_team_processes_scoped(node, team_id);
+    if cleaned {
+        let _ = append_event(
+            team_dir,
+            "node_app_server_pre_spawn_cleanup",
+            serde_json::json!({
+                "node": node.id,
+                "kind": format!("{:?}", node.kind),
+                "reason": "removed stale same-team remote/container app-server processes before spawning a fresh node runtime",
+            }),
+        );
+    }
+}
+
 fn cleanup_remote_node_team_processes(node: &TeamNode, team_id: &str) -> bool {
     match node.kind {
         TeamNodeKind::Ssh => {
@@ -14448,6 +16598,42 @@ fn cleanup_remote_node_team_processes(node: &TeamNode, team_id: &str) -> bool {
     }
 }
 
+fn cleanup_remote_node_team_processes_scoped(node: &TeamNode, team_id: &str) -> bool {
+    match node.kind {
+        TeamNodeKind::Ssh => {
+            let Some(host) = node.host.as_deref() else {
+                return false;
+            };
+            ssh_shell_success(host, &team_env_cleanup_shell(team_id))
+        }
+        TeamNodeKind::Docker => {
+            let Some(container) = node.container.as_deref() else {
+                return false;
+            };
+            docker_shell_success(
+                container,
+                &container_team_cleanup_shell(team_id, container, false),
+            )
+        }
+        TeamNodeKind::SshDocker => {
+            let Some(host) = node.host.as_deref() else {
+                return false;
+            };
+            let Some(container) = node.container.as_deref() else {
+                return false;
+            };
+            let container_cleanup = ssh_docker_shell_success(
+                host,
+                container,
+                &container_team_cleanup_shell(team_id, container, false),
+            );
+            let host_cleanup = ssh_shell_success(host, &team_env_cleanup_shell(team_id));
+            container_cleanup || host_cleanup
+        }
+        TeamNodeKind::Local | TeamNodeKind::Manual => false,
+    }
+}
+
 fn team_env_cleanup_shell(team_id: &str) -> String {
     let quoted_pattern = format!("[C]ODEX_TEAM_ID='{}'", team_id);
     let plain_pattern = format!("[C]ODEX_TEAM_ID={team_id}");
@@ -14466,8 +16652,16 @@ fn container_team_cleanup_shell(
     include_team_app_server: bool,
 ) -> String {
     let mut script = team_env_cleanup_shell(team_id);
-    let team_container_prefix = format!("codex-team-{team_id}");
-    if include_team_app_server || container.starts_with(&team_container_prefix) {
+    let managed_container_prefixes = [
+        format!("codex-team-{team_id}"),
+        format!("team-{team_id}-"),
+        format!("{team_id}-"),
+    ];
+    if include_team_app_server
+        || managed_container_prefixes
+            .iter()
+            .any(|prefix| container.starts_with(prefix))
+    {
         script.push_str("; pkill -TERM -f '[c]odex app-server' || true; sleep 1; pkill -KILL -f '[c]odex app-server' || true");
     }
     script
@@ -15035,6 +17229,20 @@ fn task_dependencies_completed(task: &TeamTask, tasks: &[TeamTask]) -> bool {
     })
 }
 
+fn open_waits_by_task(waits: &[TeamWait]) -> HashMap<String, Vec<String>> {
+    let mut by_task: HashMap<String, Vec<String>> = HashMap::new();
+    for wait in waits.iter().filter(|wait| wait.status.is_open()) {
+        let Some(task_id) = wait.task_id.as_deref() else {
+            continue;
+        };
+        by_task
+            .entry(task_id.to_string())
+            .or_default()
+            .push(wait.id.clone());
+    }
+    by_task
+}
+
 fn task_has_positive_lead_clearance(task: &TeamTask) -> bool {
     let Some(result) = task.result.as_deref() else {
         return false;
@@ -15079,6 +17287,8 @@ fn task_is_ready(task: &TeamTask, tasks: &[TeamTask]) -> bool {
 fn auto_promote_dependency_waits(team_dir: &Path) -> Result<Vec<TeamTask>> {
     let mut config = load_config(team_dir)?;
     let mut tasks = load_tasks(team_dir)?;
+    let waits = load_waits(team_dir)?;
+    let open_waits_by_task = open_waits_by_task(&waits);
     let contract_inputs = load_contract_declared_inputs(&load_ownerships(team_dir)?)?;
     let snapshot = tasks.clone();
     let updated_at = now();
@@ -15093,6 +17303,19 @@ fn auto_promote_dependency_waits(team_dir: &Path) -> Result<Vec<TeamTask>> {
         .iter()
         .filter(|task| is_soft_dependency_wait(task))
         .filter(|task| task_dependencies_completed(task, &snapshot))
+        .filter(|task| !open_waits_by_task.contains_key(task.id.as_str()))
+        .map(|task| task.id.clone())
+        .collect::<HashSet<_>>();
+    let open_wait_hold_ids = tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Ready | TaskStatus::Waiting | TaskStatus::Blocked
+            )
+        })
+        .filter(|task| task_dependencies_completed(task, &snapshot))
+        .filter(|task| open_waits_by_task.contains_key(task.id.as_str()))
         .map(|task| task.id.clone())
         .collect::<HashSet<_>>();
     let contract_clearance_hold_ids = tasks
@@ -15109,6 +17332,7 @@ fn auto_promote_dependency_waits(team_dir: &Path) -> Result<Vec<TeamTask>> {
         .collect::<HashSet<_>>();
     let mut promoted = Vec::new();
     let mut held_for_contract_clearance = Vec::new();
+    let mut held_for_open_waits = Vec::new();
     let mut reactivated_members = Vec::new();
     let mut reactivated_tasks = Vec::new();
     let mut tasks_changed = false;
@@ -15123,7 +17347,34 @@ fn auto_promote_dependency_waits(team_dir: &Path) -> Result<Vec<TeamTask>> {
             ));
             tasks_changed = true;
         }
-        if contract_clearance_hold_ids.contains(&task.id) {
+        if open_wait_hold_ids.contains(&task.id) {
+            let wait_ids = open_waits_by_task
+                .get(task.id.as_str())
+                .map(|ids| ids.join(","))
+                .unwrap_or_default();
+            let note = format!(
+                "Dependency gate may be clear, but task has open wait item(s): {wait_ids}. Do not READY_TO_START until waits close."
+            );
+            let already_noted = task
+                .result
+                .as_deref()
+                .is_some_and(|result| result.contains("task has open wait item(s)"));
+            let old_status = task.status;
+            if matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Ready | TaskStatus::Waiting
+            ) {
+                task.status = TaskStatus::Waiting;
+            }
+            if task.status != old_status || !already_noted {
+                task.updated_at = updated_at.clone();
+                if !already_noted {
+                    task.result = Some(append_result_note(task.result.as_deref(), &note));
+                }
+                held_for_open_waits.push(task.clone());
+                tasks_changed = true;
+            }
+        } else if contract_clearance_hold_ids.contains(&task.id) {
             let note = "Dependency gate cleared, but this non-local task has contract-declared inputs. Await explicit lead root-correct verification clearance before READY_TO_START.";
             let already_noted = task
                 .result
@@ -15205,9 +17456,20 @@ fn auto_promote_dependency_waits(team_dir: &Path) -> Result<Vec<TeamTask>> {
         )?;
         send_contract_input_clearance_required_message(team_dir, task)?;
     }
+    for task in &held_for_open_waits {
+        append_event(
+            team_dir,
+            "task_dependency_open_wait_hold",
+            serde_json::json!({ "task": task }),
+        )?;
+        send_open_wait_hold_message(team_dir, task)?;
+    }
     let promoted_ids = promoted.iter().map(|task| &task.id).collect::<HashSet<_>>();
     for task in &reactivated_tasks {
-        if !promoted_ids.contains(&task.id) && !contract_clearance_hold_ids.contains(&task.id) {
+        if !promoted_ids.contains(&task.id)
+            && !contract_clearance_hold_ids.contains(&task.id)
+            && !open_wait_hold_ids.contains(&task.id)
+        {
             send_ready_to_start_message(team_dir, task)?;
         }
     }
@@ -15244,6 +17506,20 @@ fn send_contract_input_clearance_required_message(team_dir: &Path, task: &TeamTa
     let deps = task.depends_on.join(",");
     let message = format!(
         "AWAITING_LEAD_CLEARANCE: task {} dependencies are complete for @{owner} ({deps}), but this non-local task has contract-declared inputs. Lead must sync/root-correct verify declared inputs, predecessor manifests, and guard/bootstrap requirements, then explicitly clear or resume the owner. Do not start from dependency completion alone.",
+        task.id
+    );
+    send_system_message_to_recipients(team_dir, &recipients, &message)
+}
+
+fn send_open_wait_hold_message(team_dir: &Path, task: &TeamTask) -> Result<()> {
+    let config = load_config(team_dir)?;
+    let recipients = ready_task_recipients(&config, task);
+    if recipients.is_empty() {
+        return Ok(());
+    }
+    let owner = task.owner.as_deref().unwrap_or("unassigned");
+    let message = format!(
+        "WAIT_STILL_OPEN: task {} dependencies may be complete for @{owner}, but at least one linked wait is still open. Keep the task waiting/blocked until the wait reaches completed/failed/cancelled and the owner publishes the real handoff or blocker.",
         task.id
     );
     send_system_message_to_recipients(team_dir, &recipients, &message)
@@ -15734,6 +18010,7 @@ fn run_node(root: &Path, cli: NodeCli) -> Result<()> {
         NodeSubcommand::CreateDocker(args) => create_docker_node(&team_dir, args),
         NodeSubcommand::SyncAssets(args) => sync_node_assets(&team_dir, args),
         NodeSubcommand::SyncPath(args) => sync_node_path(&team_dir, args),
+        NodeSubcommand::PullPath(args) => pull_node_path(&team_dir, args),
         NodeSubcommand::Add(args) => add_team_node(&team_dir, args),
         NodeSubcommand::Remove(args) => remove_team_node(&team_dir, args),
     }
@@ -15998,6 +18275,48 @@ fn sync_node_path(team_dir: &Path, args: NodeSyncPathArgs) -> Result<()> {
         args.dest
     );
     Ok(())
+}
+
+fn pull_node_path(team_dir: &Path, args: NodePullPathArgs) -> Result<()> {
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
+    let node = nodes
+        .into_iter()
+        .find(|node| node.id == sanitize_id(&args.id))
+        .with_context(|| format!("node `{}` not found", args.id))?;
+    let dest = normalize_local_pull_dest(&args.dest)?;
+    let (command, src_name) = build_path_pull_command(&node, &args.src, &dest, args.replace)?;
+    if args.dry_run {
+        println!("{command}");
+        return Ok(());
+    }
+    run_shell_command(&command, "pull team artifact path")?;
+    append_event(
+        team_dir,
+        "node_path_pulled",
+        serde_json::json!({
+            "node": node.id,
+            "src": args.src,
+            "dest": dest,
+            "name": src_name,
+            "replace": args.replace,
+        }),
+    )?;
+    println!("Pulled node {}:{} to {}", node.id, args.src, dest.display());
+    Ok(())
+}
+
+fn normalize_local_pull_dest(dest: &Path) -> Result<PathBuf> {
+    if dest.as_os_str().is_empty() {
+        bail!("destination path must not be empty");
+    }
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create destination parent `{}`", parent.display()))?;
+    }
+    Ok(dest.to_path_buf())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16377,6 +18696,94 @@ fn build_path_sync_command(
     Ok((command, src_kind))
 }
 
+fn build_path_pull_command(
+    node: &TeamNode,
+    src: &str,
+    dest: &Path,
+    replace: bool,
+) -> Result<(String, String)> {
+    let src_name = node_path_basename(src)
+        .with_context(|| format!("node source path `{src}` has no file name"))?;
+    let remote_tar = node_path_tar_script(src);
+    let local_extract = remote_path_extract_script(&src_name, &dest.display().to_string(), replace);
+    let command = match node.kind {
+        TeamNodeKind::Local => {
+            format!(
+                "bash -lc {} | bash -lc {}",
+                shell_quote(&remote_tar),
+                shell_quote(&local_extract)
+            )
+        }
+        TeamNodeKind::Ssh => {
+            let host = node.host.as_deref().context("ssh node needs host")?;
+            format!(
+                "ssh {} {} | bash -lc {}",
+                shell_quote(host),
+                shell_quote(&remote_tar),
+                shell_quote(&local_extract)
+            )
+        }
+        TeamNodeKind::Docker => {
+            let container = node
+                .container
+                .as_deref()
+                .context("docker node needs container")?;
+            format!(
+                "docker exec {} bash -lc {} | bash -lc {}",
+                shell_quote(container),
+                shell_quote(&remote_tar),
+                shell_quote(&local_extract)
+            )
+        }
+        TeamNodeKind::SshDocker => {
+            let host = node.host.as_deref().context("ssh-docker node needs host")?;
+            let container = node
+                .container
+                .as_deref()
+                .context("ssh-docker node needs container")?;
+            let remote_command = format!(
+                "docker exec {} bash -lc {}",
+                shell_quote(container),
+                shell_quote(&remote_tar)
+            );
+            format!(
+                "ssh {} {} | bash -lc {}",
+                shell_quote(host),
+                shell_quote(&remote_command),
+                shell_quote(&local_extract)
+            )
+        }
+        TeamNodeKind::Manual => bail!("manual node path pull is not supported"),
+    };
+    Ok((command, src_name))
+}
+
+fn node_path_tar_script(src: &str) -> String {
+    format!(
+        r#"set -euo pipefail
+src={src}
+if [ ! -e "$src" ]; then
+  echo "pull-path: source does not exist: $src" >&2
+  exit 19
+fi
+parent="$(dirname "$src")"
+name="$(basename "$src")"
+tar -C "$parent" -cf - "$name"
+"#,
+        src = shell_quote(src),
+    )
+}
+
+fn node_path_basename(src: &str) -> Option<String> {
+    let src = src.trim().trim_end_matches('/');
+    if src.is_empty() {
+        return None;
+    }
+    src.rsplit('/')
+        .find(|part| !part.is_empty())
+        .map(str::to_string)
+}
+
 fn remote_path_extract_script(src_name: &str, dest: &str, replace: bool) -> String {
     format!(
         r#"set -euo pipefail
@@ -16737,12 +19144,7 @@ fn add_team_wait(team_dir: &Path, args: WaitAddArgs) -> Result<()> {
         {
             bail!("task `{task_id}` is owned by `{task_owner}`, not `{owner}`");
         }
-        set_task_status_if_open(
-            team_dir,
-            task_id,
-            TaskStatus::Waiting,
-            Some(&format!("Waiting on `{id}`: {}", args.title)),
-        )?;
+        record_task_wait_registration(team_dir, task_id, &id, &args.title)?;
     }
     if let Some(node_id) = args.node.as_deref() {
         let mut nodes = load_nodes(team_dir)?;
@@ -16802,6 +19204,7 @@ fn set_team_wait(team_dir: &Path, args: WaitSetArgs) -> Result<()> {
             Some(evidence)
         };
     }
+    validate_wait_status_transition(team_dir, &wait, &previous_status)?;
     wait.updated_at = now();
     write_json_atomic(&wait_path(team_dir, &wait.id), &wait)?;
     append_event(
@@ -16818,6 +19221,137 @@ fn set_team_wait(team_dir: &Path, args: WaitSetArgs) -> Result<()> {
     )?;
     handle_wait_status_change(team_dir, &wait, previous_status)?;
     println!("Updated wait {}", wait.id);
+    Ok(())
+}
+
+fn validate_wait_status_transition(
+    team_dir: &Path,
+    wait: &TeamWait,
+    previous_status: &TeamWaitStatus,
+) -> Result<()> {
+    if wait.status == TeamWaitStatus::Failed
+        && previous_status.is_open()
+        && wait_looks_like_external_long_wait(wait)
+        && !wait_has_terminal_failure_evidence(team_dir, wait)
+    {
+        bail!(
+            "refusing to mark external wait `{}` as failed without terminal failure evidence. \
+             Keep it running/polling/blocked while the external tool is still pending, or provide \
+             a real failure artifact/URL with --evidence, or include `terminal_failure:` in --progress.",
+            wait.id
+        );
+    }
+    Ok(())
+}
+
+fn wait_looks_like_external_long_wait(wait: &TeamWait) -> bool {
+    let haystack =
+        format!("{}\n{}\n{}", wait.title, wait.condition, wait.progress).to_ascii_lowercase();
+    [
+        "deep_thinker",
+        "deep-researcher",
+        "deep_researcher",
+        "deep research",
+        "mcp",
+        "chatgpt",
+        "external tool",
+        "external api",
+        "api/tool",
+        "request id",
+        "service-side",
+        "polling",
+        "external queue",
+    ]
+    .iter()
+    .any(|needle| haystack.contains(needle))
+}
+
+fn wait_has_terminal_failure_evidence(team_dir: &Path, wait: &TeamWait) -> bool {
+    let progress = wait.progress.to_ascii_lowercase();
+    if progress.contains("terminal_failure:")
+        || progress.contains("confirmed terminal failure")
+        || progress.contains("final_error:")
+    {
+        return true;
+    }
+    let Some(evidence) = wait.evidence.as_deref().map(str::trim) else {
+        return false;
+    };
+    if evidence.is_empty() {
+        return false;
+    }
+    if evidence.starts_with("http://") || evidence.starts_with("https://") {
+        return true;
+    }
+    let path = Path::new(evidence);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        team_dir.join(path)
+    };
+    if resolved.exists() {
+        return true;
+    }
+    !(evidence.starts_with('/')
+        || evidence.starts_with('.')
+        || evidence.contains('/')
+        || evidence.ends_with(".md")
+        || evidence.ends_with(".json")
+        || evidence.ends_with(".jsonl")
+        || evidence.ends_with(".log")
+        || evidence.ends_with(".txt")
+        || evidence.ends_with(".yaml")
+        || evidence.ends_with(".yml"))
+}
+
+fn record_task_wait_registration(
+    team_dir: &Path,
+    task_id: &str,
+    wait_id: &str,
+    wait_title: &str,
+) -> Result<()> {
+    let mut tasks = load_tasks(team_dir)?;
+    let mut changed = false;
+    let note = format!("Waiting on `{wait_id}`: {wait_title}");
+    let now = now();
+    for task in &mut tasks {
+        if task.id != task_id
+            || matches!(
+                task.status,
+                TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Failed
+            )
+        {
+            continue;
+        }
+        if !matches!(task.status, TaskStatus::InProgress | TaskStatus::Review) {
+            task.status = TaskStatus::Waiting;
+        }
+        if !task
+            .result
+            .as_deref()
+            .is_some_and(|result| result.contains(&note))
+        {
+            task.result = Some(append_result_note(task.result.as_deref(), &note));
+        }
+        task.updated_at = now.clone();
+        changed = true;
+    }
+    if !changed {
+        return Ok(());
+    }
+    for task in &tasks {
+        write_json_atomic(&task_path(team_dir, &task.id), task)?;
+    }
+    touch_config(team_dir)?;
+    append_event(
+        team_dir,
+        "task_wait_registered",
+        serde_json::json!({
+            "task": task_id,
+            "wait": wait_id,
+            "preserve_active_status": true,
+        }),
+    )?;
     Ok(())
 }
 
@@ -17008,7 +19542,7 @@ fn start_team_job(team_dir: &Path, args: JobStartArgs) -> Result<()> {
         }),
     )?;
     let start_script = format!(
-        "mkdir -p {base} && cd {cwd} && rm -f {exit_path} && (bash -lc {command} > {log} 2>&1; printf '%s' \"$?\" > {exit_path}) & echo $!",
+        "base={base}; exit_path={exit_path}; log_path={log}; mkdir -p \"$base\" && cd {cwd} && rm -f \"$exit_path\" && (trap 'code=$?; printf \"%s\" \"$code\" > \"$exit_path\"' EXIT; bash -lc {command} > \"$log_path\" 2>&1) & pid=$!; printf \"%s\" \"$pid\" > \"$base/pid\"; echo \"$pid\"",
         base = shell_quote(&remote_base),
         cwd = shell_quote(&cwd),
         exit_path = shell_quote(&remote_exit),
@@ -17194,18 +19728,34 @@ fn handle_job_artifact_handoff(team_dir: &Path, job: &TeamJob) -> Result<()> {
 
 fn refresh_job_status(team_dir: &Path, id: &str) -> Result<TeamJob> {
     let mut job = load_job(team_dir, id)?;
+    if matches!(job.status, TeamJobStatus::Stopped) {
+        return Ok(job);
+    }
     let previous_status = job.status.clone();
+    if job.pid.is_none()
+        && matches!(job.status, TeamJobStatus::Running)
+        && job_start_grace_active(&job)
+    {
+        return Ok(job);
+    }
     let node = load_node_for_job(team_dir, &job)?;
     let script = format!(
-        "if [ -f {exit_path} ]; then cat {exit_path}; elif kill -0 {pid} >/dev/null 2>&1; then echo RUNNING; else echo UNKNOWN; fi",
+        "exit_path={exit_path}; log_path={log_path}; pid_value={pid}; pid_file=\"$(dirname \"$exit_path\")/pid\"; if [ -f \"$exit_path\" ]; then cat \"$exit_path\"; elif [ -n \"$pid_value\" ] && kill -0 \"$pid_value\" >/dev/null 2>&1; then echo RUNNING; elif [ -f \"$pid_file\" ] && pid_from_file=\"$(cat \"$pid_file\" 2>/dev/null)\" && [ -n \"$pid_from_file\" ] && kill -0 \"$pid_from_file\" >/dev/null 2>&1; then echo \"RUNNING_PID:$pid_from_file\"; elif [ -f \"$log_path\" ] && now_ts=\"$(date +%s)\" && log_ts=\"$(stat -c %Y \"$log_path\" 2>/dev/null)\" && [ -n \"$log_ts\" ] && [ $((now_ts - log_ts)) -lt 300 ]; then echo RUNNING_NO_PID; else echo UNKNOWN; fi",
         exit_path = shell_quote(&job.exit_path),
+        log_path = shell_quote(&job.log_path),
         pid = shell_quote(job.pid.as_deref().unwrap_or("")),
     );
     let status = run_node_command_capture(&node, &script)
         .unwrap_or_else(|_| "UNKNOWN".to_string())
         .trim()
         .to_string();
-    if status == "RUNNING" {
+    if status == "RUNNING" || status == "RUNNING_NO_PID" {
+        job.status = TeamJobStatus::Running;
+    } else if let Some(pid) = status.strip_prefix("RUNNING_PID:") {
+        let pid = pid.trim();
+        if !pid.is_empty() {
+            job.pid = Some(pid.to_string());
+        }
         job.status = TeamJobStatus::Running;
     } else if let Ok(code) = status.parse::<i32>() {
         job.exit_code = Some(code);
@@ -17215,7 +19765,11 @@ fn refresh_job_status(team_dir: &Path, id: &str) -> Result<TeamJob> {
             TeamJobStatus::Failed
         };
     } else if !matches!(job.status, TeamJobStatus::Stopped) {
-        job.status = TeamJobStatus::Unknown;
+        if job.pid.is_some() {
+            job.status = TeamJobStatus::Failed;
+        } else {
+            job.status = TeamJobStatus::Unknown;
+        }
     }
     job.updated_at = now();
     write_json_atomic(&job_path(team_dir, &job.id), &job)?;
@@ -17244,6 +19798,19 @@ fn refresh_job_status(team_dir: &Path, id: &str) -> Result<TeamJob> {
         if let Some(task_id) = job.task_id.as_deref() {
             if !job_owner_matches_task_owner(team_dir, &job, task_id)? {
                 record_auxiliary_job_status(team_dir, &job, task_id)?;
+            } else if job_task_is_closed(team_dir, task_id)? {
+                append_event(
+                    team_dir,
+                    "job_status_ignored_closed_task",
+                    serde_json::json!({
+                        "job": job.id,
+                        "task": task_id,
+                        "owner": job.owner,
+                        "job_status": format!("{:?}", job.status),
+                        "exit_code": job.exit_code,
+                        "reason": "task is already closed; stale or superseded job status must not reopen or resume it",
+                    }),
+                )?;
             } else {
                 match job.status {
                     TeamJobStatus::Completed => {
@@ -17327,6 +19894,13 @@ fn refresh_job_status(team_dir: &Path, id: &str) -> Result<TeamJob> {
     Ok(job)
 }
 
+fn job_start_grace_active(job: &TeamJob) -> bool {
+    let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(&job.created_at) else {
+        return false;
+    };
+    (Utc::now() - created_at.with_timezone(&Utc)).num_seconds() < 60
+}
+
 fn claim_job_status_notification(
     team_dir: &Path,
     job_id: &str,
@@ -17366,6 +19940,13 @@ fn job_owner_matches_task_owner(team_dir: &Path, job: &TeamJob, task_id: &str) -
         .find(|task| task.id == task_id)
         .and_then(|task| task.owner.as_deref())
         .is_some_and(|task_owner| task_owner == job_owner))
+}
+
+fn job_task_is_closed(team_dir: &Path, task_id: &str) -> Result<bool> {
+    Ok(load_tasks(team_dir)?
+        .iter()
+        .find(|task| task.id == task_id)
+        .is_some_and(|task| !task_is_open(task)))
 }
 
 fn record_auxiliary_job_status(team_dir: &Path, job: &TeamJob, task_id: &str) -> Result<()> {
@@ -18037,6 +20618,14 @@ fn task_completion_missing_required_local_outputs(
 ) -> Result<Option<String>> {
     let paths = task_required_local_output_paths(team_dir, task)?;
     if paths.is_empty() {
+        if task_requires_formal_handoff_package(task)
+            && task_required_declared_non_local_output_paths(team_dir, task)?.is_empty()
+        {
+            return Ok(Some(
+                "task requires a formal handoff package, but no task-specific local or node-side output package path was claimed or declared"
+                    .to_string(),
+            ));
+        }
         return Ok(None);
     }
     let owner_has_completion_checklist_message = task
@@ -18061,6 +20650,20 @@ fn task_completion_missing_required_local_outputs(
             issues.join("; ")
         )))
     }
+}
+
+fn task_requires_formal_handoff_package(task: &TeamTask) -> bool {
+    let lower = format!(
+        "{} {} {}",
+        task.subject,
+        task.description,
+        task.result.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    lower.contains("team_completion_checklist")
+        && (lower.contains("sha256_manifest")
+            || lower.contains("manifest check")
+            || lower.contains("sha256sum -c"))
 }
 
 fn task_completion_blocker(team_dir: &Path, task: &TeamTask) -> Result<Option<String>> {
@@ -18280,13 +20883,15 @@ fn task_required_declared_non_local_output_paths(
     }
 
     let text = format!(
-        "{} {}",
+        "{} {} {}",
+        task.subject,
         task.description,
         task.result.as_deref().unwrap_or("")
     );
-    for path in extract_absolute_paths_from_text(&text) {
+    for (path, path_start) in extract_absolute_paths_with_offsets_from_text(&text) {
         if !ownership_path_is_probably_local(team_dir, &path)
-            && path_looks_like_task_handoff_output(&path)
+            && (path_looks_like_task_handoff_output(&path)
+                || text_path_context_is_output(&text, path_start))
         {
             paths.push(path);
         }
@@ -18414,9 +21019,19 @@ fn clean_embedded_path_token(token: &str) -> Option<&str> {
     embedded_absolute_path_slice(token, &["/home/", "/tmp/"])
 }
 
-fn extract_absolute_paths_from_text(text: &str) -> Vec<String> {
+fn extract_absolute_paths_with_offsets_from_text(text: &str) -> Vec<(String, usize)> {
     text.split_whitespace()
-        .filter_map(clean_embedded_absolute_path_token)
+        .scan(0usize, |cursor, token| {
+            let rel = text[*cursor..].find(token).unwrap_or(0);
+            let start = *cursor + rel;
+            *cursor = start + token.len();
+            Some((start, token))
+        })
+        .filter_map(|(token_start, token)| {
+            let path = clean_embedded_absolute_path_token(token)?;
+            let path_start = token_start + token.find(path.as_str()).unwrap_or(0);
+            Some((path, path_start))
+        })
         .collect()
 }
 
@@ -18797,6 +21412,9 @@ fn build_worker_prompt(config: &TeamConfig, tasks: &[TeamTask], member: &TeamMem
         .collect::<Vec<_>>()
         .join("\n");
 
+    let autoresearch_policy =
+        build_autoresearch_loop_policy_block(&config.goal, TeamPromptLanguage::En);
+
     format!(
         r#"You are a Codex agent team department.
 
@@ -18871,6 +21489,7 @@ External prompt/template compliance policy:
 - Before handoff, include a compact checklist mapping each template requirement to the artifact path, provenance/source, and verification status.
 - For research scans, `sources.yaml` entries that only contain URLs and remembered summaries are not enough for `confirmed` evidence. Save source evidence locally when practical: fetched HTML/PDF/API metadata, MCP/tool response excerpts with request id, or command transcripts with URL, timestamp, cwd, command, and rc/exit. If a source could not be fetched or snapshotted, mark the related claim `likely`, `speculative`, or `unknown`, not `confirmed`, and document the access limitation.
 - If the team CLI rejects task completion because the output package is missing a checklist, manifest, ledger/report, or verification evidence, do not work around that by switching the task to `review` or calling it complete in chat. Either create the missing package and retry completion, or leave the task blocked with the exact missing artifact list and next owner.
+{autoresearch_policy}
 
 External dependency and credential policy:
 - When choosing or implementing an external model, dataset, package, API, browser, or service, verify the transitive runtime dependencies, not just the top-level repo license.
@@ -18915,6 +21534,7 @@ Assigned tasks:
         goal = config.goal,
         member_name = member.name,
         role = member.role,
+        autoresearch_policy = autoresearch_policy,
         task_text = if task_text.is_empty() {
             "(none)".to_string()
         } else {
@@ -18949,6 +21569,7 @@ App-server managed team run:
   - "{codex}" team node --team "{team_id}" list
   - "{codex}" team node --team "{team_id}" inspect [node-id]
   - "{codex}" team node --team "{team_id}" sync-path <node-id> --src <local-path> --dest <node-path> [--replace]
+  - "{codex}" team node --team "{team_id}" pull-path <node-id> --src <node-path> --dest <local-path> [--replace]
   - "{codex}" team task --team "{team_id}" list
   - "{codex}" team task --team "{team_id}" claim [TASK_ID] --owner "{member}"
   - "{codex}" team job --team "{team_id}" start --owner "{member}" --task <TASK_ID> --node <node-id> --cwd <cwd> -- <command...>
@@ -18992,7 +21613,7 @@ App-server managed team run:
 When a teammate sends you a message, the orchestrator may steer this active turn with the new message. Treat that as live team discussion and respond or adjust your work if needed. Ask clarifying or review questions back to related departments whenever their judgment could improve the result; do not silently make cross-department decisions.
 When you send team messages through a shell command, treat message text as data. Do not put unescaped backticks, `$()`, or other command-substitution syntax inside double-quoted CLI arguments. Prefer plain identifiers without markdown backticks in shell-delivered messages, or use safe single-quote/heredoc/stdin-style quoting when available. If a sent message loses an identifier because of shell expansion, resend the exact identifier immediately and record the correction.
 If your work or an invoked skill creates or uses a Docker container for ongoing team work, do not leave it as an invisible side environment. Ask lead to use `team node create-docker` when possible; otherwise use a stable long-lived container name, mount the relevant workspace, publish any user-facing ports with `-p`, keep the container alive, and send lead the exact container name, host, mount paths, exposed ports, and suggested node kind (`docker` or `ssh-docker`) so lead can register or update the placement. If you cannot run the local team CLI but have enough details, also write one standalone line in this exact format: `TEAM_NODE id=<node-id> kind=<docker|ssh-docker> host=<ssh-host-or-> container=<container> cwd=<container-cwd> note=<short_note>`. The orchestrator will register the node and add a container-internal department automatically. Once the node is registered, the container-internal department owns installs, runtime execution, rendering, tests, and debugging inside that container; host-side departments should stop at image/container creation plus handoff unless lead asks for a rebuild or replacement. Avoid read-write mounting the host's entire `~/.codex` into a root-owned container; use `team node sync-assets`, a dedicated Codex home, copied credentials/config, or the existing bootstrap/auth flow. If lead has already assigned you to a Docker/SSH-Docker node, treat the execution node context above as authoritative.
-If you need a local artifact, schema package, config, generated input, report, or source matrix on a remote/Docker node and it is not mounted there, ask lead to hand it off with `team node sync-path <node-id> --src <local-path> --dest <node-path> [--replace]`. Do not silently recreate stale copies on the node, and treat missing handoff files as a blocker until the authoritative artifact is synced.
+If you need a local artifact, schema package, config, generated input, report, or source matrix on a remote/Docker node and it is not mounted there, ask lead to hand it off with `team node sync-path <node-id> --src <local-path> --dest <node-path> [--replace]`. If a local department needs your remote/container artifact package, ask lead to pull it with `team node pull-path <node-id> --src <node-path> --dest <local-path> [--replace]` instead of pasting large logs or recreating a weak summary. Do not silently recreate stale copies, and treat missing handoff files as a blocker until the authoritative artifact is synced or pulled.
 If your assigned node lacks a normal verification tool, install it before weakening the verification. Example: for a web app, install Node.js/npm or a headless browser when needed to run smoke tests; for Python work, install the project/test dependencies in a venv when appropriate. In containers, root-level installs are acceptable. On SSH/local nodes, use user-local installs or passwordless sudo only.
 If you start work that may take time, make it inspectable. Use `team job --owner {member} --task <TASK_ID>` for commands the team CLI can run and inspect. Use `team wait add --owner {member} --task <TASK_ID>` for anything with a completion condition but no reliable team-managed PID. This is generic: do not assume only a fixed set of wait types exists. Include the exact completion condition, current request/log/checkpoint identifier, and expected evidence. Do not hide important background or external work in an untracked shell process or an unregistered wait.
 If you start a tracked job or wait yourself, send `all` or the relevant departments the id, target node if any, exact intent, completion condition, and expected log/artifact/evidence paths. When it completes or fails, update the job/wait, hand off the result, and include it in `TEAM_COMPLETION_CHECKLIST`.
@@ -19165,6 +21786,7 @@ fn build_app_server_lead_prompt(
         .map(|member| format!("- {} ({})", member.name, member.role))
         .collect::<Vec<_>>()
         .join("\n");
+    let autoresearch_policy = build_autoresearch_loop_policy_block(&config.goal, language);
 
     let prompt = format!(
         r#"You are the live lead for a Codex app-server agent team.
@@ -19177,6 +21799,7 @@ Role: {role}
 You are a real app-server thread. Your job is orchestration, not implementation. Read current team state and your inbox, then send concise coordination only when useful.
 
 Coordinate toward the user's current task, not toward an implicit endless improvement loop. Create, resume, reassign, or stand down departments based on current tasks, mailboxes, artifacts, and blockers. If a task description says "after runtime", "after validation", "after handoff", or names an upstream task, set that upstream task in `--depends-on`; do not start downstream validation/review before its real handoff exists. Before clearing a non-local runtime/validation department, inspect the contract and task text for every named predecessor package, prior review/audit note, validation report, source matrix, config, or generated input; sync those artifacts to the node and root-correct verify their manifests, not only the immediate method package or producer package. If you notice you created the wrong dependency list or cleared a task before required predecessor artifacts were synced, immediately fix it with `team task set <TASK_ID> --depends-on ... --status waiting|blocked --result "<corrected gate>"`, sync/verify the missing artifacts, and message the affected departments to standby until the handoff lands. Only start an automatic improvement/research loop when the active user instruction or an explicit domain skill requires that behavior.
+{autoresearch_policy}
 
 Commands:
 - "{codex}" team status --team "{team_id}"
@@ -19187,9 +21810,10 @@ Commands:
 - "{codex}" team node --team "{team_id}" add <node-id> --kind docker --container <container> --cwd <container-cwd> --note "<site/purpose>"
 - "{codex}" team node --team "{team_id}" add <node-id> --kind ssh-docker --host <ssh-host> --container <container> --cwd <container-cwd> --note "<site/purpose>"
 - "{codex}" team node --team "{team_id}" create-docker <node-id> [--host <ssh-host>] --image <image> --mount <host:container> --port <host:container> --gpus --replace
-- "{codex}" team node --team "{team_id}" sync-assets <node-id> [--include-auth]
-- "{codex}" team node --team "{team_id}" sync-path <node-id> --src <local-path> --dest <node-path> [--replace]
-- "{codex}" team node --team "{team_id}" remove <node-id> --force
+  - "{codex}" team node --team "{team_id}" sync-assets <node-id> [--include-auth]
+  - "{codex}" team node --team "{team_id}" sync-path <node-id> --src <local-path> --dest <node-path> [--replace]
+  - "{codex}" team node --team "{team_id}" pull-path <node-id> --src <node-path> --dest <local-path> [--replace]
+  - "{codex}" team node --team "{team_id}" remove <node-id> --force
 - "{codex}" team job --team "{team_id}" start --owner lead --task <TASK_ID> --node <node-id> --cwd <cwd> -- <command...>
 - "{codex}" team job --team "{team_id}" status <job-id>
 - "{codex}" team job --team "{team_id}" logs <job-id> --tail 80
@@ -19197,6 +21821,8 @@ Commands:
 - "{codex}" team wait --team "{team_id}" add "<title>" --owner <department> --task <TASK_ID> --condition "<exact completion condition>" --progress "<request id, URL, log path, checkpoint, or current state>" [--node <node-id>] [--evidence <path-or-url>]
 - "{codex}" team wait --team "{team_id}" list [--owner <department>] [--task <TASK_ID>]
 - "{codex}" team wait --team "{team_id}" set <WAIT_ID> --status <waiting|running|polling|blocked|completed|failed|cancelled> --progress "<current state>" [--evidence <path-or-url>]
+
+Do not mark an external/tool/API/MCP/deep_research wait as failed merely because no response has arrived yet or because the main turn has been quiet. Keep it `running` or `polling` while it may still be in progress. Use `failed` only when there is terminal failure evidence, such as a saved error artifact/URL or a `terminal_failure:` progress note.
 - "{codex}" team task --team "{team_id}" list
 - "{codex}" team task --team "{team_id}" set <TASK_ID> --status <status> --depends-on <DEP_TASK_ID> [--depends-on <DEP_TASK_ID>...] --result "<why>"
 - "{codex}" team ownership --team "{team_id}" list
@@ -19237,11 +21863,11 @@ Hard Docker ownership boundary: for main task execution, the host/SSH department
 
 If CUDA, base image, driver, library, port, or mount choices turn out wrong, you are responsible for rebuilding/replacing the container and keeping the team node valid; the user should not need to provide new flags. Reusing the same stable container name is acceptable: update the node if cwd/mount/port/context changed, then resume or message the existing container department rather than creating duplicate departments. If a department or skill creates a container manually that should host ongoing team work, create it with a stable name, mount the relevant workspace (for example `-v "$PWD:/workspace" -w /workspace`), publish any user-facing service ports with `-p host_port:container_port`, and keep it alive long enough for app-server bootstrap. Avoid read-write mounting the host's entire `~/.codex` into a root-owned container; use `team node sync-assets`, a dedicated Codex home, copied credentials/config, or the existing bootstrap/auth flow so host config ownership is not changed. Then register it as a node with `team node add --kind docker --container <name> --cwd /workspace` for local Docker, or `--kind ssh-docker --host <ssh-host> --container <name> --cwd /workspace` for Docker on an SSH host. If a department can report but cannot run the local team CLI, tell it to emit `TEAM_NODE id=<node-id> kind=<docker|ssh-docker> host=<ssh-host-or-> container=<container> cwd=<container-cwd> note=<short_note>` on its own line; the orchestrator will register that node and add the container department. For SSH-host Docker, run Docker creation/removal on that SSH host, then register the resulting `ssh-docker` node. If a container is rebuilt or replaced, update/remove the old node and add the new container node before assigning departments.
 
-Remote/container artifact handoff policy: when a non-local department needs a local artifact, schema package, report, source matrix, config, or generated input that is not mounted on its node, do not ask the user to copy it manually and do not let the remote/container department recreate stale copies. Use `team node sync-path <node-id> --src <local-path> --dest <node-path> [--replace]` to package the authoritative local artifact into the node workspace, then notify the consumer department with the exact destination path and expected hashes/manifests. Before clearing a remote/container runtime or validation task, inspect the task text, latest method contract, and previous audit/validation recommendation for all required predecessor artifacts, not just the immediate producer package. Sync and root-correct verify every required prior audit, validation report, source matrix, config, generated input, and method package that the contract names; if any is missing, keep the task waiting/blocked and resume lead/ops to sync it before runtime starts. Treat missing handoff files as a blocker until the sync happens.
+Remote/container artifact handoff policy: when a non-local department needs a local artifact, schema package, report, source matrix, config, or generated input that is not mounted on its node, do not ask the user to copy it manually and do not let the remote/container department recreate stale copies. Use `team node sync-path <node-id> --src <local-path> --dest <node-path> [--replace]` to package the authoritative local artifact into the node workspace, then notify the consumer department with the exact destination path and expected hashes/manifests. When a local department needs a remote/container artifact package, do not ask the remote worker to paste logs or recreate a summary; use `team node pull-path <node-id> --src <node-path> --dest <local-path> [--replace]`, then have the local consumer verify manifests and hashes from the pulled copy before using it. Before clearing a remote/container runtime or validation task, inspect the task text, latest method contract, and previous audit/validation recommendation for all required predecessor artifacts, not just the immediate producer package. Sync and root-correct verify every required prior audit, validation report, source matrix, config, generated input, and method package that the contract names; if any is missing, keep the task waiting/blocked and resume lead/ops to sync it before runtime starts. Treat missing handoff files as a blocker until the sync or pull happens.
 
 Tooling policy: lead should expect departments to install missing task tools instead of downgrading work quality. If `team node inspect` or a department report shows missing Node.js, Python tooling, browsers, build tools, CUDA libraries, package managers, or test utilities, instruct the responsible department to install what is needed on its own node and verify with the best practical checks. In Docker containers, root installs are acceptable. On SSH/local nodes, use project-local or user-local installs first, and passwordless sudo (`sudo -n`) only when available. Do not require user intervention for ordinary package installs. Ask for a fallback only when install is impossible, unsafe, or requires an interactive password.
 
-For any long-running or externally-completed work, make the completion condition explicit. Use `team job start/status/logs/artifact` for PID-backed commands that the team CLI can run and inspect. Use `team wait add/list/set` for anything with a completion condition but no reliable team-managed PID, including tool/API polling, service-side processing, human/account/credential gates, external queues, remote workflows owned by another process, or any other waitable dependency. Do not hardcode the category: if a task cannot continue until some observable condition becomes true, register a wait with owner, task, condition, progress/request/log identifiers, and final evidence. A task with an open wait is not complete; when the wait is completed/failed/blocked, resume the owner to inspect the result and publish the real handoff, next action, or blocker.
+For any long-running or externally-completed work, make the completion condition explicit. Use `team job start/status/logs/artifact` for PID-backed commands that the team CLI can run and inspect. Use `team wait add/list/set` for anything with a completion condition but no reliable team-managed PID, including tool/API polling, service-side processing, human/account/credential gates, external queues, remote workflows owned by another process, or any other waitable dependency. Do not hardcode the category: if a task cannot continue until some observable condition becomes true, register a wait with owner, task, condition, progress/request/log identifiers, and final evidence. A task with an open wait is not complete. Do not mark an external/tool/API/MCP/deep_research wait as failed merely because no response has arrived yet or because a turn is quiet; keep it `running` or `polling` while it may still be in progress, and use `failed` only with terminal failure evidence such as a saved error artifact/URL or `terminal_failure:` progress note. When the wait is completed/failed/blocked, resume the owner to inspect the result and publish the real handoff, next action, or blocker.
 
 Collaboration policy: departments should over-communicate compared with a solo Codex session. Require each nontrivial department to broadcast an initial plan, ask producer/consumer departments for judgment on uncertain choices, report failures with exact logs and proposed next actions, and hand off artifacts to the departments that must consume or review them. Departments have different natural speeds; do not equate slower output with failure, and do not push for low-quality premature artifacts just to satisfy a heartbeat. For slow or quiet work, require status evidence, current subtask, running tool/job/MCP details, risks, and the next checkpoint. Departments are also allowed to act as observers: if they see a blocked/pending/review task that appears ready or misassigned, they should send lead a `LEAD_PROPOSAL:` with evidence instead of silently waiting or starting unassigned work. Treat proposals as advisory signals; validate them against current tasks, ownerships, mailboxes, jobs, and artifacts before resuming or reassigning anyone. A completed task without a `TEAM_COMPLETION_CHECKLIST` in the department's final response is not a clean completion; resume that department with a concrete mission to send missing messages, evidence, verification, and handoff paths instead of doing its work yourself. If a department ends too quickly after a substantial mission, treat that as suspicious until its checklist and mailbox messages prove real work or a valid blocker.
 
@@ -19251,7 +21877,7 @@ During keep-alive, keep placement dynamic just like departments: add nodes when 
 
 If a department reports that it is blocked on a gate or handoff, that is not completion. Leave or move it to standby/blocked. When the required handoff arrives, explicitly resume that department with a concrete mission instead of assuming the old completed turn will continue automatically. If another department notices that the handoff has arrived and proposes a resume, verify the evidence and then act or explain why not.
 
-During the run, add a new department only when the existing departments cannot reasonably cover a distinct ownership domain. When teammate messages arrive later, the orchestrator may either steer this active turn or start a new lead turn in this same thread. Reply with decisions, unblockers, ownership changes, placement changes, department changes, or handoffs. Keep each lead turn short and finish when no coordination is needed.
+During the run, add a new department only when the existing departments cannot reasonably cover a distinct ownership domain. Long-running waits are normal; do not treat a quiet active wait as a reason to clone a department. If the only problem is that an owner is blocked on a long external wait but independent artifact recovery would help, create a temporary helper/recovery department with narrow ownership, explicit handoff requirements, and no authority to replace the original owner or clear downstream gates. When teammate messages arrive later, the orchestrator may either steer this active turn or start a new lead turn in this same thread. Reply with decisions, unblockers, ownership changes, placement changes, department changes, or handoffs. Keep each lead turn short and finish when no coordination is needed.
 
 Team members:
 {member_lines}
@@ -19263,6 +21889,7 @@ Current tasks:
         goal = config.goal,
         member_name = member.name,
         role = member.role,
+        autoresearch_policy = autoresearch_policy,
         codex = codex_exe.display(),
         member_lines = member_lines,
         task_text = if task_text.is_empty() {
@@ -19308,6 +21935,7 @@ Use the team CLI if you need context:
 - "{codex}" team node --team "{team_id}" create-docker <node-id> [--host <ssh-host>] --image <image> --mount <host:container> --port <host:container> --gpus --replace
 - "{codex}" team node --team "{team_id}" sync-assets <node-id> [--include-auth]
 - "{codex}" team node --team "{team_id}" sync-path <node-id> --src <local-path> --dest <node-path> [--replace]
+- "{codex}" team node --team "{team_id}" pull-path <node-id> --src <node-path> --dest <local-path> [--replace]
 - "{codex}" team node --team "{team_id}" remove <node-id> --force
 - "{codex}" team job --team "{team_id}" start --owner lead --task <TASK_ID> --node <node-id> --cwd <cwd> -- <command...>
 - "{codex}" team job --team "{team_id}" status <job-id>
@@ -19846,9 +22474,10 @@ fn print_task(task: &TeamTask) {
     } else {
         format!(" deps:{}", task.depends_on.join(","))
     };
+    let subject = compact_one_line(&task.subject, 260);
     println!(
         "  {:>3} {:<11} {:<16} {}{}",
-        task.id, task.status, owner, task.subject, deps
+        task.id, task.status, owner, subject, deps
     );
 }
 
@@ -20185,6 +22814,24 @@ mod tests {
     }
 
     #[test]
+    fn container_cleanup_recognizes_team_managed_runtime_names() {
+        let script = container_team_cleanup_shell(
+            "team-20260511115343",
+            "team-20260511115343-runtime",
+            false,
+        );
+        assert!(script.contains("[c]odex app-server"));
+    }
+
+    #[test]
+    fn container_cleanup_does_not_broadly_kill_shared_containers_by_default() {
+        let script =
+            container_team_cleanup_shell("team-20260511115343", "shared-runtime-container", false);
+        assert!(!script.contains("[c]odex app-server"));
+        assert!(script.contains("[C]ODEX_TEAM_ID"));
+    }
+
+    #[test]
     fn embedded_local_path_extraction_handles_japanese_punctuation_and_prefixes() {
         assert_eq!(
             clean_embedded_path_token(
@@ -20390,6 +23037,7 @@ mod tests {
             source_thread_id: "main".to_string(),
             side_thread_id: "side".to_string(),
             turn_id: "turn".to_string(),
+            usage_category: "side_channel_reply".to_string(),
             recipients: vec!["lead".to_string()],
             messages: Vec::new(),
             buffer: "現状はpreflight中です。\n\nTEAM_COMPLETION_CHECKLIST:\n- artifacts: none\n- verification: message sent rc=0\n"
@@ -20428,6 +23076,277 @@ mod tests {
 
         assert!(en.contains("never include TEAM_COMPLETION_CHECKLIST"));
         assert!(ja.contains("TEAM_COMPLETION_CHECKLIST を絶対に書かない"));
+    }
+
+    #[test]
+    fn side_channel_ignores_status_handoff_updates() {
+        let message = MailMessage {
+            from: "evaluation".to_string(),
+            to: "runtime".to_string(),
+            message: "受領しました。current mode は task 3 blocked / wait-2 waiting(open) 継続です。next checkpoint は runtime package 到着です。"
+                .to_string(),
+            timestamp: now(),
+            read: false,
+        };
+
+        assert!(!side_channel_message_needs_fast_reply("runtime", &message));
+    }
+
+    #[test]
+    fn side_channel_still_replies_to_real_questions() {
+        let message = MailMessage {
+            from: "evaluation".to_string(),
+            to: "runtime".to_string(),
+            message: "runtime package の正式 path はどれですか？".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+
+        assert!(side_channel_message_needs_fast_reply("runtime", &message));
+    }
+
+    #[test]
+    fn autoresearch_audit_maps_required_gates_to_artifacts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let now = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-autoresearch-audit".to_string(),
+            goal: "Autoresearch loop for 操作可能デジタルツイン / laboratory instrument digital twin using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
+                .to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "runtime_container-container".to_string(),
+                    role: "container".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: Some("runtime_container".to_string()),
+                },
+            ],
+            language: Some(TeamPromptLanguage::Ja),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("config");
+        let phase0 = team_dir.join("research_planning").join("phase0_scans");
+        for i in 1..=6 {
+            let dir = phase0.join(format!("scan{i:02}"));
+            fs::create_dir_all(&dir).expect("scan dir");
+            fs::write(
+                dir.join("prompt.md"),
+                format!(
+                    "Deep research scan {i}: investigate prior work, datasets, models, evaluation, and runtime constraints for the articulated laboratory digital twin loop with concrete source requirements and integration targets for phase1 synthesis.\n"
+                ),
+            )
+            .expect("scan prompt");
+            fs::write(
+                dir.join("result.md"),
+                format!(
+                    "Result for scan {i}. This scan records substantive findings about articulated objects, data availability, open source methods, evaluation protocols, runtime risks, and how the evidence should influence the next bounded experiment. The package intentionally contains enough detail to distinguish actual research output from a placeholder list. It also records limitations, alternatives, rejected options, and the handoff needed by phase1 synthesis, environment planning, and runtime validation teams. These repeated words ensure the audit sees a meaningful result artifact rather than an empty stub. {}\n",
+                    "evidence ".repeat(50)
+                ),
+            )
+            .expect("scan result");
+            fs::write(
+                dir.join("source_evidence.md"),
+                format!(
+                    "Source evidence for scan {i}: https://example.com/paper-{i} timestamp=2026-05-13 request_id=req-{i} provenance=fetched-html source=public web metadata. Additional source notes preserve URL, access status, confidence reason, and exact material consumed by the scan owner.\n"
+                ),
+            )
+            .expect("scan source");
+            fs::write(
+                dir.join("confidence.md"),
+                "confirmed: public source available\nlikely: runtime can be reproduced\nspeculative: dataset quality may vary\nunknown: final benchmark coverage\n",
+            )
+            .expect("scan confidence");
+            fs::write(
+                dir.join("integration_target.md"),
+                "phase1 synthesis target: feed this scan into bounded experiment selection, environment_handoff, evaluation design, and next runtime experiment planning.\n",
+            )
+            .expect("scan integration");
+            fs::write(
+                dir.join("command_or_mcp_record.md"),
+                format!(
+                    "team wait wait-deep-{i} completed deep_thinker request req-{i} command=mcp/deep_research status=completed rc=0 evidence_path=source_evidence.md saved_result=result.md\n"
+                ),
+            )
+            .expect("scan command record");
+            fs::write(
+                dir.join("manifest.sha256"),
+                "0123456789abcdef  result.md\nfedcba9876543210  source_evidence.md\n",
+            )
+            .expect("scan manifest");
+        }
+        fs::write(phase0.join("MANIFEST.sha256"), "manifest\n").expect("phase0 manifest");
+        fs::write(
+            phase0.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "TEAM_COMPLETION_CHECKLIST\n",
+        )
+        .expect("phase0 checklist");
+        let phase1 = team_dir.join("research_planning").join("phase1");
+        fs::create_dir_all(&phase1).expect("phase1 dir");
+        fs::write(phase1.join("MANIFEST.sha256"), "manifest\n").expect("phase1 manifest");
+        fs::write(
+            phase1.join("synthesis.md"),
+            "killer experiment and bounded experiment with environment_handoff\n",
+        )
+        .expect("phase1 synthesis");
+        let runtime = team_dir.join("runtime_container").join("reports");
+        fs::create_dir_all(&runtime).expect("runtime dir");
+        fs::write(
+            team_dir.join("runtime_container").join("MANIFEST.sha256"),
+            "manifest\n",
+        )
+        .expect("runtime manifest");
+        fs::write(runtime.join("runtime_report_ja.md"), "日本語 report\n").expect("runtime report");
+        fs::write(runtime.join("claim_evidence_table.md"), "claim table\n").expect("claim table");
+        let evaluation = team_dir.join("evaluation");
+        let audit = team_dir.join("audit");
+        fs::create_dir_all(&evaluation).expect("evaluation dir");
+        fs::create_dir_all(&audit).expect("audit dir");
+        fs::write(evaluation.join("MANIFEST.sha256"), "manifest\n").expect("eval manifest");
+        fs::write(
+            audit.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "recommended next action\n",
+        )
+        .expect("audit checklist");
+        write_test_task(
+            team_dir,
+            "1",
+            Some("evaluation"),
+            TaskStatus::Completed,
+            Vec::new(),
+            Some("evaluation done"),
+        );
+        write_test_task(
+            team_dir,
+            "2",
+            Some("audit"),
+            TaskStatus::Completed,
+            Vec::new(),
+            Some("audit done"),
+        );
+        write_test_task(
+            team_dir,
+            "3",
+            Some("lead"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("next bounded task"),
+        );
+        fs::create_dir_all(waits_dir(team_dir)).expect("waits dir");
+        for i in 1..=6 {
+            write_json_atomic(
+                &wait_path(team_dir, &format!("wait-deep-{i}")),
+                &TeamWait {
+                    id: format!("wait-deep-{i}"),
+                    title: format!("deep_thinker phase0 scan {i}"),
+                    owner: Some("research_planning".to_string()),
+                    task_id: Some("1".to_string()),
+                    node: None,
+                    condition: "deep_thinker/deep_research returns with source-backed result"
+                        .to_string(),
+                    status: TeamWaitStatus::Completed,
+                    progress: format!("saved result for scan {i}"),
+                    evidence: Some(format!(
+                        "research_planning/phase0_scans/scan{i:02}/source_evidence.md"
+                    )),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .expect("wait");
+        }
+        write_json_atomic(
+            &wait_path(team_dir, "wait-runtime"),
+            &TeamWait {
+                id: "wait-runtime".to_string(),
+                title: "container runtime package".to_string(),
+                owner: Some("runtime_container-container".to_string()),
+                task_id: Some("3".to_string()),
+                node: Some("runtime_container".to_string()),
+                condition: "runtime package complete".to_string(),
+                status: TeamWaitStatus::Completed,
+                progress: "runtime package saved".to_string(),
+                evidence: Some("runtime_container/MANIFEST.sha256".to_string()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .expect("runtime wait");
+        fs::create_dir_all(jobs_dir(team_dir)).expect("jobs dir");
+        write_json_atomic(
+            &job_path(team_dir, "docker-build"),
+            &TeamJob {
+                id: "docker-build".to_string(),
+                node: "saitou".to_string(),
+                command: "docker build .".to_string(),
+                cwd: "/data2/nonaka/team".to_string(),
+                owner: Some("remote_build_ops".to_string()),
+                task_id: Some("2".to_string()),
+                status: TeamJobStatus::Completed,
+                pid: None,
+                log_path: "/tmp/build.log".to_string(),
+                exit_path: "/tmp/exit.code".to_string(),
+                exit_code: Some(0),
+                note: String::new(),
+                artifacts: Vec::new(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .expect("job");
+        write_nodes(
+            team_dir,
+            &[
+                TeamNode {
+                    id: "saitou".to_string(),
+                    kind: TeamNodeKind::Ssh,
+                    url: None,
+                    host: Some("saitou".to_string()),
+                    container: None,
+                    cwd: Some("/data2/nonaka".to_string()),
+                    status: TeamNodeStatus::Online,
+                    note: String::new(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                TeamNode {
+                    id: "runtime_container".to_string(),
+                    kind: TeamNodeKind::SshDocker,
+                    url: None,
+                    host: Some("saitou".to_string()),
+                    container: Some("runtime".to_string()),
+                    cwd: Some("/workspace/run".to_string()),
+                    status: TeamNodeStatus::Online,
+                    note: String::new(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            ],
+        )
+        .expect("nodes");
+
+        let report = build_autoresearch_audit_report(team_dir).expect("audit");
+
+        assert!(report.contains("overall: PASS"));
+        assert!(report.contains("| phase0_scans | PASS |"));
+        assert!(report.contains("| container_runtime_evidence | PASS |"));
+        assert!(report.contains("| loop_continuation | PASS |"));
     }
 
     #[test]
@@ -20658,6 +23577,48 @@ mod tests {
     }
 
     #[test]
+    fn wait_add_preserves_in_progress_task_status() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "7",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("working"),
+        );
+
+        add_team_wait(
+            team_dir,
+            WaitAddArgs {
+                title: "handoff package".to_string(),
+                owner: Some("engineering".to_string()),
+                task: Some("7".to_string()),
+                node: None,
+                condition: "final handoff appears".to_string(),
+                status: TeamWaitStatus::Waiting,
+                progress: "owner is preparing artifacts".to_string(),
+                evidence: Some("/tmp/final_handoff.md".to_string()),
+            },
+        )
+        .expect("add wait");
+
+        let task = read_json::<TeamTask>(&task_path(team_dir, "7")).expect("task");
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert!(task.result.as_deref().is_some_and(|result| {
+            result.contains("working") && result.contains("Waiting on `wait-1`")
+        }));
+        let wait = read_json::<TeamWait>(&wait_path(team_dir, "wait-1")).expect("wait");
+        assert_eq!(wait.status, TeamWaitStatus::Waiting);
+
+        auto_promote_dependency_waits(team_dir).expect("auto promote");
+        let task = read_json::<TeamTask>(&task_path(team_dir, "7")).expect("task");
+        assert_eq!(task.status, TaskStatus::InProgress);
+    }
+
+    #[test]
     fn wait_completion_resumes_owner_for_handoff() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -20704,6 +23665,108 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message.message.contains("WAIT_STATUS") && message.message.contains("wait-1")
         }));
+    }
+
+    #[test]
+    fn external_wait_cannot_fail_without_terminal_evidence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "9",
+            Some("engineering"),
+            TaskStatus::Waiting,
+            Vec::new(),
+            Some("Waiting on deep_thinker"),
+        );
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        let now = now();
+        write_json_atomic(
+            &wait_path(team_dir, "wait-1"),
+            &TeamWait {
+                id: "wait-1".to_string(),
+                title: "deep_thinker_strategy".to_string(),
+                owner: Some("engineering".to_string()),
+                task_id: Some("9".to_string()),
+                node: None,
+                condition: "MCP deep_thinker returns a PoC strategy".to_string(),
+                status: TeamWaitStatus::Running,
+                progress: "polling external tool".to_string(),
+                evidence: Some("/tmp/missing-deep-thinker-result.md".to_string()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write wait");
+
+        let err = set_team_wait(
+            team_dir,
+            WaitSetArgs {
+                id: "wait-1".to_string(),
+                status: Some(TeamWaitStatus::Failed),
+                progress: Some("no usable response yet".to_string()),
+                evidence: None,
+                clear_evidence: false,
+            },
+        )
+        .expect_err("missing terminal evidence should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("refusing to mark external wait `wait-1` as failed")
+        );
+        let wait = read_json::<TeamWait>(&wait_path(team_dir, "wait-1")).expect("wait");
+        assert_eq!(wait.status, TeamWaitStatus::Running);
+    }
+
+    #[test]
+    fn external_wait_can_fail_with_terminal_progress_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "9",
+            Some("engineering"),
+            TaskStatus::Waiting,
+            Vec::new(),
+            Some("Waiting on deep_thinker"),
+        );
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        let now = now();
+        write_json_atomic(
+            &wait_path(team_dir, "wait-1"),
+            &TeamWait {
+                id: "wait-1".to_string(),
+                title: "deep_thinker_strategy".to_string(),
+                owner: Some("engineering".to_string()),
+                task_id: Some("9".to_string()),
+                node: None,
+                condition: "MCP deep_thinker returns a PoC strategy".to_string(),
+                status: TeamWaitStatus::Running,
+                progress: "polling external tool".to_string(),
+                evidence: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write wait");
+
+        set_team_wait(
+            team_dir,
+            WaitSetArgs {
+                id: "wait-1".to_string(),
+                status: Some(TeamWaitStatus::Failed),
+                progress: Some("terminal_failure: MCP returned a final error".to_string()),
+                evidence: None,
+                clear_evidence: false,
+            },
+        )
+        .expect("terminal marker permits failure");
+
+        let wait = read_json::<TeamWait>(&wait_path(team_dir, "wait-1")).expect("wait");
+        assert_eq!(wait.status, TeamWaitStatus::Failed);
     }
 
     #[test]
@@ -21163,6 +24226,9 @@ mod tests {
         );
         assert!(script.contains("export PATH=\"$HOME/bin:/usr/local/bin:/root/bin:$PATH\""));
         assert!(script.contains("CODEX_TEAM_HELPER_TIMEOUT:-30s"));
+        assert!(script.contains("$CODEX_TEAM_RELAY_URL/wait/list"));
+        assert!(script.contains("$CODEX_TEAM_RELAY_URL/wait/add"));
+        assert!(script.contains("$CODEX_TEAM_RELAY_URL/wait/set"));
     }
 
     #[test]
@@ -21238,6 +24304,91 @@ mod tests {
             read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering")).expect("mailbox");
         assert_eq!(messages.len(), 1);
         assert!(messages[0].message.contains("READY_TO_START: task 2"));
+    }
+
+    #[test]
+    fn dependency_auto_promote_does_not_ready_task_with_open_wait() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "1",
+            Some("lead"),
+            TaskStatus::Completed,
+            Vec::new(),
+            Some("done"),
+        );
+        write_test_task(
+            team_dir,
+            "2",
+            Some("engineering"),
+            TaskStatus::Blocked,
+            vec!["1"],
+            Some("dependency task 1 is complete, but wait-1 is still open"),
+        );
+        write_test_wait(
+            team_dir,
+            "wait-1",
+            Some("engineering"),
+            Some("2"),
+            TeamWaitStatus::Waiting,
+        );
+
+        let promoted = auto_promote_dependency_waits(team_dir).expect("auto promote");
+
+        assert!(promoted.is_empty());
+        let tasks = load_tasks(team_dir).expect("load tasks");
+        let task = tasks.iter().find(|task| task.id == "2").expect("task 2");
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert!(task.result.as_deref().is_some_and(|result| {
+            result.contains("wait-1") && result.contains("Do not READY_TO_START")
+        }));
+        let messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering")).expect("mailbox");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].message.contains("WAIT_STILL_OPEN: task 2"));
+        assert!(!messages[0].message.contains("READY_TO_START"));
+    }
+
+    #[test]
+    fn ready_dependency_task_with_open_wait_is_demoted_to_waiting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "1",
+            Some("lead"),
+            TaskStatus::Completed,
+            Vec::new(),
+            Some("done"),
+        );
+        write_test_task(
+            team_dir,
+            "2",
+            Some("engineering"),
+            TaskStatus::Ready,
+            vec!["1"],
+            Some("premature ready"),
+        );
+        write_test_wait(
+            team_dir,
+            "wait-1",
+            Some("engineering"),
+            Some("2"),
+            TeamWaitStatus::Polling,
+        );
+
+        let promoted = auto_promote_dependency_waits(team_dir).expect("auto promote");
+
+        assert!(promoted.is_empty());
+        let tasks = load_tasks(team_dir).expect("load tasks");
+        let task = tasks.iter().find(|task| task.id == "2").expect("task 2");
+        assert_eq!(task.status, TaskStatus::Waiting);
+        assert!(task.result.as_deref().is_some_and(|result| {
+            result.contains("wait-1") && result.contains("Do not READY_TO_START")
+        }));
     }
 
     #[test]
@@ -21954,6 +25105,69 @@ method_package:
     }
 
     #[test]
+    fn path_pull_command_uses_node_source_and_local_replace_guard() {
+        let node = TeamNode {
+            id: "runtime".to_string(),
+            kind: TeamNodeKind::SshDocker,
+            status: TeamNodeStatus::Online,
+            url: None,
+            host: Some("saitou".to_string()),
+            container: Some("runtime-container".to_string()),
+            cwd: Some("/workspace".to_string()),
+            note: String::new(),
+            created_at: now(),
+            updated_at: now(),
+        };
+
+        let (command, src_name) = build_path_pull_command(
+            &node,
+            "/workspace/team-1/audit_package",
+            Path::new("/tmp/local-audit-package"),
+            true,
+        )
+        .expect("build command");
+
+        assert_eq!(src_name, "audit_package");
+        assert!(command.contains("ssh 'saitou'"));
+        assert!(command.contains("docker exec"));
+        assert!(command.contains("runtime-container"));
+        assert!(command.contains("/workspace/team-1/audit_package"));
+        assert!(command.contains("/tmp/local-audit-package"));
+        assert!(command.contains("replace=1"));
+        assert!(command.contains(".codex-team-handoff-backups"));
+    }
+
+    #[test]
+    fn pull_path_from_local_node_copies_artifact_package() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path().join("team");
+        write_test_config(&team_dir);
+        let src = tmp.path().join("remote_artifact");
+        fs::create_dir_all(&src).expect("src dir");
+        fs::write(src.join("report.md"), "# report\n").expect("report");
+        let dest = tmp.path().join("pulled_artifact");
+
+        pull_node_path(
+            &team_dir,
+            NodePullPathArgs {
+                id: "local".to_string(),
+                src: src.display().to_string(),
+                dest: dest.clone(),
+                replace: false,
+                dry_run: false,
+            },
+        )
+        .expect("pull path");
+
+        assert_eq!(
+            fs::read_to_string(dest.join("report.md")).expect("pulled report"),
+            "# report\n"
+        );
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| event.event == "node_path_pulled"));
+    }
+
+    #[test]
     fn runtime_contract_inputs_extract_host_to_container_pairs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -22141,6 +25355,31 @@ authoritative_predecessor:
     }
 
     #[test]
+    fn checklist_field_value_accepts_multiline_yaml_lists() {
+        let checklist = r#"TEAM_COMPLETION_CHECKLIST:
+- artifacts:
+  - /tmp/report.md
+  - /tmp/result.json
+- verification:
+  - sha256sum -c sha256_manifest.txt rc=0
+- messages_sent:
+  - lead
+- consumers_notified:
+  - lead
+- blockers_or_limits:
+  - none"#;
+
+        assert_eq!(
+            checklist_field_value(&checklist.to_ascii_lowercase(), "artifacts:").as_deref(),
+            Some("/tmp/report.md\n/tmp/result.json")
+        );
+        assert_eq!(
+            checklist_field_value(&checklist.to_ascii_lowercase(), "verification:").as_deref(),
+            Some("sha256sum -c sha256_manifest.txt rc=0")
+        );
+    }
+
+    #[test]
     fn active_task_completion_rejects_empty_artifacts_field() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -22271,6 +25510,7 @@ authoritative_predecessor:
             completed: true,
             failed: false,
             standby_after_turn: false,
+            usage_category: "test".to_string(),
             team_message_scan_offset: 42,
             last_activity_at: Instant::now(),
             last_activity_kind: "turn_completed".to_string(),
@@ -22413,6 +25653,7 @@ authoritative_predecessor:
                 completed: false,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "test".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now(),
                 last_activity_kind: "test".to_string(),
@@ -22481,6 +25722,7 @@ authoritative_predecessor:
                 completed: false,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "test".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now(),
                 last_activity_kind: "test".to_string(),
@@ -22591,6 +25833,68 @@ authoritative_predecessor:
         assert!(events.iter().any(|event| {
             event.get("event").and_then(|value| value.as_str())
                 == Some("job_completed_requires_owner_handoff")
+        }));
+    }
+
+    #[test]
+    fn stale_job_status_does_not_reopen_or_message_completed_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        fs::create_dir_all(team_dir.join("jobs")).expect("jobs dir");
+        write_test_task(
+            team_dir,
+            "35",
+            Some("engineering"),
+            TaskStatus::Completed,
+            Vec::new(),
+            Some("superseding retry completed and handoff accepted"),
+        );
+        let exit_path = team_dir.join("job.exit");
+        fs::write(&exit_path, "143").expect("exit code");
+        let job = TeamJob {
+            id: "stale-failed-job".to_string(),
+            node: "local".to_string(),
+            command: "false".to_string(),
+            cwd: team_dir.display().to_string(),
+            owner: Some("engineering".to_string()),
+            task_id: Some("35".to_string()),
+            status: TeamJobStatus::Running,
+            pid: Some("999999".to_string()),
+            log_path: team_dir.join("job.log").display().to_string(),
+            exit_path: exit_path.display().to_string(),
+            exit_code: None,
+            note: String::new(),
+            artifacts: Vec::new(),
+            created_at: now(),
+            updated_at: now(),
+        };
+        write_json_atomic(&job_path(team_dir, "stale-failed-job"), &job).expect("write job");
+
+        let refreshed = refresh_job_status(team_dir, "stale-failed-job").expect("refresh job");
+
+        assert_eq!(refreshed.status, TeamJobStatus::Failed);
+        let task = load_tasks(team_dir)
+            .expect("tasks")
+            .into_iter()
+            .find(|task| task.id == "35")
+            .expect("task");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(
+            task.result.as_deref(),
+            Some("superseding retry completed and handoff accepted")
+        );
+        let owner_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering")).expect("mailbox");
+        let lead_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "lead")).expect("lead mailbox");
+        assert!(owner_messages.is_empty());
+        assert!(lead_messages.is_empty());
+        let events =
+            read_jsonl::<serde_json::Value>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(|value| value.as_str())
+                == Some("job_status_ignored_closed_task")
         }));
     }
 
@@ -22739,6 +26043,137 @@ authoritative_predecessor:
             })
             .count();
         assert_eq!(lead_status_count, 1);
+    }
+
+    #[test]
+    fn newly_registered_job_without_pid_stays_running_during_start_grace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        fs::create_dir_all(team_dir.join("jobs")).expect("jobs dir");
+        let job = TeamJob {
+            id: "job-starting".to_string(),
+            node: "local".to_string(),
+            command: "sleep 1".to_string(),
+            cwd: team_dir.display().to_string(),
+            owner: Some("engineering".to_string()),
+            task_id: None,
+            status: TeamJobStatus::Running,
+            pid: None,
+            log_path: team_dir.join("job.log").display().to_string(),
+            exit_path: team_dir.join("exit.code").display().to_string(),
+            exit_code: None,
+            note: String::new(),
+            artifacts: Vec::new(),
+            created_at: now(),
+            updated_at: now(),
+        };
+        write_json_atomic(&job_path(team_dir, "job-starting"), &job).expect("write job");
+
+        let refreshed = refresh_job_status(team_dir, "job-starting").expect("refresh job");
+
+        assert_eq!(refreshed.status, TeamJobStatus::Running);
+        assert!(refreshed.pid.is_none());
+        let events =
+            read_jsonl::<serde_json::Value>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().all(|event| {
+            event.get("event").and_then(|value| value.as_str()) != Some("job_unknown")
+        }));
+    }
+
+    #[test]
+    fn job_with_dead_pid_and_missing_exit_file_is_failed_not_unknown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        fs::create_dir_all(team_dir.join("jobs")).expect("jobs dir");
+        write_test_task(
+            team_dir,
+            "88",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            None,
+        );
+        let job = TeamJob {
+            id: "job-missing-exit".to_string(),
+            node: "local".to_string(),
+            command: "false".to_string(),
+            cwd: team_dir.display().to_string(),
+            owner: Some("engineering".to_string()),
+            task_id: Some("88".to_string()),
+            status: TeamJobStatus::Running,
+            pid: Some("999999".to_string()),
+            log_path: team_dir.join("job.log").display().to_string(),
+            exit_path: team_dir.join("missing.exit").display().to_string(),
+            exit_code: None,
+            note: String::new(),
+            artifacts: Vec::new(),
+            created_at: now(),
+            updated_at: now(),
+        };
+        write_json_atomic(&job_path(team_dir, "job-missing-exit"), &job).expect("write job");
+
+        let refreshed = refresh_job_status(team_dir, "job-missing-exit").expect("refresh job");
+
+        assert_eq!(refreshed.status, TeamJobStatus::Failed);
+        assert_eq!(refreshed.exit_code, None);
+        let task = load_tasks(team_dir)
+            .expect("tasks")
+            .into_iter()
+            .find(|task| task.id == "88")
+            .expect("task");
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert!(task.result.as_deref().is_some_and(|result| {
+            result.contains("job-missing-exit") && result.contains("Failed")
+        }));
+        let owner_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering")).expect("mailbox");
+        assert!(owner_messages.iter().any(|message| {
+            message
+                .message
+                .contains("JOB_STATUS: job `job-missing-exit`")
+                && message.message.contains("status Failed")
+        }));
+    }
+
+    #[test]
+    fn job_without_pid_and_recent_log_stays_running_after_start_grace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        fs::create_dir_all(team_dir.join("jobs")).expect("jobs dir");
+        let log_path = team_dir.join("job.log");
+        fs::write(&log_path, "still downloading\n").expect("log");
+        let old_created_at = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let job = TeamJob {
+            id: "job-no-pid-recent-log".to_string(),
+            node: "local".to_string(),
+            command: "sleep 300".to_string(),
+            cwd: team_dir.display().to_string(),
+            owner: Some("engineering".to_string()),
+            task_id: None,
+            status: TeamJobStatus::Running,
+            pid: None,
+            log_path: log_path.display().to_string(),
+            exit_path: team_dir.join("missing.exit").display().to_string(),
+            exit_code: None,
+            note: String::new(),
+            artifacts: Vec::new(),
+            created_at: old_created_at,
+            updated_at: now(),
+        };
+        write_json_atomic(&job_path(team_dir, "job-no-pid-recent-log"), &job).expect("write job");
+
+        let refreshed = refresh_job_status(team_dir, "job-no-pid-recent-log").expect("refresh job");
+
+        assert_eq!(refreshed.status, TeamJobStatus::Running);
+        assert_eq!(refreshed.exit_code, None);
+        let events =
+            read_jsonl::<serde_json::Value>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().all(|event| {
+            event.get("event").and_then(|value| value.as_str()) != Some("job_unknown")
+        }));
     }
 
     #[test]
@@ -23292,6 +26727,7 @@ authoritative_predecessor:
                 completed: true,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "test".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now(),
                 last_activity_kind: "usage_limited".to_string(),
@@ -23321,6 +26757,154 @@ authoritative_predecessor:
             event.event == "department_heartbeat_skipped"
                 && event.data.get("reason").and_then(|value| value.as_str())
                     == Some("usage_limit_cooldown")
+        }));
+    }
+
+    #[test]
+    fn heartbeat_skips_completed_department_without_open_tasks_even_if_turn_is_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let now = now();
+        let lead = TeamMember {
+            name: "lead".to_string(),
+            role: "lead".to_string(),
+            status: MemberStatus::Standby,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let audit = TeamMember {
+            name: "audit".to_string(),
+            role: "audit".to_string(),
+            status: MemberStatus::Completed,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let config = TeamConfig {
+            version: 1,
+            id: "team-completed-heartbeat".to_string(),
+            goal: "keep finished reviewers quiet unless assigned".to_string(),
+            lead: "lead".to_string(),
+            members: vec![lead, audit.clone()],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        let mut active = HashMap::new();
+        active.insert(
+            "audit".to_string(),
+            AppServerMemberRun {
+                member: audit,
+                node_id: "local".to_string(),
+                cwd: team_dir.to_path_buf(),
+                thread_id: "thread-audit".to_string(),
+                turn_id: "turn-audit".to_string(),
+                completed: false,
+                failed: false,
+                standby_after_turn: false,
+                usage_category: "test".to_string(),
+                team_message_scan_offset: 0,
+                last_activity_at: Instant::now(),
+                last_activity_kind: "agent_message_delta".to_string(),
+                last_stale_notice_at: None,
+                retry_not_before: None,
+                side_context_ids: Vec::new(),
+            },
+        );
+
+        let mut heartbeats = HashMap::new();
+        maybe_send_department_heartbeats(
+            team_dir,
+            &config,
+            &active,
+            &mut heartbeats,
+            &HashMap::new(),
+            Duration::from_secs(60),
+            TeamPromptLanguage::Ja,
+        )
+        .expect("heartbeat");
+
+        let audit_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "audit")).expect("mailbox");
+        assert!(audit_messages.is_empty());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "department_heartbeat_skipped"
+                && event.data.get("reason").and_then(|value| value.as_str())
+                    == Some("completed_no_open_tasks")
+                && event
+                    .data
+                    .get("active_turn")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+        }));
+    }
+
+    #[test]
+    fn heartbeat_skips_standby_department_without_open_tasks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let now = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-standby-heartbeat".to_string(),
+            goal: "avoid heartbeat noise for idle departments".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "evaluation".to_string(),
+                    role: "quality".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+            ],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+
+        let mut heartbeats = HashMap::new();
+        maybe_send_department_heartbeats(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut heartbeats,
+            &HashMap::new(),
+            Duration::from_secs(60),
+            TeamPromptLanguage::Ja,
+        )
+        .expect("heartbeat");
+
+        let evaluation_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "evaluation")).expect("mailbox");
+        assert!(evaluation_messages.is_empty());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "department_heartbeat_skipped"
+                && event.data.get("reason").and_then(|value| value.as_str())
+                    == Some("no_open_tasks")
+                && event.data.get("status").and_then(|value| value.as_str()) == Some("Standby")
         }));
     }
 
@@ -23372,6 +26956,7 @@ authoritative_predecessor:
                 completed: true,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "test".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now(),
                 last_activity_kind: "usage_limited".to_string(),
@@ -23468,7 +27053,7 @@ authoritative_predecessor:
         write_test_task(
             team_dir,
             "1",
-            Some("research"),
+            Some("engineering"),
             TaskStatus::InProgress,
             Vec::new(),
             None,
@@ -23675,6 +27260,93 @@ authoritative_predecessor:
             event.event == "department_heartbeat_skipped"
                 && event.data.get("reason").and_then(|value| value.as_str()) == Some("node_stale")
                 && event.data.get("node").and_then(|value| value.as_str()) == Some("remote")
+        }));
+    }
+
+    #[test]
+    fn task_watchdog_warns_about_open_wait_on_stale_node() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_nodes(
+            team_dir,
+            &[TeamNode {
+                id: "remote".to_string(),
+                kind: TeamNodeKind::Ssh,
+                url: Some("ws://127.0.0.1:9999".to_string()),
+                host: Some("remote-host".to_string()),
+                container: None,
+                cwd: Some("/work".to_string()),
+                status: TeamNodeStatus::Online,
+                note: String::new(),
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                updated_at: "2026-05-08T06:41:31Z".to_string(),
+            }],
+        )
+        .expect("write nodes");
+        write_test_task(
+            team_dir,
+            "1",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            None,
+        );
+        let mut task = read_json::<TeamTask>(&task_path(team_dir, "1")).expect("task");
+        task.updated_at = "2026-05-08T06:41:31Z".to_string();
+        write_json_atomic(&task_path(team_dir, "1"), &task).expect("rewrite task");
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        write_json_atomic(
+            &wait_path(team_dir, "wait-1"),
+            &TeamWait {
+                id: "wait-1".to_string(),
+                title: "remote runtime package".to_string(),
+                owner: Some("engineering".to_string()),
+                task_id: Some("1".to_string()),
+                node: Some("remote".to_string()),
+                condition: "remote node writes manifest".to_string(),
+                status: TeamWaitStatus::Waiting,
+                progress: "/work/package/MANIFEST.sha256".to_string(),
+                evidence: Some("/work/package".to_string()),
+                created_at: "2026-05-08T06:41:31Z".to_string(),
+                updated_at: "2026-05-08T06:41:31Z".to_string(),
+            },
+        )
+        .expect("write wait");
+
+        let config = load_config(team_dir).expect("config");
+        let mut last_watchdog = Instant::now() - Duration::from_secs(61);
+        let mut warned = HashSet::new();
+        maybe_warn_unattended_tasks(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut last_watchdog,
+            &mut warned,
+            Duration::from_secs(60),
+            TeamPromptLanguage::En,
+        )
+        .expect("watchdog");
+
+        let lead_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "lead")).expect("lead mailbox");
+        assert!(lead_messages.iter().any(|message| {
+            message.message.contains("Wait node watchdog")
+                && message.message.contains("wait-1")
+                && message.message.contains("node `remote`")
+        }));
+        let owner_messages = read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering"))
+            .expect("engineering mailbox");
+        assert!(
+            owner_messages
+                .iter()
+                .any(|message| message.message.contains("Wait node watchdog"))
+        );
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "wait_node_unavailable_attention"
+                && event.data.get("wait").and_then(|value| value.as_str()) == Some("wait-1")
+                && event.data.get("reason").and_then(|value| value.as_str()) == Some("node_stale")
         }));
     }
 
@@ -24080,6 +27752,124 @@ authoritative_predecessor:
         )
         .expect("after ack prompt");
         assert!(after_ack_ids.is_empty());
+    }
+
+    #[test]
+    fn active_external_wait_detection_is_limited_to_running_external_waits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        let timestamp = now();
+        for wait in [
+            TeamWait {
+                id: "wait-deep".to_string(),
+                title: "deep_thinker strategy".to_string(),
+                owner: Some("research".to_string()),
+                task_id: Some("1".to_string()),
+                node: None,
+                condition: "MCP result returns".to_string(),
+                status: TeamWaitStatus::Running,
+                progress: "polling external tool".to_string(),
+                evidence: None,
+                created_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+            },
+            TeamWait {
+                id: "wait-complete".to_string(),
+                title: "deep_thinker completed".to_string(),
+                owner: Some("research".to_string()),
+                task_id: Some("1".to_string()),
+                node: None,
+                condition: "done".to_string(),
+                status: TeamWaitStatus::Completed,
+                progress: "artifact saved".to_string(),
+                evidence: None,
+                created_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+            },
+            TeamWait {
+                id: "wait-local".to_string(),
+                title: "local review".to_string(),
+                owner: Some("research".to_string()),
+                task_id: Some("1".to_string()),
+                node: None,
+                condition: "review finishes".to_string(),
+                status: TeamWaitStatus::Running,
+                progress: "reading notes".to_string(),
+                evidence: None,
+                created_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+            },
+        ] {
+            write_json_atomic(&wait_path(team_dir, &wait.id), &wait).expect("write wait");
+        }
+
+        let waits =
+            active_external_wait_ids_for_member(team_dir, "research").expect("active waits");
+        assert_eq!(waits, vec!["wait-deep".to_string()]);
+    }
+
+    #[test]
+    fn deferred_active_turn_context_is_reinjected_later() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let timestamp = now();
+        let run = AppServerMemberRun {
+            member: TeamMember {
+                name: "research".to_string(),
+                role: "research".to_string(),
+                status: MemberStatus::Running,
+                joined_at: timestamp.clone(),
+                thread_id: Some("thread-main".to_string()),
+                workspace_path: None,
+                node: None,
+            },
+            node_id: "local".to_string(),
+            cwd: team_dir.to_path_buf(),
+            thread_id: "thread-main".to_string(),
+            turn_id: "turn-main".to_string(),
+            completed: false,
+            failed: false,
+            standby_after_turn: false,
+            usage_category: "test".to_string(),
+            team_message_scan_offset: 0,
+            last_activity_at: Instant::now(),
+            last_activity_kind: "test".to_string(),
+            last_stale_notice_at: None,
+            retry_not_before: None,
+            side_context_ids: Vec::new(),
+        };
+        let messages = vec![MailMessage {
+            from: "lead".to_string(),
+            to: "research".to_string(),
+            message: "deep result が返ったら Docker 条件も見てください".to_string(),
+            timestamp,
+            read: false,
+        }];
+
+        let context_id = record_deferred_active_turn_context(
+            team_dir,
+            &run,
+            &messages,
+            &["wait-deep".to_string()],
+            TeamPromptLanguage::Ja,
+        )
+        .expect("defer")
+        .expect("context id");
+        let (prompt, ids) = append_side_channel_context_prompt(
+            team_dir,
+            "research",
+            "turn-next",
+            "次の turn".to_string(),
+            TeamPromptLanguage::Ja,
+        )
+        .expect("append context");
+
+        assert_eq!(ids, vec![context_id]);
+        assert!(prompt.contains("実行中 turn へ直接 steer せず保留されました"));
+        assert!(prompt.contains("Docker 条件"));
     }
 
     #[test]
@@ -24713,6 +28503,116 @@ authoritative_predecessor:
     }
 
     #[test]
+    fn completion_blocker_accepts_embedded_checklist_in_validation_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("evaluation").join("final_runtime_validation");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        fs::write(
+            artifact_dir.join("validation_report.md"),
+            "# Runtime package validation report\n\nverdict: PASS_WITH_WARNINGS\n\nTEAM_COMPLETION_CHECKLIST:\n- artifacts: validation_report.md; claim_evidence_review.md; manifest_validation_log.md; sha256_manifest.txt\n- verification: sha256sum -c sha256_manifest.txt rc=0; canonical evidence job-13 Completed exit=0\n- messages_sent: lead and audit\n- consumers_notified: lead and audit\n- blockers_or_limits: no active blocker; warnings recorded\n",
+        )
+        .expect("validation report");
+        fs::write(
+            artifact_dir.join("claim_evidence_review.md"),
+            "# claim evidence review\n",
+        )
+        .expect("claim evidence");
+        fs::write(
+            artifact_dir.join("manifest_validation_log.md"),
+            "# manifest validation\nrc=0\n",
+        )
+        .expect("manifest validation");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "validation_report.md",
+                "claim_evidence_review.md",
+                "manifest_validation_log.md",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::write(artifact_dir.join("sha256_manifest.txt"), manifest.stdout).expect("manifest");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "quality".to_string(),
+                note: "Task44 final runtime validation artifacts".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "44",
+            Some("quality"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("handoff complete"),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "44")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
+    }
+
+    #[test]
+    fn completion_blocker_rejects_formal_handoff_task_without_output_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "52",
+            Some("audit"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("Worker exited successfully."),
+        );
+        let mut task = read_json::<TeamTask>(&task_path(team_dir, "52")).expect("task");
+        task.subject = "Audit next-cycle plan and produce PASS/WARN/FAIL, TEAM_COMPLETION_CHECKLIST, sha256_manifest.txt, and manifest check log.".to_string();
+        write_json_atomic(&task_path(team_dir, "52"), &task).expect("write task");
+        let task = read_json::<TeamTask>(&task_path(team_dir, "52")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker")
+            .expect("missing output path should block formal handoff completion");
+
+        assert!(issue.contains("no task-specific local or node-side output package path"));
+    }
+
+    #[test]
+    fn completion_blocker_accepts_subject_declared_remote_output_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "10",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some(
+                "Candidate package complete. TEAM_COMPLETION_CHECKLIST present; sha256_manifest.txt verified with sha256sum -c rc=0.",
+            ),
+        );
+        let mut task = read_json::<TeamTask>(&task_path(team_dir, "10")).expect("task");
+        task.subject = "Produce final handoff with TEAM_COMPLETION_CHECKLIST, sha256_manifest.txt, and sha256sum -c. 出力 root は /workspace/team-20260511115343/candidate1_visual_state_consistency とし、最終 handoff に含める。".to_string();
+        write_json_atomic(&task_path(team_dir, "10"), &task).expect("write task");
+        let task = read_json::<TeamTask>(&task_path(team_dir, "10")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
+    }
+
+    #[test]
     fn completion_blocker_rejects_pending_checklist_fields() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -24762,6 +28662,68 @@ authoritative_predecessor:
             .expect("pending checklist should block completion");
 
         assert!(issue.contains("pending/unresolved"));
+    }
+
+    #[test]
+    fn completion_blocker_allows_pending_language_in_blockers_or_limits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("audit").join("task9_next_cycle_plan_audit");
+        fs::create_dir_all(artifact_dir.join("logs")).expect("artifact dir");
+        fs::write(
+            artifact_dir.join("reports_next_cycle_plan_audit.md"),
+            "# audit\n",
+        )
+        .expect("report");
+        fs::write(artifact_dir.join("audit_status.json"), "{}\n").expect("json");
+        fs::write(
+            artifact_dir.join("logs").join("sha256_manifest_check.log"),
+            "sha256sum -c rc=0\n",
+        )
+        .expect("check log");
+        fs::write(
+            artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: reports_next_cycle_plan_audit.md; audit_status.json; logs/sha256_manifest_check.log\n- verification: sha256sum -c sha256_manifest.txt rc=0\n- messages_sent: lead and all\n- consumers_notified: lead and all\n- blockers_or_limits: Candidate 2 remains blocked pending separate authorization; no active blocker for this handoff\n",
+        )
+        .expect("checklist");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "reports_next_cycle_plan_audit.md",
+                "audit_status.json",
+                "logs/sha256_manifest_check.log",
+                "TEAM_COMPLETION_CHECKLIST.md",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::write(artifact_dir.join("sha256_manifest.txt"), manifest.stdout).expect("manifest");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "audit".to_string(),
+                note: "Task52 repair audit package".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "52",
+            Some("audit"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("handoff complete"),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "52")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
+        assert!(handoff_file_kind("sha256_manifest_check.log").is_some());
     }
 
     #[test]
@@ -25603,6 +29565,7 @@ authoritative_predecessor:
                 completed: false,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "test".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now(),
                 last_activity_kind: "turn_started".to_string(),
@@ -25712,6 +29675,91 @@ authoritative_predecessor:
     }
 
     #[test]
+    fn continuation_detection_accepts_continue_iterating_prompt() {
+        assert!(team_goal_requests_continuation(
+            "Continue iterating: research/planning -> Docker/build -> container experiment -> evaluation/audit -> next action."
+        ));
+        assert!(team_goal_requests_continuation(
+            "Keep iterating until a real blocker requiring user input appears."
+        ));
+        assert!(team_goal_requests_continuation(
+            "自動研究として phase0.md と phase1.md を使い、deep_thinker の結果を待ってから ssh saitou 上で Dockerfile を作り、container 内で実験を繰り返す。"
+        ));
+        assert!(!team_goal_requests_continuation(
+            "Run one bounded review and stop for user approval."
+        ));
+    }
+
+    #[test]
+    fn autoresearch_goal_gets_explicit_loop_policy_in_prompts() {
+        let now = now();
+        let lead = TeamMember {
+            name: "lead".to_string(),
+            role: "lead".to_string(),
+            status: MemberStatus::Online,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let research = TeamMember {
+            name: "research_planning".to_string(),
+            role: "research".to_string(),
+            status: MemberStatus::Online,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let config = TeamConfig {
+            version: 1,
+            id: "team-autoresearch-policy".to_string(),
+            goal: "自動研究: /home/yukimaru/research_prompt/phase0.md と /home/yukimaru/research_prompt/phase1.md を使い、deep_thinker/deep_researcher、ssh saitou Dockerfile build、container 実験、結果を見て次実験を永遠に繰り返す。".to_string(),
+            lead: "lead".to_string(),
+            members: vec![lead.clone(), research.clone()],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let task = TeamTask {
+            id: "1".to_string(),
+            subject: "phase0 scans".to_string(),
+            description: "Run Fixed-4 + Flexible-2 scans and save prompt/result artifacts."
+                .to_string(),
+            owner: Some("research_planning".to_string()),
+            status: TaskStatus::InProgress,
+            depends_on: Vec::new(),
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        let worker_prompt = build_worker_prompt(&config, std::slice::from_ref(&task), &research);
+        assert!(worker_prompt.contains("Autoresearch loop policy"));
+        assert!(worker_prompt.contains("Fixed-4 + Flexible-2"));
+        assert!(worker_prompt.contains("container-internal department"));
+        assert!(worker_prompt.contains("Do not treat the loop as done"));
+
+        let lead_prompt = build_app_server_lead_prompt(
+            &config,
+            &[task],
+            &lead,
+            Path::new("/tmp/codex"),
+            TeamPromptLanguage::En,
+        );
+        assert!(lead_prompt.contains("Autoresearch loop policy"));
+        assert!(lead_prompt.contains("Environment phase"));
+        assert!(lead_prompt.contains("Runtime phase"));
+        assert!(lead_prompt.contains("Reflection phase"));
+
+        let design_prompt =
+            build_lead_department_design_prompt(&config.goal, &[], TeamPromptLanguage::En);
+        assert!(design_prompt.contains("Additional constraints for autoresearch goals"));
+        assert!(design_prompt.contains("local research/planning department"));
+        assert!(design_prompt.contains("saitou"));
+    }
+
+    #[test]
     fn lead_proposal_collection_ignores_resolved_old_signals() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -25817,7 +29865,7 @@ authoritative_predecessor:
         write_test_task(
             team_dir,
             "1",
-            Some("research"),
+            Some("engineering"),
             TaskStatus::InProgress,
             Vec::new(),
             None,
@@ -25834,6 +29882,7 @@ authoritative_predecessor:
                 completed: true,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "test".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now(),
                 last_activity_kind: "usage_limited".to_string(),
@@ -25862,6 +29911,108 @@ authoritative_predecessor:
             events
                 .iter()
                 .any(|event| event.event == "lead_autonomy_tick_suppressed")
+        );
+    }
+
+    #[test]
+    fn token_usage_panel_groups_latest_turn_usage_by_feature() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        let member = TeamMember {
+            name: "research".to_string(),
+            role: "research".to_string(),
+            status: MemberStatus::Running,
+            joined_at: now(),
+            thread_id: Some("thread-1".to_string()),
+            workspace_path: None,
+            node: None,
+        };
+        let run = AppServerMemberRun {
+            member: member.clone(),
+            node_id: "local".to_string(),
+            cwd: team_dir.to_path_buf(),
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed: false,
+            failed: false,
+            standby_after_turn: false,
+            usage_category: "lead_tick".to_string(),
+            team_message_scan_offset: 0,
+            last_activity_at: Instant::now(),
+            last_activity_kind: "turn_started".to_string(),
+            last_stale_notice_at: None,
+            retry_not_before: None,
+            side_context_ids: Vec::new(),
+        };
+        let mut active = HashMap::new();
+        active.insert(member.name.clone(), run);
+        let mut thread_to_member = HashMap::new();
+        thread_to_member.insert(thread_key("local", "thread-1"), member.name.clone());
+        let side_replies = HashMap::new();
+
+        for total in [10, 15, 15] {
+            record_token_usage_update(
+                team_dir,
+                "local",
+                ThreadTokenUsageUpdatedNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    token_usage: codex_app_server_protocol::ThreadTokenUsage {
+                        total: TokenUsageBreakdown {
+                            total_tokens: total,
+                            input_tokens: total - 4,
+                            cached_input_tokens: 2,
+                            output_tokens: 4,
+                            reasoning_output_tokens: 0,
+                        },
+                        last: TokenUsageBreakdown {
+                            total_tokens: total,
+                            input_tokens: total - 4,
+                            cached_input_tokens: 2,
+                            output_tokens: 4,
+                            reasoning_output_tokens: 0,
+                        },
+                        model_context_window: Some(128_000),
+                    },
+                },
+                &active,
+                &side_replies,
+                &thread_to_member,
+            )
+            .expect("record usage");
+        }
+
+        let html = render_token_usage_panel(team_dir);
+        assert!(html.contains("lead_tick"));
+        assert!(html.contains("research"));
+        assert!(html.contains(">25</"));
+        assert!(!html.contains(">40</"));
+    }
+
+    #[test]
+    fn usage_category_for_messages_identifies_system_triggers() {
+        let base = MailMessage {
+            from: "system".to_string(),
+            to: "lead".to_string(),
+            message: "Lead autonomy tick: inspect work".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[base]),
+            "lead_tick"
+        );
+
+        let user = MailMessage {
+            from: "user".to_string(),
+            to: "lead".to_string(),
+            message: "please continue".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("lead_reactive", &[user]),
+            "user_message"
         );
     }
 
@@ -26105,6 +30256,7 @@ authoritative_predecessor:
                 completed: false,
                 failed: false,
                 standby_after_turn: false,
+                usage_category: "test".to_string(),
                 team_message_scan_offset: 0,
                 last_activity_at: Instant::now() - Duration::from_secs(900),
                 last_activity_kind: "turn_started".to_string(),
