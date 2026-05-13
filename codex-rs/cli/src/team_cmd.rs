@@ -42,6 +42,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -11020,6 +11021,9 @@ fn inspect_handoff_checklists(stats: &HandoffArtifactStats) -> Result<Option<Str
             if field != "blockers_or_limits:"
                 && checklist_value_has_unresolved_marker(value.as_deref())
             {
+                if field == "verification:" && !stats.manifest_paths.is_empty() {
+                    continue;
+                }
                 return Ok(Some(format!(
                     "{} has pending/unresolved `{field}` field",
                     checklist_path.display()
@@ -11246,6 +11250,9 @@ fn handoff_text_file_contains_completion_checklist(path: &Path) -> Result<bool> 
         return Ok(false);
     };
     let lower = name.to_ascii_lowercase();
+    if lower.contains("transcript") || lower.contains("log") {
+        return Ok(false);
+    }
     if !(lower.ends_with(".md") || lower.ends_with(".txt")) {
         return Ok(false);
     }
@@ -11254,9 +11261,10 @@ fn handoff_text_file_contains_completion_checklist(path: &Path) -> Result<bool> 
         return Ok(false);
     }
     let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(content
+    let trimmed = content.trim_start_matches('\u{feff}').trim_start();
+    Ok(trimmed
         .to_ascii_lowercase()
-        .contains("team_completion_checklist:"))
+        .starts_with("team_completion_checklist:"))
 }
 
 enum HandoffFileKind {
@@ -11725,7 +11733,14 @@ fn message_mentions_lead_proposal_resolution(message: &str) -> bool {
             || normalized.contains("addressed")
             || normalized.contains("no separate action")
             || normalized.contains("reject")
-            || normalized.contains("premature"))
+            || normalized.contains("premature")
+            || normalized.contains("採用")
+            || normalized.contains("却下")
+            || normalized.contains("対応済")
+            || normalized.contains("対応しました")
+            || normalized.contains("別対応不要")
+            || normalized.contains("追加対応不要")
+            || normalized.contains("早すぎ"))
 }
 
 fn is_real_lead_proposal_message(message: &MailMessage) -> bool {
@@ -11833,6 +11848,12 @@ fn collect_next_action_candidate_files(dir: &Path, depth: usize, candidates: &mu
 }
 
 fn is_next_action_candidate_file(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == OsStr::new("live_messages"))
+    {
+        return false;
+    }
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -12302,6 +12323,27 @@ fn maybe_send_department_heartbeats(
                     "node": member_node_id(member),
                     "reason": "no_open_tasks",
                     "status": format!("{:?}", member.status),
+                }),
+            )?;
+            continue;
+        }
+        if active_run {
+            let entry = heartbeats
+                .entry(member.name.clone())
+                .or_insert(now_instant - interval);
+            if now_instant.duration_since(*entry) < interval {
+                continue;
+            }
+            *entry = now_instant;
+            append_event(
+                team_dir,
+                "department_heartbeat_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "active_turn_in_progress",
+                    "owned_open_tasks": member_tasks.len(),
                 }),
             )?;
             continue;
@@ -25432,6 +25474,98 @@ method_package:
     }
 
     #[test]
+    fn next_action_signals_ignore_live_message_transcripts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let live_dir = team_dir.join("live_messages");
+        fs::create_dir_all(&live_dir).expect("live dir");
+        fs::write(
+            live_dir.join("audit.side.md"),
+            "Next action: stale side-channel conversation should not drive lead ticks.\n",
+        )
+        .expect("write side transcript");
+
+        let audit_dir = team_dir.join("audit");
+        fs::create_dir_all(&audit_dir).expect("audit dir");
+        fs::write(
+            audit_dir.join("final_audit.md"),
+            "Recommended next action: evaluate the fresh runtime package.\n",
+        )
+        .expect("write audit");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: audit_dir.display().to_string(),
+                owner: "quality".to_string(),
+                note: "audit artifacts".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+
+        let signals =
+            collect_recent_next_action_signals(team_dir, 4).expect("collect next actions");
+
+        assert_eq!(signals.len(), 1);
+        assert!(signals[0].contains("final_audit.md"));
+        assert!(!signals[0].contains("audit.side.md"));
+    }
+
+    #[test]
+    fn lead_proposal_resolution_accepts_japanese_adoption_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_jsonl_atomic(
+            &mailbox_path(team_dir, "lead"),
+            &[
+                MailMessage {
+                    from: "quality".to_string(),
+                    to: "lead".to_string(),
+                    message:
+                        "LEAD_PROPOSAL: task 7 の成果物を pull して評価 task を作ってください。"
+                            .to_string(),
+                    timestamp: "2026-05-13T16:18:01+09:00".to_string(),
+                    read: false,
+                },
+                MailMessage {
+                    from: "engineering".to_string(),
+                    to: "lead".to_string(),
+                    message: "LEAD_PROPOSAL: task 8 完了後に audit task を作ってください。"
+                        .to_string(),
+                    timestamp: "2026-05-13T16:18:03+09:00".to_string(),
+                    read: false,
+                },
+            ],
+        )
+        .expect("write mailbox");
+        let config = load_config(team_dir).expect("load config");
+        append_jsonl(
+            &team_dir.join("events.jsonl"),
+            &Event {
+                event: "message_sent",
+                timestamp: "2026-05-13T16:18:02+09:00".to_string(),
+                team: &config.id,
+                data: serde_json::json!({
+                "from": "lead",
+                "to": ["evaluation"],
+                "message": "LEAD_PROPOSAL は採用しました。task 8 と wait-11 を作成します。",
+                "source": "team_relay",
+                }),
+            },
+        )
+        .expect("append resolution");
+
+        let proposals =
+            collect_recent_lead_proposals(team_dir, "lead", 4).expect("collect proposals");
+
+        assert_eq!(proposals.len(), 1);
+        assert!(proposals[0].contains("@engineering"));
+        assert!(!proposals[0].contains("@quality"));
+    }
+
+    #[test]
     fn remote_codex_dest_assignment_expands_home_on_remote() {
         let assignment = remote_codex_dest_assignment("$HOME/.codex");
 
@@ -27225,6 +27359,100 @@ authoritative_predecessor:
                     .get("active_turn")
                     .and_then(|value| value.as_bool())
                     == Some(true)
+        }));
+    }
+
+    #[test]
+    fn heartbeat_skips_busy_department_with_active_turn_and_open_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let now = now();
+        let lead = TeamMember {
+            name: "lead".to_string(),
+            role: "lead".to_string(),
+            status: MemberStatus::Standby,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let audit = TeamMember {
+            name: "audit".to_string(),
+            role: "audit".to_string(),
+            status: MemberStatus::Online,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let config = TeamConfig {
+            version: 1,
+            id: "team-busy-heartbeat".to_string(),
+            goal: "avoid interrupting active department work".to_string(),
+            lead: "lead".to_string(),
+            members: vec![lead, audit.clone()],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        write_test_task(
+            team_dir,
+            "9",
+            Some("audit"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("final audit running"),
+        );
+        let mut active = HashMap::new();
+        active.insert(
+            "audit".to_string(),
+            AppServerMemberRun {
+                member: audit,
+                node_id: "local".to_string(),
+                cwd: team_dir.to_path_buf(),
+                thread_id: "thread-audit".to_string(),
+                turn_id: "turn-audit".to_string(),
+                completed: false,
+                failed: false,
+                standby_after_turn: false,
+                usage_category: "test".to_string(),
+                team_message_scan_offset: 0,
+                last_activity_at: Instant::now(),
+                last_activity_kind: "agent_message_delta".to_string(),
+                last_stale_notice_at: None,
+                retry_not_before: None,
+                side_context_ids: Vec::new(),
+            },
+        );
+
+        let mut heartbeats = HashMap::new();
+        maybe_send_department_heartbeats(
+            team_dir,
+            &config,
+            &active,
+            &mut heartbeats,
+            &HashMap::new(),
+            Duration::from_secs(60),
+            TeamPromptLanguage::Ja,
+        )
+        .expect("heartbeat");
+
+        let audit_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "audit")).expect("mailbox");
+        assert!(audit_messages.is_empty());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "department_heartbeat_skipped"
+                && event.data.get("reason").and_then(|value| value.as_str())
+                    == Some("active_turn_in_progress")
+                && event
+                    .data
+                    .get("owned_open_tasks")
+                    .and_then(|value| value.as_u64())
+                    == Some(1)
         }));
     }
 
@@ -29089,6 +29317,144 @@ authoritative_predecessor:
             .expect("pending checklist should block completion");
 
         assert!(issue.contains("pending/unresolved"));
+    }
+
+    #[test]
+    fn completion_blocker_accepts_stale_verification_text_when_manifest_verifies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("evaluation").join("iteration2");
+        fs::create_dir_all(artifact_dir.join("reports")).expect("artifact dir");
+        fs::write(
+            artifact_dir.join("reports").join("evaluation_report.md"),
+            "# evaluation\n",
+        )
+        .expect("report");
+        fs::write(artifact_dir.join("summary.json"), "{}\n").expect("json");
+        fs::write(
+            artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: evaluation/iteration2\n- verification: evaluation manifest check to be recorded in final handoff after manifest generation\n- messages_sent: lead and audit\n- consumers_notified: lead and audit\n- blockers_or_limits: none\n",
+        )
+        .expect("checklist");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "reports/evaluation_report.md",
+                "summary.json",
+                "TEAM_COMPLETION_CHECKLIST.md",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::create_dir_all(artifact_dir.join("manifests")).expect("manifests dir");
+        fs::write(
+            artifact_dir.join("manifests").join("MANIFEST.sha256"),
+            manifest.stdout,
+        )
+        .expect("manifest");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "quality".to_string(),
+                note: "Task48 iteration2 evaluation package".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "48",
+            Some("quality"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("handoff complete"),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "48")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
+    }
+
+    #[test]
+    fn completion_blocker_does_not_treat_transcript_mentions_as_checklists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("audit").join("iteration2");
+        fs::create_dir_all(artifact_dir.join("reports")).expect("reports dir");
+        fs::create_dir_all(artifact_dir.join("ledgers")).expect("ledgers dir");
+        fs::create_dir_all(artifact_dir.join("transcripts")).expect("transcripts dir");
+        fs::write(
+            artifact_dir
+                .join("reports")
+                .join("iteration2_final_audit_report.md"),
+            "# final audit\n",
+        )
+        .expect("report");
+        fs::write(
+            artifact_dir
+                .join("ledgers")
+                .join("iteration2_gate_ledger.json"),
+            "{}\n",
+        )
+        .expect("ledger");
+        fs::write(
+            artifact_dir
+                .join("transcripts")
+                .join("audit_iteration2_command_transcript.md"),
+            "# command transcript\n\nquoted output mentioned TEAM_COMPLETION_CHECKLIST:\n- artifacts: none\n",
+        )
+        .expect("transcript");
+        fs::write(
+            artifact_dir.join("TEAM_COMPLETION_CHECKLIST.md"),
+            "TEAM_COMPLETION_CHECKLIST:\n- artifacts: audit/iteration2\n- verification: sha256sum -c manifests/MANIFEST.sha256 rc=0\n- messages_sent: lead and all\n- consumers_notified: lead and all\n- blockers_or_limits: PASS_WITH_LIMITS\n",
+        )
+        .expect("checklist");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "reports/iteration2_final_audit_report.md",
+                "ledgers/iteration2_gate_ledger.json",
+                "transcripts/audit_iteration2_command_transcript.md",
+                "TEAM_COMPLETION_CHECKLIST.md",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::create_dir_all(artifact_dir.join("manifests")).expect("manifests dir");
+        fs::write(
+            artifact_dir.join("manifests").join("MANIFEST.sha256"),
+            manifest.stdout,
+        )
+        .expect("manifest");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "audit".to_string(),
+                note: "Task9 final audit package".to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "9",
+            Some("audit"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("handoff complete"),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "9")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
     }
 
     #[test]
