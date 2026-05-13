@@ -21803,6 +21803,7 @@ Coordinate toward the user's current task, not toward an implicit endless improv
 
 Commands:
 - "{codex}" team status --team "{team_id}"
+- "{codex}" team autoresearch-audit --team "{team_id}" --write
 - "{codex}" team node --team "{team_id}" list
 - "{codex}" team node --team "{team_id}" inspect [node-id]
 - "{codex}" team node --team "{team_id}" add <node-id> --kind manual --url ws://127.0.0.1:<forwarded-port> --note "<site/purpose>"
@@ -21846,6 +21847,7 @@ Current-run source policy: team mailbox messages, current tasks, ownerships, and
 External dependency and credential policy: for tasks involving public/open-source models, datasets, packages, APIs, browsers, services, or other external artifacts, require the responsible department to verify transitive runtime accessibility before accepting the choice. A top-level open-source license is not enough if a required checkpoint, submodel, dataset, browser binary, package, or service is gated/private or returns 401/403 in this environment. If a run hits unprovided credentials, manual license acceptance, or a gated dependency, treat that as a real blocker: preserve exact logs and config paths, keep QA blocked, and resume research/ops to either find a documented public/local fallback or choose another current runnable option. Do not mark the overall goal complete with partial artifacts, stale outputs, or an image that cannot run end to end.
 
 External prompt/template compliance policy: when the user goal, a skill, or a department mission references an external prompt/template/spec file such as `phase0.md`, `phase1.md`, `SKILL.md`, a benchmark protocol, or an evaluation contract, do not treat "read it" or "used it for planning" as completion. First turn that file's required outputs, numbered sections, named scans, gates, and deliverables into explicit team tasks, waits, ownerships, and artifact paths. If the template asks for multiple independent prompts/scans/experiments, each one needs its own prompt artifact, result artifact, provenance, and completion gate; a meta-plan describing those prompts is not a substitute for the actual results. A downstream synthesis, Docker build, runtime experiment, or next cycle may depend only on the completed result artifacts, not on the existence of the plan. If you discover after the fact that a template requirement was only planned or partially substituted by fallback work, create a compliance matrix, mark the affected work as WARN or blocked as appropriate, and create repair tasks/waits before proceeding.
+For autoresearch teams, run `team autoresearch-audit --team "{team_id}" --write` before accepting a phase0/phase1/runtime/evaluation/audit iteration as clean. Treat WARN/FAIL rows as real repair inputs, not as cosmetic notes, unless you record the exact user-input blocker.
 For research scan evidence, require more than a URL list before accepting `confirmed` claims. The scan owner should save local source evidence when practical: fetched HTML/PDF/API metadata, MCP/tool response snippets with request ids, or command transcripts containing URL, timestamp, command, cwd, and rc/exit. If the team only has a URL plus a model-written summary, treat it as weak provenance and require `likely/speculative/unknown` or a follow-up evidence fetch before downstream synthesis relies on it.
 Completion rejection policy: if `team task set ... --status completed` is rejected because a required output package is incomplete, treat that rejection as authoritative. Do not evade it by setting the task to `review`, changing status wording, or declaring practical completion in a message. Fix the missing checklist/manifest/ledger/report/evidence package and retry, or leave a real blocked task with exact missing artifacts and an owner.
 
@@ -21927,6 +21929,7 @@ New message(s) arrived for lead while the lead turn was idle:
 
 Use the team CLI if you need context:
 - "{codex}" team status --team "{team_id}"
+- "{codex}" team autoresearch-audit --team "{team_id}" --write
 - "{codex}" team node --team "{team_id}" list
 - "{codex}" team node --team "{team_id}" inspect [node-id]
 - "{codex}" team node --team "{team_id}" add <node-id> --kind ssh --host <ssh-host> --cwd <remote-cwd>
@@ -23413,6 +23416,8 @@ mod tests {
         assert!(lead_prompt.contains("create a compliance matrix"));
         assert!(lead_prompt.contains("require more than a URL list"));
         assert!(lead_prompt.contains("Completion rejection policy"));
+        assert!(lead_prompt.contains("team autoresearch-audit --team"));
+        assert!(lead_prompt.contains("Treat WARN/FAIL rows as real repair inputs"));
     }
 
     fn write_test_job(
