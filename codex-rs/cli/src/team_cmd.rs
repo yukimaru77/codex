@@ -12754,6 +12754,10 @@ fn record_deferred_active_turn_context(
     Ok(Some(id))
 }
 
+fn active_turn_messages_are_deferrable_system_nudges(messages: &[MailMessage]) -> bool {
+    !messages.is_empty() && messages.iter().all(|message| message.from == "system")
+}
+
 async fn steer_new_team_messages(
     node_clients: &mut HashMap<String, TeamAppServerNodeClient>,
     team_dir: &Path,
@@ -12937,6 +12941,30 @@ async fn steer_new_team_messages(
                     "messages": messages.len(),
                     "waits": active_external_waits,
                     "side_channel_reply_started": side_started,
+                    "deferred_context": context_id,
+                }),
+            )?;
+            acknowledge_mailbox_delivery(
+                team_dir,
+                mailbox_counts,
+                &member_name,
+                pending.seen,
+                messages.len(),
+            )?;
+            continue;
+        }
+        if active_turn_messages_are_deferrable_system_nudges(&messages) {
+            let context_id =
+                record_deferred_active_turn_context(team_dir, &run, &messages, &[], language)?;
+            append_event(
+                team_dir,
+                "app_server_turn_steer_deferred_system_nudge",
+                serde_json::json!({
+                    "member": member_name,
+                    "node": run.node_id,
+                    "thread": run.thread_id,
+                    "turn": run.turn_id,
+                    "messages": messages.len(),
                     "deferred_context": context_id,
                 }),
             )?;
@@ -28685,6 +28713,41 @@ authoritative_predecessor:
         assert_eq!(ids, vec![context_id]);
         assert!(prompt.contains("実行中 turn へ直接 steer せず保留されました"));
         assert!(prompt.contains("Docker 条件"));
+    }
+
+    #[test]
+    fn active_turn_system_nudges_are_deferrable() {
+        let timestamp = now();
+        let system_messages = vec![
+            MailMessage {
+                from: "system".to_string(),
+                to: "lead".to_string(),
+                message: "Lead autonomy tick".to_string(),
+                timestamp: timestamp.clone(),
+                read: false,
+            },
+            MailMessage {
+                from: "system".to_string(),
+                to: "lead".to_string(),
+                message: "Department heartbeat".to_string(),
+                timestamp: timestamp.clone(),
+                read: false,
+            },
+        ];
+        assert!(active_turn_messages_are_deferrable_system_nudges(
+            &system_messages
+        ));
+
+        let user_messages = vec![MailMessage {
+            from: "user".to_string(),
+            to: "lead".to_string(),
+            message: "今すぐ方針を変えて".to_string(),
+            timestamp,
+            read: false,
+        }];
+        assert!(!active_turn_messages_are_deferrable_system_nudges(
+            &user_messages
+        ));
     }
 
     #[test]
