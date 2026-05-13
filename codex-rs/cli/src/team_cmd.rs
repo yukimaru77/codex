@@ -5096,9 +5096,13 @@ fn format_status_text(team_dir: &Path) -> Result<String> {
     auto_promote_dependency_waits(team_dir)?;
     let config = load_config(team_dir)?;
     let tasks = load_tasks(team_dir)?;
+    let waits = load_waits(team_dir)?;
     let mut out = String::new();
     out.push_str(&format!("Team: {}\n", config.id));
     out.push_str(&format!("Goal: {}\n", compact_one_line(&config.goal, 500)));
+    out.push_str(&format_runtime_status_text(
+        team_dir, &config, &tasks, &waits,
+    ));
     out.push_str(&format!("Members: {}\n", config.members.len()));
     for member in &config.members {
         let task_status = member_task_status_summary(&tasks, &member.name);
@@ -5124,7 +5128,6 @@ fn format_status_text(team_dir: &Path) -> Result<String> {
     if !cooldowns.is_empty() {
         out.push_str(&cooldowns);
     }
-    let waits = load_waits(team_dir)?;
     let open_waits = waits.iter().filter(|wait| wait.status.is_open()).count();
     if open_waits > 0 {
         out.push_str(&format!(
@@ -5143,6 +5146,54 @@ fn format_status_text(team_dir: &Path) -> Result<String> {
         out.push_str(&format!("Ownerships:\n{ownerships}"));
     }
     Ok(out)
+}
+
+fn format_runtime_status_text(
+    team_dir: &Path,
+    config: &TeamConfig,
+    tasks: &[TeamTask],
+    waits: &[TeamWait],
+) -> String {
+    let status = team_run_status_for_dir(team_dir, &config.id);
+    let run_pid = read_team_run_pid(team_dir)
+        .map(|pid| {
+            let state = if process_alive(pid) { "alive" } else { "dead" };
+            format!(" run_pid={pid}({state})")
+        })
+        .unwrap_or_default();
+    let ui_pid = team_dir
+        .parent()
+        .and_then(|root| read_ui_team_pid(root, &config.id))
+        .map(|pid| {
+            let state = if process_alive(pid) { "alive" } else { "dead" };
+            format!(" ui_pid={pid}({state})")
+        })
+        .unwrap_or_default();
+    let open_tasks = tasks
+        .iter()
+        .filter(|task| {
+            !matches!(
+                task.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            )
+        })
+        .count();
+    let open_waits = waits.iter().filter(|wait| wait.status.is_open()).count();
+    let mut out = format!(
+        "Runtime: {}{}{} open_tasks={} open_waits={}\n",
+        status.label(),
+        run_pid,
+        ui_pid,
+        open_tasks,
+        open_waits
+    );
+    if matches!(status, UiTeamRunStatus::Stopped) && (open_tasks > 0 || open_waits > 0) {
+        out.push_str(&format!(
+            "Runtime warning: open work remains but the team runtime is stopped. Resume with: codex team resume --team {} --dangerously-bypass-approvals-and-sandbox\n",
+            config.id
+        ));
+    }
+    out
 }
 
 fn format_tasks_text(team_dir: &Path) -> Result<String> {
@@ -13459,54 +13510,7 @@ fn list_teams(root: &Path) -> Result<()> {
 }
 
 fn print_status(team_dir: &Path) -> Result<()> {
-    let config = load_config(team_dir)?;
-    let tasks = load_tasks(team_dir)?;
-    println!("Team: {}", config.id);
-    println!("Goal: {}", compact_one_line(&config.goal, 500));
-    println!("Members: {}", config.members.len());
-    for member in &config.members {
-        let task_status = member_task_status_summary(&tasks, &member.name);
-        let mail = mailbox_unread_counts(team_dir, &member.name)?;
-        println!(
-            "  {} ({}) session={:?} tasks={} node={} unread={} direct={}",
-            member.name,
-            member.role,
-            member.status,
-            task_status,
-            member.node.as_deref().unwrap_or("local"),
-            mail.unread,
-            mail.direct_unread
-        );
-    }
-    let mut nodes = load_nodes(team_dir)?;
-    ensure_local_node(&mut nodes);
-    println!("Nodes: {}", nodes.len());
-    for node in nodes {
-        println!("{}", format_node_status_line(&node));
-    }
-    let cooldowns = format_usage_limit_cooldowns(team_dir, &config)?;
-    if !cooldowns.is_empty() {
-        print!("{cooldowns}");
-    }
-    let waits = load_waits(team_dir)?;
-    let open_waits = waits.iter().filter(|wait| wait.status.is_open()).count();
-    if open_waits > 0 {
-        println!("Waits: {open_waits} open, {} total", waits.len());
-        for wait in waits.iter().filter(|wait| wait.status.is_open()).take(12) {
-            println!("{}", format_wait_line(wait));
-        }
-    }
-    println!("Tasks: {}", format_task_status_counts(&tasks));
-    for task in &tasks {
-        print_task(task);
-    }
-    let ownerships = load_ownerships(team_dir)?;
-    if !ownerships.is_empty() {
-        println!("Ownerships: {}", ownerships.len());
-        for ownership in ownerships {
-            print_ownership(&ownership);
-        }
-    }
+    print!("{}", format_status_text(team_dir)?);
     Ok(())
 }
 
@@ -14046,6 +14050,49 @@ fn handle_team_ui_request(
                 &[("team", team.as_str()), ("translation", language.as_str())],
             )?;
         }
+        ("POST", "/resume") => {
+            let form = parse_form(&request.body);
+            let team = form_value(&form, "team")?;
+            let team_dir = resolve_team_dir(root, Some(&team))?;
+            let config = load_config(&team_dir)?;
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .arg("team")
+                .arg("resume")
+                .arg("--team")
+                .arg(&config.id)
+                .arg("--dangerously-bypass-approvals-and-sandbox");
+            if let Some(language) = config.language {
+                command.arg("--language").arg(language.cli_value());
+            }
+            command.stdin(Stdio::null());
+            let log_path = root.join("ui-runs.log");
+            let log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .with_context(|| format!("open {}", log_path.display()))?;
+            let stderr = log.try_clone()?;
+            command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
+            let child = command.spawn().context("spawn team resume from UI")?;
+            write_ui_team_pid(root, &config.id, child.id())?;
+            redirect_team_ui(stream, Some(&config.id))?;
+        }
+        ("POST", "/stop") => {
+            let form = parse_form(&request.body);
+            let team = form_value(&form, "team")?;
+            stop_team_runtime(
+                root,
+                StopArgs {
+                    selector: TeamSelector {
+                        team: Some(team.clone()),
+                    },
+                    keep_local_app_server: false,
+                    no_remote_nodes: false,
+                },
+            )?;
+            redirect_team_ui(stream, Some(&team))?;
+        }
         ("POST", "/delete") => {
             let form = parse_form(&request.body);
             let team = form_value(&form, "team")?;
@@ -14566,6 +14613,11 @@ fn render_team_ui(
             .map(|dir| render_message_board(dir, &config.id, translation_language))
             .transpose()?
             .unwrap_or_default();
+        let run_status = selected_dir
+            .as_ref()
+            .map(|dir| team_run_status_for_dir(dir, &config.id))
+            .unwrap_or(UiTeamRunStatus::Unknown);
+        let run_controls = render_team_runtime_controls(&config.id, run_status);
         let lead_chat = selected_dir
             .as_ref()
             .map(|dir| render_lead_chat(dir, &config.id))
@@ -14584,6 +14636,7 @@ fn render_team_ui(
         let debug_timeline = render_debug_timeline_view(&config.id);
         format!(
             r#"<section><h2>{id}</h2><p>{goal}</p>
+{run_controls}
 <h3>Lead Chat</h3>{lead_chat}
 {realtime_view}
 {debug_timeline}
@@ -14596,6 +14649,7 @@ fn render_team_ui(
 <h3>Events</h3><pre>{events}</pre></section>"#,
             id = html_escape(&config.id),
             goal = html_escape(&config.goal),
+            run_controls = run_controls,
             lead_chat = lead_chat,
             realtime_view = realtime_view,
             debug_timeline = debug_timeline,
@@ -14632,6 +14686,9 @@ main{{padding:20px;overflow:auto}}
 .context-menu button:hover{{background:#ffebe9}}
 form{{display:grid;gap:10px;margin:12px 0;padding:12px;background:#fff;border:1px solid #d8dee4;border-radius:6px}}
 label{{display:grid;gap:4px}} input,textarea{{font:inherit;padding:8px;border:1px solid #c9d1d9;border-radius:4px}} button{{width:max-content;padding:8px 12px}}
+.runtime-card{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px;margin:12px 0}}
+.runtime-card .hint{{flex-basis:100%;margin:0;color:#59636e}}
+.inline-form{{display:inline-grid;margin:0;padding:0;border:0;background:transparent}}
 .dir-picker{{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px;margin:10px 0;max-height:260px;overflow:auto}}
 .dir-picker a{{display:block;padding:5px 0;color:#0969da;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .dir-current{{font-weight:600;word-break:break-all}}
@@ -15529,6 +15586,26 @@ fn render_debug_timeline_view(team_id: &str) -> String {
 <div class="dbg-status">loading</div>
 </section>"#,
         team = html_escape(team_id),
+    )
+}
+
+fn render_team_runtime_controls(team_id: &str, status: UiTeamRunStatus) -> String {
+    format!(
+        r#"<section class="runtime-card">
+<div><strong>Runtime</strong> <span class="run-state {class}">{label}</span></div>
+<form class="inline-form" method="post" action="/resume">
+  <input type="hidden" name="team" value="{team}">
+  <button type="submit">Resume Runtime</button>
+</form>
+<form class="inline-form" method="post" action="/stop" onsubmit="return confirm('Pause this team runtime? Team state is preserved.');">
+  <input type="hidden" name="team" value="{team}">
+  <button type="submit">Pause Runtime</button>
+</form>
+<p class="hint">Resume restarts the keep-alive team runtime from the preserved state. Pause stops local and node runtimes without deleting artifacts.</p>
+</section>"#,
+        team = html_escape(team_id),
+        class = status.css_class(),
+        label = status.label(),
     )
 }
 
@@ -16723,9 +16800,15 @@ fn set_running_members_to_standby_for_pause(team_dir: &Path) -> Result<()> {
 
 fn ui_team_run_status(root: &Path, team: &TeamConfig) -> UiTeamRunStatus {
     let team_dir = root.join(&team.id);
+    team_run_status_for_dir(&team_dir, &team.id)
+}
+
+fn team_run_status_for_dir(team_dir: &Path, team_id: &str) -> UiTeamRunStatus {
     let mut saw_pid = false;
     for pid in [
-        read_ui_team_pid(root, &team.id),
+        team_dir
+            .parent()
+            .and_then(|root| read_ui_team_pid(root, team_id)),
         read_team_run_pid(&team_dir),
     ]
     .into_iter()
@@ -24058,6 +24141,32 @@ mod tests {
 
         assert!(status.contains("Cooldowns:\n"));
         assert!(status.contains("lead usage_limit retry_in="));
+    }
+
+    #[test]
+    fn status_text_warns_when_runtime_stopped_with_open_work() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let team_dir = root.join("team-task-test");
+        write_test_config(&team_dir);
+        write_test_task(
+            &team_dir,
+            "1",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            None,
+        );
+        fs::write(team_run_pid_path(&team_dir), "999999\n").expect("run pid");
+
+        let status = format_status_text(&team_dir).expect("status");
+
+        assert!(status.contains("Runtime: runtime stopped run_pid=999999(dead)"));
+        assert!(status.contains("open_tasks=1"));
+        assert!(status.contains("Runtime warning: open work remains"));
+        assert!(status.contains(
+            "codex team resume --team team-task-test --dangerously-bypass-approvals-and-sandbox"
+        ));
     }
 
     #[test]
