@@ -902,12 +902,13 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         }
         Some(Subcommand::Team(team_cli)) => {
             if team_cli.is_interactive_entrypoint() {
-                let (team_shared_options, team_selector, team_language) =
+                let (team_shared_options, team_selector, team_language, team_idle_exit_after_sec) =
                     team_cli.into_interactive_parts();
                 let launch = team_cmd::launch_interactive_lead_team(
                     &team_shared_options,
                     team_selector.as_deref(),
                     team_language,
+                    team_idle_exit_after_sec,
                 )?;
                 eprintln!(
                     "Attached to team lead: {} ({})",
@@ -929,7 +930,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     None,
                     arg0_paths.clone(),
                 )
-                .await?;
+                .await;
+                if let Err(err) = team_cmd::detach_interactive_lead_team(&launch.team_dir) {
+                    eprintln!(
+                        "warning: failed to detach interactive team lead marker for {}: {err}",
+                        launch.team_id
+                    );
+                }
+                let exit_info = exit_info?;
                 handle_app_exit(exit_info)?;
                 return Ok(());
             }
@@ -1959,10 +1967,11 @@ mod tests {
             panic!("expected team subcommand");
         };
         assert!(team_cli.is_interactive_entrypoint());
-        let (shared, team, language) = team_cli.into_interactive_parts();
+        let (shared, team, language, idle_exit_after_sec) = team_cli.into_interactive_parts();
         assert!(shared.dangerously_bypass_approvals_and_sandbox);
         assert_eq!(team, None);
         assert_eq!(language, None);
+        assert_eq!(idle_exit_after_sec, 0);
     }
 
     #[test]
@@ -1973,10 +1982,11 @@ mod tests {
             panic!("expected team subcommand");
         };
         assert!(team_cli.is_interactive_entrypoint());
-        let (shared, team, language) = team_cli.into_interactive_parts();
+        let (shared, team, language, idle_exit_after_sec) = team_cli.into_interactive_parts();
         assert!(shared.dangerously_bypass_approvals_and_sandbox);
         assert_eq!(team.as_deref(), Some("team-123"));
         assert_eq!(language, None);
+        assert_eq!(idle_exit_after_sec, 0);
     }
 
     #[test]
@@ -1995,9 +2005,10 @@ mod tests {
             panic!("expected team subcommand");
         };
         assert!(team_cli.is_interactive_entrypoint());
-        let (_shared, team, language) = team_cli.into_interactive_parts();
+        let (_shared, team, language, idle_exit_after_sec) = team_cli.into_interactive_parts();
         assert_eq!(team.as_deref(), Some("team-123"));
         assert_eq!(language.map(|language| language.cli_value()), Some("ja"));
+        assert_eq!(idle_exit_after_sec, 0);
     }
 
     fn finalize_fork_from_args(args: &[&str]) -> TuiCli {

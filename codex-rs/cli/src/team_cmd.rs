@@ -42,8 +42,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
@@ -62,6 +65,12 @@ const CODEX_TEAM_HELPER_URL: &str =
     "https://raw.githubusercontent.com/yukimaru77/codex-team-tools/main/bin/codex-team";
 const MAX_DIRECT_DEVICE_AUTH_ATTEMPTS: usize = 2;
 const MAX_SIDE_CHANNEL_CONTEXTS_PER_PROMPT: usize = 8;
+const MAX_REACTIVE_PROMPT_MESSAGES: usize = 12;
+const MAX_REACTIVE_PROMPT_MESSAGE_CHARS: usize = 900;
+const MAX_RUNTIME_START_UNREAD_MAILBOX_MESSAGES: usize = 24;
+const MAX_RUNTIME_START_UNREAD_MAILBOX_TAIL_MESSAGES: usize = 12;
+const MAX_RUNTIME_START_UNREAD_MAILBOX_SUMMARY_MESSAGES: usize = 8;
+const MIN_ACTIVE_TURN_STEER_INTERVAL_SECS: u64 = 30;
 const MAX_APP_SERVER_THREAD_TOTAL_TOKENS: i64 = 180_000;
 const MAX_APP_SERVER_THREAD_CONTEXT_RATIO_PERCENT: i64 = 70;
 
@@ -101,6 +110,10 @@ pub struct TeamCli {
     #[arg(long, value_enum)]
     language: Option<TeamPromptLanguage>,
 
+    /// If keep-alive is enabled, automatically pause after this many idle seconds. Use 0 to stay alive indefinitely.
+    #[arg(long, default_value_t = 0)]
+    idle_exit_after_sec: u64,
+
     #[command(subcommand)]
     subcommand: Option<TeamSubcommand>,
 }
@@ -115,7 +128,7 @@ enum TeamSubcommand {
     Run(RunArgs),
 
     /// List local team workspaces.
-    List,
+    List(ListArgs),
 
     /// Show team status.
     Status(TeamSelector),
@@ -283,6 +296,10 @@ struct RunArgs {
     #[arg(long, default_value_t = 300)]
     stale_active_turn_timeout_sec: u64,
 
+    /// Periodically write an external autoresearch audit snapshot without steering the team. Use 0 to disable.
+    #[arg(long, default_value_t = 600)]
+    autoresearch_audit_interval_sec: u64,
+
     /// Let active departments answer incoming non-system team mail through a quick forked side-channel turn.
     #[arg(long, default_value_t = true)]
     side_channel_replies: bool,
@@ -294,6 +311,10 @@ struct RunArgs {
     /// Do not keep the app-server team alive after tasks complete.
     #[arg(long, default_value_t = false)]
     no_keep_alive: bool,
+
+    /// If keep-alive is enabled, automatically pause after this many idle seconds. Use 0 to stay alive indefinitely.
+    #[arg(long, default_value_t = 0)]
+    idle_exit_after_sec: u64,
 
     /// Connect to an existing app-server websocket instead of starting one.
     #[arg(long)]
@@ -336,6 +357,10 @@ struct RuntimeArgs {
     /// Do not keep the app-server runtime alive after tasks complete.
     #[arg(long, default_value_t = false)]
     no_keep_alive: bool,
+
+    /// If keep-alive is enabled, automatically pause after this many idle seconds. Use 0 to stay alive indefinitely.
+    #[arg(long, default_value_t = 0)]
+    idle_exit_after_sec: u64,
 
     /// Keep an existing run.pid process alive instead of replacing it.
     #[arg(long, default_value_t = false)]
@@ -380,6 +405,10 @@ struct RuntimeArgs {
     /// Warn lead when an app-server turn stays active with no observed assistant output for this many seconds. Use 0 to disable.
     #[arg(long, default_value_t = 300)]
     stale_active_turn_timeout_sec: u64,
+
+    /// Periodically write an external autoresearch audit snapshot without steering the team. Use 0 to disable.
+    #[arg(long, default_value_t = 600)]
+    autoresearch_audit_interval_sec: u64,
 
     /// Let active departments answer incoming non-system team mail through a quick forked side-channel turn.
     #[arg(long, default_value_t = true)]
@@ -477,6 +506,21 @@ struct TeamSelector {
     /// Team id. Defaults to the most recently updated team.
     #[arg(long)]
     team: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Print machine-readable JSON.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+
+    /// Only show teams whose runtime is still alive.
+    #[arg(long, default_value_t = false)]
+    live_only: bool,
+
+    /// Pause idle keep-alive runtimes after this many seconds in stop(idle). Use 0 to only list.
+    #[arg(long, alias = "exit-stop-after-sec", default_value_t = 0)]
+    pause_idle_after_sec: u64,
 }
 
 #[derive(Debug, Args)]
@@ -1210,12 +1254,36 @@ struct CleanupArgs {
     /// Delete without a confirmation prompt.
     #[arg(long, default_value_t = false)]
     force: bool,
+
+    /// Delete every local team whose runtime is already exiting.
+    #[arg(long, default_value_t = false)]
+    exiting: bool,
+
+    /// Also delete this team's state directory from registered SSH/Docker nodes.
+    #[arg(long, default_value_t = false)]
+    remote_state: bool,
+
+    /// Also stop and remove registered Docker/ssh-docker containers for this team.
+    #[arg(long, default_value_t = false)]
+    containers: bool,
+
+    /// Continue deleting local state even if a remote cleanup operation fails.
+    #[arg(long, default_value_t = false)]
+    ignore_remote_errors: bool,
+
+    /// Print what would be deleted without deleting anything.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
 struct StopArgs {
     #[command(flatten)]
     selector: TeamSelector,
+
+    /// Pause every running/idle team runtime.
+    #[arg(long, default_value_t = false)]
+    all: bool,
 
     /// Leave the registered local app-server process running.
     #[arg(long, default_value_t = false)]
@@ -1651,8 +1719,18 @@ impl TeamCli {
 
     pub(crate) fn into_interactive_parts(
         self,
-    ) -> (SharedCliOptions, Option<String>, Option<TeamPromptLanguage>) {
-        (self.interactive_shared, self.team, self.language)
+    ) -> (
+        SharedCliOptions,
+        Option<String>,
+        Option<TeamPromptLanguage>,
+        u64,
+    ) {
+        (
+            self.interactive_shared,
+            self.team,
+            self.language,
+            self.idle_exit_after_sec,
+        )
     }
 
     pub async fn run(self) -> Result<()> {
@@ -1676,7 +1754,7 @@ impl TeamCli {
                     run_team(&root, args)
                 }
             }
-            Some(TeamSubcommand::List) => list_teams(&root),
+            Some(TeamSubcommand::List(args)) => list_teams(&root, args),
             Some(TeamSubcommand::Status(selector)) => {
                 let team_dir = resolve_team_dir(&root, selector.team.as_deref())?;
                 auto_promote_dependency_waits(&team_dir)?;
@@ -1745,13 +1823,26 @@ fn runtime_args_to_run_args(args: RuntimeArgs, root: &Path) -> Result<RunArgs> {
         idle_wakeup_interval_sec: args.idle_wakeup_interval_sec,
         department_heartbeat_interval_sec: args.department_heartbeat_interval_sec,
         stale_active_turn_timeout_sec: args.stale_active_turn_timeout_sec,
+        autoresearch_audit_interval_sec: args.autoresearch_audit_interval_sec,
         side_channel_replies: args.side_channel_replies,
         interactive_lead: false,
         no_keep_alive: args.no_keep_alive,
+        idle_exit_after_sec: args.idle_exit_after_sec,
         app_server_url: args.app_server_url,
         no_app_server_registry: args.no_app_server_registry,
         resume_team: Some(config.id),
     })
+}
+
+fn resume_runtime_base_cwd(config: &TeamConfig, fallback: &Path) -> PathBuf {
+    config
+        .members
+        .iter()
+        .find(|member| member.role == "lead")
+        .and_then(|member| member.workspace_path.as_deref())
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
 }
 
 pub(crate) struct TeamInteractiveLeadLaunch {
@@ -1761,10 +1852,103 @@ pub(crate) struct TeamInteractiveLeadLaunch {
     pub(crate) lead_thread_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InteractiveLeadAttachment {
+    pid: u32,
+    thread: String,
+    app_server_url: String,
+    cwd: String,
+    attached_at: String,
+}
+
+fn interactive_lead_attachment_path(team_dir: &Path) -> PathBuf {
+    team_dir.join("interactive-lead-attached.json")
+}
+
+fn write_interactive_lead_attachment(
+    team_dir: &Path,
+    thread: &str,
+    app_server_url: &str,
+    cwd: &Path,
+) -> Result<()> {
+    let attachment = InteractiveLeadAttachment {
+        pid: std::process::id(),
+        thread: thread.to_string(),
+        app_server_url: app_server_url.to_string(),
+        cwd: cwd.display().to_string(),
+        attached_at: now(),
+    };
+    let path = interactive_lead_attachment_path(team_dir);
+    write_json_atomic(&path, &attachment).with_context(|| format!("write {}", path.display()))?;
+    append_event(
+        team_dir,
+        "interactive_lead_attached",
+        serde_json::json!({
+            "pid": attachment.pid,
+            "thread": attachment.thread,
+            "app_server_url": attachment.app_server_url,
+            "cwd": attachment.cwd,
+        }),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn detach_interactive_lead_team(team_dir: &Path) -> Result<()> {
+    let path = interactive_lead_attachment_path(team_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            append_event(
+                team_dir,
+                "interactive_lead_detached",
+                serde_json::json!({ "reason": "tui_exit" }),
+            )?;
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn interactive_lead_attached(team_dir: &Path) -> Result<bool> {
+    let path = interactive_lead_attachment_path(team_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let attachment = match serde_json::from_str::<InteractiveLeadAttachment>(&raw) {
+        Ok(attachment) => attachment,
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+            append_event(
+                team_dir,
+                "interactive_lead_attachment_cleared",
+                serde_json::json!({ "reason": "invalid_marker" }),
+            )?;
+            return Ok(false);
+        }
+    };
+    if process_alive(attachment.pid) {
+        return Ok(true);
+    }
+    let _ = fs::remove_file(&path);
+    append_event(
+        team_dir,
+        "interactive_lead_attachment_cleared",
+        serde_json::json!({
+            "reason": "stale_pid",
+            "pid": attachment.pid,
+            "thread": attachment.thread,
+        }),
+    )?;
+    Ok(false)
+}
+
 pub(crate) fn launch_interactive_lead_team(
     shared: &SharedCliOptions,
     team: Option<&str>,
     language: Option<TeamPromptLanguage>,
+    idle_exit_after_sec: u64,
 ) -> Result<TeamInteractiveLeadLaunch> {
     let codex_home =
         codex_core::config::find_codex_home().context("failed to resolve CODEX_HOME")?;
@@ -1781,6 +1965,7 @@ pub(crate) fn launch_interactive_lead_team(
             team,
             &app_server_url,
             language,
+            idle_exit_after_sec,
         );
     }
     let team_id = format!("team-{}", tokyo_now().format("%Y%m%d%H%M%S"));
@@ -1805,6 +1990,11 @@ pub(crate) fn launch_interactive_lead_team(
         .arg("--interactive-lead")
         .arg("--cd")
         .arg(&cwd);
+    if idle_exit_after_sec > 0 {
+        command
+            .arg("--idle-exit-after-sec")
+            .arg(idle_exit_after_sec.to_string());
+    }
     if let Some(language) = language {
         command.arg("--language").arg(language.cli_value());
     }
@@ -1840,6 +2030,7 @@ pub(crate) fn launch_interactive_lead_team(
     let started_at = Instant::now();
     loop {
         if let Some(lead_thread_id) = read_team_lead_thread_id(&team_dir)? {
+            write_interactive_lead_attachment(&team_dir, &lead_thread_id, &app_server_url, &cwd)?;
             append_event(
                 &team_dir,
                 "interactive_lead_tui_attached",
@@ -1878,6 +2069,7 @@ fn launch_existing_interactive_lead_team(
     team: &str,
     app_server_url: &str,
     language: Option<TeamPromptLanguage>,
+    idle_exit_after_sec: u64,
 ) -> Result<TeamInteractiveLeadLaunch> {
     let team_dir = resolve_team_dir(root, Some(team))?;
     let config = load_config(&team_dir)?;
@@ -1903,6 +2095,11 @@ fn launch_existing_interactive_lead_team(
             .arg(app_server_url)
             .arg("--cd")
             .arg(&cwd);
+        if idle_exit_after_sec > 0 {
+            command
+                .arg("--idle-exit-after-sec")
+                .arg(idle_exit_after_sec.to_string());
+        }
         if shared.dangerously_bypass_approvals_and_sandbox {
             command.arg("--dangerously-bypass-approvals-and-sandbox");
         }
@@ -1942,6 +2139,7 @@ fn launch_existing_interactive_lead_team(
         if let Some(lead_thread_id) = read_team_lead_thread_id(&team_dir)?
             && (runtime_alive || old_lead_thread_id.as_deref() != Some(lead_thread_id.as_str()))
         {
+            write_interactive_lead_attachment(&team_dir, &lead_thread_id, app_server_url, &cwd)?;
             append_event(
                 &team_dir,
                 "interactive_lead_tui_attached",
@@ -2287,6 +2485,9 @@ fn apply_department_design(args: &mut StartArgs, design: LeadDepartmentDesign) {
             node.is_empty() || node == "local" || valid_node_ids.contains(&node)
         })
         .collect::<Vec<_>>();
+    if goal_expects_future_container_work(&args.goal) {
+        departments.retain(|department| !is_future_container_local_placeholder(department));
+    }
     if departments.is_empty() {
         departments = fallback_department_design(&args.goal).departments;
     }
@@ -2315,12 +2516,140 @@ fn apply_department_design(args: &mut StartArgs, design: LeadDepartmentDesign) {
         .iter()
         .map(|department| {
             format!(
-                "Department mission for {}: {}\n\nOperate as one department-level Codex session. Proactively coordinate with related departments: broadcast your initial plan, ask even small uncertainty questions before committing to a risky choice, report failures with proposed next steps, and hand off artifacts to their consumers. If the mission is broad, research-heavy, implementation-heavy, or review-heavy, actively use available subagent/agent tools, skills, MCP servers, and internal decomposition inside this department instead of doing all work in one main thread or asking the lead to create duplicate peer departments for load balancing.",
+                "Department mission for {}: {}\n\nOperate as one department-level Codex session. Proactively coordinate with related departments: broadcast your initial plan, ask even small uncertainty questions before committing to a risky choice, report failures with proposed next steps, and hand off artifacts to their consumers. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad, research-heavy, implementation-heavy, or review-heavy, actively use those available helpers inside this department instead of doing all work in one main thread or asking the lead to create duplicate peer departments for load balancing.",
                 sanitize_id(&department.name),
                 department.mission
             )
         })
         .collect();
+}
+
+fn goal_expects_future_container_work(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    lower.contains("docker image")
+        || lower.contains("dockerfile")
+        || lower.contains("docker file")
+        || lower.contains("docker build")
+        || lower.contains("create a container")
+        || lower.contains("build a container")
+        || lower.contains("container を作")
+        || lower.contains("コンテナを作")
+        || lower.contains("コンテナ作成")
+        || lower.contains("image を作")
+        || lower.contains("イメージを作")
+}
+
+fn is_future_container_local_placeholder(department: &LeadDepartment) -> bool {
+    let node = department
+        .node
+        .as_deref()
+        .map(sanitize_id)
+        .unwrap_or_default();
+    if !(node.is_empty() || node == "local") {
+        return false;
+    }
+    let name = sanitize_id(&department.name);
+    let role = sanitize_role(&department.role);
+    let text = format!(
+        "{} {} {}",
+        name,
+        role,
+        department.mission.to_ascii_lowercase()
+    );
+    let mentions_container_runtime = [
+        "container-internal",
+        "inside container",
+        "inside the container",
+        "in the container",
+        "container 内",
+        "コンテナ内",
+        "docker container",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    if !mentions_container_runtime {
+        return false;
+    }
+    if is_local_container_result_review_department(department, &text) {
+        return false;
+    }
+    let placeholder_role = [
+        "implementation",
+        "implementer",
+        "engineering",
+        "runtime",
+        "experiment",
+        "evaluation",
+        "quality",
+        "qa",
+        "test",
+        "tester",
+        "validation",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle) || role.contains(needle) || text.contains(needle));
+    let host_bootstrap_role = ["ops", "bootstrap", "build", "docker", "infra"]
+        .iter()
+        .any(|needle| name.contains(needle) || role.contains(needle));
+    placeholder_role && !host_bootstrap_role
+}
+
+fn is_local_container_result_review_department(department: &LeadDepartment, text: &str) -> bool {
+    let name = sanitize_id(&department.name);
+    let role = sanitize_role(&department.role);
+    let reviewer_role = [
+        "audit",
+        "auditor",
+        "review",
+        "reviewer",
+        "quality",
+        "qa",
+        "validation",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle) || role.contains(needle));
+    if !reviewer_role {
+        return false;
+    }
+    let consumes_outputs = [
+        "review",
+        "audit",
+        "validate",
+        "validation",
+        "evidence",
+        "artifact",
+        "result",
+        "output",
+        "handoff",
+        "レビュー",
+        "監査",
+        "確認",
+        "検証",
+        "証跡",
+        "成果物",
+        "結果",
+        "完了条件",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    let claims_runtime_execution = [
+        "implement inside",
+        "develop inside",
+        "execute inside",
+        "run inside",
+        "test inside",
+        "container 内で実装",
+        "container 内で開発",
+        "container 内で実行",
+        "container 内でテスト",
+        "コンテナ内で実装",
+        "コンテナ内で開発",
+        "コンテナ内で実行",
+        "コンテナ内でテスト",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    consumes_outputs && !claims_runtime_execution
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2376,6 +2705,7 @@ fn build_lead_department_design_prompt(
     language: TeamPromptLanguage,
 ) -> String {
     let autoresearch_policy = build_autoresearch_department_design_policy(goal, language);
+    let prompt_goal = sanitize_goal_for_internal_team_prompt(goal);
     let candidates = if placement_candidates.is_empty() {
         "(none explicitly provided by CLI/UI advanced options)".to_string()
     } else {
@@ -2399,6 +2729,8 @@ fn build_lead_department_design_prompt(
         return format!(
             r#"あなたは、ユーザーの依頼を直接聞く lead agent です。ユーザーは実質的に社長です。あなたの仕事は、依頼全体を理解し、運用計画を決め、正しい実行場所に部署を作ることです。あなたはオーケストレーターであり、実装作業者でも、単純な作業分配係でもありません。
 
+これは Codex Teams 内部の部署設計プロンプトです。通常ユーザー向けの team 起動ワークフローを読んだり実行したりしてはいけません。既存 team の探索、team swarm/run の起動、status 確認は不要です。この turn では下記 goal を読んで JSON の部署設計だけを返してください。
+
 ユーザーの goal:
 {goal}
 
@@ -2412,13 +2744,14 @@ CLI/UI の advanced option から明示された配置候補だけ:
 - 明示的な CLI/UI 配置候補は advanced option 由来の hint にすぎません。自然言語 goal が authoritative です。
 - host/container 名が明確な場合、ユーザーの表記をそのまま使ってください。日本語の助詞や周辺文を host 名に含めないでください。
 - Docker node は具体的な既存 container を意味します。「Docker image を build」「container を作成」のような文言だけから Docker/container node を捏造しないでください。まず正しい host に planning/build/container-creation work を割り当ててください。container-internal department は、実 container が存在し node 登録された後に自動追加されます。
+- future container 内で実行する implementation/test/experiment 部署を local placeholder として作らないでください。container がまだ存在しない場合は、host-side ops/bootstrap 部署に image/container 作成と TEAM_NODE 報告だけを担当させ、node 登録後に自動追加される container-internal department に runtime 実装・テスト・実験を任せてください。
 
 小さな部署構成を設計してください:
 - 部署は 2 から 5 個にしてください。
 - 各部署は、明確な ownership domain を持つ peer Codex session です。
 - `lead` 部署は含めないでください。live lead は部署一覧の外に既に存在します。
 - workload balancing だけを目的に重複部署を作らないでください。
-- 部署の作業が重い場合、その部署が利用可能な subagent/agent tools、skills、MCP servers、または内部分解を使うべきです。
+- ユーザーは、重い部署作業で subagent/agent tools、parallel delegation、skills、MCP servers、または内部分解を使うことを明示的に許可しています。部署の作業が重い場合、その部署は利用可能な helper を積極的に使うべきです。
 - 部署は、自分の execution site で必要な task tool や library を install できます。環境セットアップだけを理由に peer department を増やさないでください。
 - goal が public/open-source model、dataset、package、API、service に依存する場合、research/ops は transitive runtime artifact や model dependency が現在の環境で実際に access 可能か確認してください。未提供の gated credential が必要な新しい選択肢より、少し新規性が低くても end-to-end で動く選択肢を優先してください。
 - product、engineering、design、quality、research、docs、ops、security、data などの domain ownership を優先してください。
@@ -2451,7 +2784,7 @@ CLI/UI の advanced option から明示された配置候補だけ:
   ]
 }}
 "#,
-            goal = goal,
+            goal = prompt_goal,
             candidates = candidates,
             autoresearch_policy = autoresearch_policy,
         );
@@ -2459,6 +2792,8 @@ CLI/UI の advanced option から明示された配置候補だけ:
 
     format!(
         r#"You are the lead agent directly listening to the user's request. The user is effectively the president/CEO. Your job is to understand the whole request, decide the operating plan, and create departments at the right execution sites. You are an orchestrator, not an implementation worker and not a simple worker balancer.
+
+This is an internal Codex Teams department-design prompt. Do not read or invoke ordinary user-facing team-launch workflows. Do not inspect existing teams, start nested team swarm/run commands, or check team status. In this turn, read the goal below and return only the JSON department design.
 
 User goal:
 {goal}
@@ -2473,13 +2808,14 @@ Read the user goal carefully and infer placement from the natural language yours
 - Explicit CLI/UI placement candidates are only hints from advanced options. The natural-language goal is authoritative.
 - Use the user's exact host/container names when they are clearly named. Do not parse Japanese particles or surrounding prose as part of a host name.
 - A Docker node means a concrete, already-existing container. Do not invent Docker/container nodes from phrases like "build a Docker image" or "create a Docker container"; assign planning/build/container-creation work to the correct host first. Container-internal departments are added automatically only after the real container exists and has been registered as a node.
+- Do not create local placeholder implementation/test/experiment departments for work that is explicitly supposed to run inside a future container. If the container does not exist yet, create a host-side ops/bootstrap department for image/container creation and TEAM_NODE reporting, then let the automatically added container-internal department own runtime implementation, tests, and experiments after node registration.
 
 Design a small department structure:
 - Create 2 to 5 departments.
 - Each department is one peer Codex session with a clear ownership domain.
 - Do not include a `lead` department. The live lead already exists outside your department list.
 - Do not create duplicate departments just to balance workload.
-- If a department's work is heavy, that department should use available subagent/agent tools, skills, MCP servers, or its own internal decomposition.
+- The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If a department's work is heavy, that department should proactively use available helpers.
 - Departments are allowed to install missing task tools and libraries in their own execution site when that is the best way to complete or verify the work. Do not create extra peer departments just because an environment needs setup.
 - If the goal depends on a public external model, dataset, package, or service, research/ops must verify that all required runtime artifacts and transitive model dependencies are actually accessible in the current environment. Prefer a slightly less novel option that can run end-to-end over a newer option that requires unprovided gated credentials.
 - Prefer domain ownership such as product, engineering, design, quality, research, docs, ops, security, data, etc.
@@ -2512,10 +2848,30 @@ Return only valid JSON, no Markdown, no commentary:
   ]
 }}
 "#,
-        goal = goal,
+        goal = prompt_goal,
         candidates = candidates,
         autoresearch_policy = autoresearch_policy,
     )
+}
+
+fn sanitize_goal_for_internal_team_prompt(goal: &str) -> String {
+    let replacements = [
+        ("codex-team-secretary", "ordinary user-facing team launcher"),
+        ("Codex Team Secretary", "ordinary user-facing team launcher"),
+        ("team secretary", "team coordinator"),
+        ("Team Secretary", "team coordinator"),
+        ("secretary skill", "launcher workflow"),
+        ("secretary workflow", "launcher workflow"),
+        ("secretary", "coordinator"),
+        ("秘書スキル", "起動ワークフロー"),
+        ("秘書ワークフロー", "起動ワークフロー"),
+        ("秘書", "連絡役"),
+    ];
+    replacements
+        .into_iter()
+        .fold(goal.to_string(), |acc, (needle, replacement)| {
+            acc.replace(needle, replacement)
+        })
 }
 
 fn parse_lead_department_design(raw: &str) -> Result<LeadDepartmentDesign> {
@@ -2862,7 +3218,8 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let use_lead_department_design = resume_team.is_none()
         && !args.interactive_lead
         && should_use_lead_department_design(&args.start);
-    let cwd = args
+    let explicit_cwd = args.cwd.is_some();
+    let mut cwd = args
         .cwd
         .clone()
         .unwrap_or(std::env::current_dir().context("resolve current directory")?);
@@ -2899,6 +3256,9 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let (team_id, team_dir) = if let Some(team) = resume_team.as_deref() {
         let team_dir = resolve_team_dir(root, Some(team))?;
         let config = load_config(&team_dir)?;
+        if !explicit_cwd {
+            cwd = resume_runtime_base_cwd(&config, &cwd);
+        }
         println!("Reattached app-server runtime to team `{}`", config.id);
         println!("State: {}", team_dir.display());
         append_event(
@@ -3281,6 +3641,13 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             app_server_member_cwd(&node_id, &nodes, &cwd)
         } else if args.worktree {
             prepare_member_worktree(&team_dir, &cwd, &team_id, member)?
+        } else if resume_team.is_some() && !explicit_cwd {
+            member
+                .workspace_path
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cwd.clone())
         } else {
             cwd.clone()
         };
@@ -3469,7 +3836,15 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             args.stale_active_turn_timeout_sec.max(120),
         ))
     };
+    let autoresearch_audit_interval = if args.autoresearch_audit_interval_sec == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(
+            args.autoresearch_audit_interval_sec.max(60),
+        ))
+    };
     let mut last_node_asset_sync = HashMap::<String, Instant>::new();
+    let mut last_member_journal_node_sync = HashMap::<String, Instant>::new();
     let mut last_idle_outreach = Instant::now();
     let mut idle_outreach_cursor = 0_usize;
     let mut last_task_watchdog = Instant::now();
@@ -3491,10 +3866,16 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let mut idle_wakeup_cursor = 0_usize;
     let mut department_heartbeats = HashMap::<String, Instant>::new();
     let mut last_stale_active_turn_check = Instant::now();
+    let mut last_autoresearch_audit = autoresearch_audit_interval
+        .map(|interval| Instant::now() - interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_member_journal_update = Instant::now() - Duration::from_secs(60);
     let mut last_job_refresh = Instant::now() - Duration::from_secs(15);
     let mut last_node_connection_heartbeat = Instant::now() - Duration::from_secs(60);
     let mut contract_input_sync_attempts = HashSet::<String>::new();
     let mut keep_alive_idle_reported = false;
+    let mut keep_alive_idle_since = None::<Instant>;
+    let mut idle_exit_requested = false;
     #[cfg(unix)]
     let hangup_task = {
         let mut hangup_signal =
@@ -3518,6 +3899,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
         let team_is_idle = !has_running_turn && !has_unstarted_member;
         if team_is_idle {
             if !args.no_keep_alive {
+                let idle_since = *keep_alive_idle_since.get_or_insert_with(Instant::now);
                 if !keep_alive_idle_reported {
                     println!(
                         "Team {} is idle and staying alive. Send messages or member changes; press Ctrl-C to stop.",
@@ -3530,11 +3912,27 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                     )?;
                     keep_alive_idle_reported = true;
                 }
+                if args.idle_exit_after_sec > 0
+                    && idle_since.elapsed() >= Duration::from_secs(args.idle_exit_after_sec)
+                {
+                    append_event(
+                        &team_dir,
+                        "app_server_keep_alive_idle_timeout",
+                        serde_json::json!({
+                            "idle_for_sec": idle_since.elapsed().as_secs(),
+                            "idle_exit_after_sec": args.idle_exit_after_sec,
+                            "message": "idle keep-alive runtime paused automatically to avoid token/process waste",
+                        }),
+                    )?;
+                    idle_exit_requested = true;
+                    break;
+                }
             } else {
                 break;
             }
         } else {
             keep_alive_idle_reported = false;
+            keep_alive_idle_since = None;
         }
         tokio::select! {
             _ = tokio::signal::ctrl_c(), if !args.no_keep_alive => {
@@ -3593,8 +3991,36 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                         record_runtime_loop_error(&team_dir, "refresh_running_team_jobs", err)?;
                     }
                 }
+                if let Err(err) = auto_complete_wait_checks(&team_dir) {
+                    record_runtime_loop_error(&team_dir, "auto_complete_wait_checks", err)?;
+                }
                 if let Err(err) = auto_promote_dependency_waits(&team_dir) {
                     record_runtime_loop_error(&team_dir, "auto_promote_dependency_waits", err)?;
+                }
+                if last_member_journal_update.elapsed() >= Duration::from_secs(60) {
+                    last_member_journal_update = Instant::now();
+                    if let Err(err) = update_member_journals(&team_dir, &config) {
+                        record_runtime_loop_error(&team_dir, "member_journal_update", err)?;
+                    }
+                    if let Err(err) = maybe_generate_member_digest_journals(
+                        &team_dir,
+                        &codex_exe,
+                        args.model.as_deref(),
+                        args.profile.as_deref(),
+                        args.sandbox.as_deref(),
+                        args.dangerously_bypass_approvals_and_sandbox,
+                    ) {
+                        record_runtime_loop_error(&team_dir, "member_digest_journal", err)?;
+                    }
+                    if let Err(err) = maybe_sync_member_journals_to_nodes(
+                        &team_dir,
+                        &nodes,
+                        &node_clients,
+                        &mut last_member_journal_node_sync,
+                        Duration::from_secs(60),
+                    ) {
+                        record_runtime_loop_error(&team_dir, "member_journal_node_sync", err)?;
+                    }
                 }
                 if let Err(err) = assign_unowned_tasks_round_robin(&team_dir) {
                     record_runtime_loop_error(&team_dir, "assign_unowned_tasks_round_robin", err)?;
@@ -3723,11 +4149,21 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                         record_runtime_loop_error(&team_dir, "stale_active_turn_check", err)?;
                     }
                 }
+                if let Some(audit_interval) = autoresearch_audit_interval {
+                    if let Err(err) = maybe_write_autoresearch_runtime_audit(
+                        &team_dir,
+                        &mut last_autoresearch_audit,
+                        audit_interval,
+                    ) {
+                        record_runtime_loop_error(&team_dir, "autoresearch_runtime_audit", err)?;
+                    }
+                }
             }
         }
     }
 
     if !args.no_synthesis
+        && !idle_exit_requested
         && let Some(lead_run) = active.get(&lead_member.name)
         && lead_run.completed
     {
@@ -3782,6 +4218,9 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
         && !summary.trim().is_empty()
     {
         write_text_atomic(&team_dir.join("summary.md"), summary)?;
+    }
+    if let Err(err) = update_member_journals(&team_dir, &config) {
+        record_runtime_loop_error(&team_dir, "member_journal_final_update", err)?;
     }
 
     print_status(&team_dir)?;
@@ -4323,6 +4762,46 @@ fn run_autoresearch_audit(root: &Path, args: AutoresearchAuditArgs) -> Result<()
     Ok(())
 }
 
+fn maybe_write_autoresearch_runtime_audit(
+    team_dir: &Path,
+    last_audit: &mut Instant,
+    interval: Duration,
+) -> Result<()> {
+    if last_audit.elapsed() < interval {
+        return Ok(());
+    }
+    *last_audit = Instant::now();
+
+    let config = load_config(team_dir)?;
+    if !team_goal_requests_autoresearch_loop(&config.goal) {
+        return Ok(());
+    }
+
+    let report = build_autoresearch_audit_report(team_dir)?;
+    let output_dir = team_dir.join("autoresearch_audits");
+    fs::create_dir_all(&output_dir)?;
+    let output = output_dir.join(format!(
+        "runtime_audit_{}.md",
+        sanitize_id(&now()).replace('-', "_")
+    ));
+    write_text_atomic(&output, &report)?;
+    let pass_count = report.matches("| PASS |").count();
+    let warn_count = report.matches("| WARN |").count();
+    let fail_count = report.matches("| FAIL |").count();
+    append_event(
+        team_dir,
+        "autoresearch_runtime_audit_written",
+        serde_json::json!({
+            "path": output,
+            "pass": pass_count,
+            "warn": warn_count,
+            "fail": fail_count,
+            "note": "external god-view audit only; no team mailbox steer was sent",
+        }),
+    )?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AutoresearchAuditStatus {
     Pass,
@@ -4731,6 +5210,51 @@ fn build_autoresearch_audit_report(team_dir: &Path) -> Result<String> {
         },
     });
 
+    let open_blocked_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Blocked)
+        .collect::<Vec<_>>();
+    let failed_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Failed)
+        .collect::<Vec<_>>();
+    let open_task_count = tasks.iter().filter(|task| task_is_open(task)).count();
+    let blocked_summary = summarize_audit_tasks(&open_blocked_tasks, 6);
+    let failed_summary = summarize_audit_tasks(&failed_tasks, 6);
+    items.push(AutoresearchAuditItem {
+        id: "latest_iteration_blockers",
+        requirement:
+            "最新 iteration に blocked/failed task が残っていないかを明示し、履歴上の PASS と現在の停止を混同しない",
+        status: if !failed_tasks.is_empty() {
+            AutoresearchAuditStatus::Fail
+        } else if !open_blocked_tasks.is_empty() {
+            AutoresearchAuditStatus::Warn
+        } else {
+            AutoresearchAuditStatus::Pass
+        },
+        evidence: format!(
+            "open_tasks={} blocked_tasks={} failed_tasks={}",
+            open_task_count,
+            if blocked_summary.is_empty() {
+                "-".to_string()
+            } else {
+                blocked_summary
+            },
+            if failed_summary.is_empty() {
+                "-".to_string()
+            } else {
+                failed_summary
+            }
+        ),
+        gap: if !failed_tasks.is_empty() {
+            "failed task が残っています。履歴上の成果物 PASS だけでは現在の研究ループを clean と判定できません".to_string()
+        } else if !open_blocked_tasks.is_empty() {
+            "blocked task が残っています。最新 iteration は完了ではなく、blocker 解消または明示的な user-input blocker 判定が必要です".to_string()
+        } else {
+            "-".to_string()
+        },
+    });
+
     let next_action_files = files.iter().any(|path| {
         file_contains_any(
             path,
@@ -4782,6 +5306,26 @@ fn build_autoresearch_audit_report(team_dir: &Path) -> Result<String> {
     Ok(format_autoresearch_audit_report(
         &config, team_dir, &roots, &items, &tasks, &waits, &jobs, &nodes,
     ))
+}
+
+fn summarize_audit_tasks(tasks: &[&TeamTask], limit: usize) -> String {
+    let mut parts = tasks
+        .iter()
+        .take(limit)
+        .map(|task| {
+            format!(
+                "#{}:{}:{}",
+                task.id,
+                task.owner.as_deref().unwrap_or("-"),
+                compact_one_line(&task.subject, 120)
+            )
+        })
+        .collect::<Vec<_>>();
+    let omitted = tasks.len().saturating_sub(parts.len());
+    if omitted > 0 {
+        parts.push(format!("+{omitted} more"));
+    }
+    parts.join("; ")
 }
 
 fn format_autoresearch_audit_report(
@@ -4855,6 +5399,21 @@ fn format_autoresearch_audit_report(
             wait.task_id.as_deref().unwrap_or("-"),
             wait.evidence.as_deref().unwrap_or("-"),
             wait.title
+        ));
+    }
+    out.push_str("\n## Open Tasks\n\n");
+    for task in tasks.iter().filter(|task| task_is_open(task)) {
+        out.push_str(&format!(
+            "- {} [{}] owner={} deps={} subject={}\n",
+            task.id,
+            task.status,
+            task.owner.as_deref().unwrap_or("-"),
+            if task.depends_on.is_empty() {
+                "-".to_string()
+            } else {
+                task.depends_on.join(",")
+            },
+            task.subject
         ));
     }
     out.push_str("\n## Non-Completed Jobs\n\n");
@@ -5148,6 +5707,7 @@ fn autoresearch_scan_dir_has_wait_or_command_record(dir: &Path) -> bool {
 }
 
 fn format_status_text(team_dir: &Path) -> Result<String> {
+    auto_complete_wait_checks(team_dir)?;
     auto_promote_dependency_waits(team_dir)?;
     let config = load_config(team_dir)?;
     let tasks = load_tasks(team_dir)?;
@@ -5224,16 +5784,8 @@ fn format_runtime_status_text(
             format!(" ui_pid={pid}({state})")
         })
         .unwrap_or_default();
-    let open_tasks = tasks
-        .iter()
-        .filter(|task| {
-            !matches!(
-                task.status,
-                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-            )
-        })
-        .count();
-    let open_waits = waits.iter().filter(|wait| wait.status.is_open()).count();
+    let open_tasks = open_task_count(tasks);
+    let open_waits = open_wait_count(waits);
     let mut out = format!(
         "Runtime: {}{}{} open_tasks={} open_waits={}\n",
         status.label(),
@@ -5242,7 +5794,7 @@ fn format_runtime_status_text(
         open_tasks,
         open_waits
     );
-    if matches!(status, UiTeamRunStatus::Stopped) && (open_tasks > 0 || open_waits > 0) {
+    if matches!(status, UiTeamRunStatus::Exiting) && (open_tasks > 0 || open_waits > 0) {
         out.push_str(&format!(
             "Runtime warning: open work remains but the team runtime is stopped. Resume with: codex team resume --team {} --dangerously-bypass-approvals-and-sandbox\n",
             config.id
@@ -5251,7 +5803,16 @@ fn format_runtime_status_text(
     out
 }
 
+fn open_task_count(tasks: &[TeamTask]) -> usize {
+    tasks.iter().filter(|task| task_is_open(task)).count()
+}
+
+fn open_wait_count(waits: &[TeamWait]) -> usize {
+    waits.iter().filter(|wait| wait.status.is_open()).count()
+}
+
 fn format_tasks_text(team_dir: &Path) -> Result<String> {
+    auto_complete_wait_checks(team_dir)?;
     auto_promote_dependency_waits(team_dir)?;
     let tasks = load_tasks(team_dir)?;
     if tasks.is_empty() {
@@ -5584,6 +6145,7 @@ fn resolve_or_spawn_node_app_server(
     node: &TeamNode,
     relay_port: u16,
 ) -> Result<(String, Option<NodeAppServerProcess>)> {
+    ensure_node_cwd_exists(team_dir, node)?;
     if let Some(url) = node.url.clone()
         && app_server_readyz(&url)
     {
@@ -5708,6 +6270,148 @@ fn resolve_or_spawn_node_app_server(
             }
         }
         Err(err) => Err(err),
+    }
+}
+
+fn ensure_node_cwd_exists(team_dir: &Path, node: &TeamNode) -> Result<()> {
+    let Some(cwd) = node.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) else {
+        return Ok(());
+    };
+    match node.kind {
+        TeamNodeKind::Local | TeamNodeKind::Manual => Ok(()),
+        TeamNodeKind::Ssh => {
+            let host = node.host.as_deref().with_context(|| {
+                format!("ssh node `{}` needs host before cwd bootstrap", node.id)
+            })?;
+            let command = format!("mkdir -p {}", shell_quote(cwd));
+            let output = Command::new("ssh")
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg(host)
+                .arg(format!("bash -lc {}", shell_quote(&command)))
+                .output()
+                .with_context(|| format!("create cwd `{cwd}` on ssh node `{}`", node.id))?;
+            if output.status.success() {
+                append_event(
+                    team_dir,
+                    "node_cwd_ensured",
+                    serde_json::json!({ "node": node.id, "kind": node.kind, "cwd": cwd }),
+                )?;
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                append_event(
+                    team_dir,
+                    "node_cwd_ensure_failed",
+                    serde_json::json!({
+                        "node": node.id,
+                        "kind": node.kind,
+                        "cwd": cwd,
+                        "status": output.status.code(),
+                        "stderr": stderr,
+                    }),
+                )?;
+                bail!(
+                    "failed to create cwd `{cwd}` on ssh node `{}`: {stderr}",
+                    node.id
+                )
+            }
+        }
+        TeamNodeKind::Docker => {
+            let container = node.container.as_deref().with_context(|| {
+                format!(
+                    "docker node `{}` needs container before cwd bootstrap",
+                    node.id
+                )
+            })?;
+            ensure_docker_node_cwd_exists(team_dir, node, None, container, cwd)
+        }
+        TeamNodeKind::SshDocker => {
+            let host = node.host.as_deref().with_context(|| {
+                format!(
+                    "ssh-docker node `{}` needs host before cwd bootstrap",
+                    node.id
+                )
+            })?;
+            let container = node.container.as_deref().with_context(|| {
+                format!(
+                    "ssh-docker node `{}` needs container before cwd bootstrap",
+                    node.id
+                )
+            })?;
+            ensure_docker_node_cwd_exists(team_dir, node, Some(host), container, cwd)
+        }
+    }
+}
+
+fn ensure_docker_node_cwd_exists(
+    team_dir: &Path,
+    node: &TeamNode,
+    host: Option<&str>,
+    container: &str,
+    cwd: &str,
+) -> Result<()> {
+    let inner = format!(
+        "docker exec {} mkdir -p {}",
+        shell_quote(container),
+        shell_quote(cwd)
+    );
+    let output = match host {
+        Some(host) => Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg(host)
+            .arg(format!("bash -lc {}", shell_quote(&inner)))
+            .output()
+            .with_context(|| {
+                format!(
+                    "create cwd `{cwd}` in container `{container}` on ssh node `{}`",
+                    node.id
+                )
+            })?,
+        None => Command::new("bash")
+            .arg("-lc")
+            .arg(&inner)
+            .output()
+            .with_context(|| {
+                format!(
+                    "create cwd `{cwd}` in local container `{container}` for node `{}`",
+                    node.id
+                )
+            })?,
+    };
+    if output.status.success() {
+        append_event(
+            team_dir,
+            "node_cwd_ensured",
+            serde_json::json!({
+                "node": node.id,
+                "kind": node.kind,
+                "host": host,
+                "container": container,
+                "cwd": cwd,
+            }),
+        )?;
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        append_event(
+            team_dir,
+            "node_cwd_ensure_failed",
+            serde_json::json!({
+                "node": node.id,
+                "kind": node.kind,
+                "host": host,
+                "container": container,
+                "cwd": cwd,
+                "status": output.status.code(),
+                "stderr": stderr,
+            }),
+        )?;
+        bail!(
+            "failed to create cwd `{cwd}` in container `{container}` for node `{}`: {stderr}",
+            node.id
+        )
     }
 }
 
@@ -7550,9 +8254,98 @@ fn usage_category_for_messages(default: &str, messages: &[MailMessage]) -> Strin
         return "stale_active_turn".to_string();
     }
     if messages.iter().any(|message| message.from != "system") {
-        return "team_message".to_string();
+        return usage_category_for_team_messages(messages);
     }
     default.to_string()
+}
+
+fn usage_category_for_team_messages(messages: &[MailMessage]) -> String {
+    let mut saw_non_system = false;
+    let mut saw_noop_stay = false;
+    let mut saw_handoff = false;
+    let mut saw_blocker = false;
+    let mut saw_review = false;
+    let mut saw_status = false;
+    for message in messages.iter().filter(|message| message.from != "system") {
+        saw_non_system = true;
+        let text = message.message.trim();
+        let lower = text.to_ascii_lowercase();
+        if is_stay_message(text) {
+            saw_noop_stay = true;
+            continue;
+        }
+        if lower.contains("team_completion_checklist")
+            || lower.contains("handoff")
+            || lower.contains("final handoff")
+            || lower.contains("成果物")
+            || lower.contains("完了報告")
+            || lower.contains("引き継ぎ")
+        {
+            saw_handoff = true;
+        }
+        if lower.contains("blocker")
+            || lower.contains("blocked")
+            || lower.contains("failed")
+            || lower.contains("failure")
+            || lower.contains("terminal_failure")
+            || lower.contains("詰ま")
+            || lower.contains("失敗")
+            || lower.contains("ブロック")
+        {
+            saw_blocker = true;
+        }
+        if lower.contains("review")
+            || lower.contains("qa")
+            || lower.contains("quality")
+            || lower.contains("audit")
+            || lower.contains("findings")
+            || lower.contains("検証")
+            || lower.contains("レビュー")
+            || lower.contains("監査")
+        {
+            saw_review = true;
+        }
+        if lower.contains("status")
+            || lower.contains("standby")
+            || lower.contains("waiting")
+            || lower.contains("wait-")
+            || lower.contains("進捗")
+            || lower.contains("待機")
+        {
+            saw_status = true;
+        }
+    }
+    if !saw_non_system {
+        return "team_message".to_string();
+    }
+    if saw_blocker {
+        "team_blocker".to_string()
+    } else if saw_review {
+        "team_review".to_string()
+    } else if saw_handoff {
+        "team_handoff".to_string()
+    } else if saw_noop_stay && !saw_status {
+        "team_noop_stay".to_string()
+    } else if saw_status || saw_noop_stay {
+        "team_status".to_string()
+    } else {
+        "team_message".to_string()
+    }
+}
+
+fn is_stay_message(message: &str) -> bool {
+    let trimmed = message.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("stay:")
+        || lower == "stay"
+        || lower.starts_with("staying:")
+        || lower.starts_with("no action")
+        || lower.starts_with("no-op")
+        || lower.starts_with("noop")
+        || trimmed.starts_with("不要")
+        || trimmed.starts_with("追加対応不要")
+        || trimmed.contains("追加対応は不要")
+        || trimmed.contains("追加作業なし")
 }
 
 fn update_active_turn_usage_category(
@@ -9193,6 +9986,42 @@ fn compact_one_line(value: &str, max_chars: usize) -> String {
     compact
 }
 
+fn format_mail_messages_for_prompt(
+    messages: &[MailMessage],
+    language: TeamPromptLanguage,
+) -> String {
+    let omitted = messages.len().saturating_sub(MAX_REACTIVE_PROMPT_MESSAGES);
+    let selected = messages
+        .iter()
+        .skip(omitted)
+        .map(|message| {
+            format!(
+                "- [{}] {} -> {}: {}",
+                message.timestamp,
+                message.from,
+                message.to,
+                compact_one_line(&message.message, MAX_REACTIVE_PROMPT_MESSAGE_CHARS)
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut out = String::new();
+    if omitted > 0 {
+        if language.is_ja() {
+            out.push_str(&format!(
+                "(トークン節約のため、古い message {} 件は省略しています。必要なら `team inbox` や mailbox jsonl を参照してください。)\n",
+                omitted
+            ));
+        } else {
+            out.push_str(&format!(
+                "(To keep this turn compact, {} older message(s) are omitted. Inspect `team inbox` or the mailbox jsonl if needed.)\n",
+                omitted
+            ));
+        }
+    }
+    out.push_str(&selected.join("\n"));
+    out
+}
+
 fn member_turn_reports_blocked(
     assistant_buffers: &HashMap<String, String>,
     member_name: &str,
@@ -10294,13 +11123,26 @@ fn current_mailbox_counts(
     tasks: &[TeamTask],
 ) -> Result<HashMap<String, usize>> {
     let mut counts = HashMap::new();
+    let language = load_config(team_dir)
+        .ok()
+        .and_then(|config| config.language)
+        .unwrap_or_default();
     for member in members {
-        let messages = read_jsonl::<MailMessage>(&mailbox_path(team_dir, &member.name))?;
+        let path = mailbox_path(team_dir, &member.name);
+        let mut messages = read_jsonl::<MailMessage>(&path)?;
         let has_open_task = tasks
             .iter()
             .any(|task| task.owner.as_deref() == Some(member.name.as_str()) && task_is_open(task));
         let count = if member.role == "lead" || has_open_task {
-            mailbox_seen_count(&messages)
+            let seen = mailbox_seen_count(&messages);
+            compact_runtime_start_mailbox_backlog(
+                team_dir,
+                &member.name,
+                &path,
+                &mut messages,
+                seen,
+                language,
+            )?
         } else {
             messages.len()
         };
@@ -10314,6 +11156,67 @@ fn mailbox_seen_count(messages: &[MailMessage]) -> usize {
         .iter()
         .position(|message| !message.read)
         .unwrap_or(messages.len())
+}
+
+fn compact_runtime_start_mailbox_backlog(
+    team_dir: &Path,
+    member_name: &str,
+    path: &Path,
+    messages: &mut Vec<MailMessage>,
+    first_unread: usize,
+    language: TeamPromptLanguage,
+) -> Result<usize> {
+    let unread_count = messages.len().saturating_sub(first_unread);
+    if unread_count <= MAX_RUNTIME_START_UNREAD_MAILBOX_MESSAGES {
+        return Ok(first_unread);
+    }
+    let old_len = messages.len();
+    let tail_start = old_len
+        .saturating_sub(MAX_RUNTIME_START_UNREAD_MAILBOX_TAIL_MESSAGES)
+        .max(first_unread);
+    let compacted_count = tail_start.saturating_sub(first_unread);
+    if compacted_count == 0 {
+        return Ok(first_unread);
+    }
+    for message in messages.iter_mut().take(tail_start).skip(first_unread) {
+        message.read = true;
+    }
+    let summary_start =
+        tail_start.saturating_sub(MAX_RUNTIME_START_UNREAD_MAILBOX_SUMMARY_MESSAGES);
+    let summary_messages = messages[summary_start..tail_start].to_vec();
+    let summarized = summarize_side_reply_messages(&summary_messages, language);
+    let summary = if language.is_ja() {
+        format!(
+            "Mailbox resume compaction: runtime 起動時点で @{member_name} に unread message が {unread_count} 件ありました。トークン節約と stale context 混入防止のため、古い {compacted_count} 件を既読化し、直近 {retained} 件とこの要約だけを実行 turn へ渡します。全履歴は team state の mailbox jsonl に残っています。\n\n古い既読化対象の末尾要約:\n{summarized}",
+            retained = old_len.saturating_sub(tail_start)
+        )
+    } else {
+        format!(
+            "Mailbox resume compaction: @{member_name} had {unread_count} unread messages when the runtime started. To reduce token pressure and stale-context injection, {compacted_count} older message(s) were marked read; only the latest {retained} message(s) plus this summary will be delivered into the next turn. The full history remains in the team state's mailbox jsonl.\n\nTail summary of compacted messages:\n{summarized}",
+            retained = old_len.saturating_sub(tail_start)
+        )
+    };
+    messages.push(MailMessage {
+        from: "system".to_string(),
+        to: member_name.to_string(),
+        message: summary,
+        timestamp: now(),
+        read: false,
+    });
+    write_jsonl_atomic(path, messages)?;
+    append_event(
+        team_dir,
+        "mailbox_resume_backlog_compacted",
+        serde_json::json!({
+            "member": member_name,
+            "first_unread": first_unread,
+            "unread_before": unread_count,
+            "compacted": compacted_count,
+            "retained_tail": old_len.saturating_sub(tail_start),
+            "summary_messages": summary_messages.len(),
+        }),
+    )?;
+    Ok(tail_start)
 }
 
 #[cfg(test)]
@@ -10516,6 +11419,46 @@ fn record_runtime_loop_error(team_dir: &Path, phase: &str, err: anyhow::Error) -
     )
 }
 
+fn stable_short_hash(value: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn attention_fingerprint_recently_sent(team_dir: &Path, kind: &str, fingerprint: &str) -> bool {
+    read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl"))
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .take(400)
+        .any(|event| {
+            event.event == "system_attention_fingerprint"
+                && event.data.get("kind").and_then(|value| value.as_str()) == Some(kind)
+                && event
+                    .data
+                    .get("fingerprint")
+                    .and_then(|value| value.as_str())
+                    == Some(fingerprint)
+        })
+}
+
+fn record_attention_fingerprint(
+    team_dir: &Path,
+    kind: &str,
+    fingerprint: &str,
+    scope: serde_json::Value,
+) -> Result<()> {
+    append_event(
+        team_dir,
+        "system_attention_fingerprint",
+        serde_json::json!({
+            "kind": kind,
+            "fingerprint": fingerprint,
+            "scope": scope,
+        }),
+    )
+}
+
 fn refresh_running_team_jobs(team_dir: &Path) -> Result<()> {
     let jobs = load_jobs(team_dir)?;
     for job in jobs {
@@ -10633,6 +11576,27 @@ fn maybe_warn_unattended_tasks(
         if !warned.insert(warning_key) {
             continue;
         }
+        let fingerprint = stable_short_hash(&format!(
+            "task-watchdog|{}|{}|{}|{}|{}",
+            task.id,
+            owner,
+            task.status,
+            task.depends_on.join(","),
+            task.result.as_deref().unwrap_or("")
+        ));
+        if attention_fingerprint_recently_sent(team_dir, "task_watchdog", &fingerprint) {
+            append_event(
+                team_dir,
+                "task_watchdog_attention_skipped",
+                serde_json::json!({
+                    "task": task.id,
+                    "owner": owner,
+                    "reason": "same_fingerprint_recently_sent",
+                    "fingerprint": fingerprint,
+                }),
+            )?;
+            continue;
+        }
         let proposal_lines =
             collect_recent_lead_proposals_for_task(team_dir, &config.lead, &task.id, 3)?;
         let proposal_note = if proposal_lines.is_empty() {
@@ -10679,6 +11643,16 @@ fn maybe_warn_unattended_tasks(
         if owner_cooldown.is_none() && config.members.iter().any(|member| member.name == owner) {
             send_team_message_to_dir(team_dir, "system", owner, &message)?;
         }
+        record_attention_fingerprint(
+            team_dir,
+            "task_watchdog",
+            &fingerprint,
+            serde_json::json!({
+                "task": task.id,
+                "owner": owner,
+                "status": task.status,
+            }),
+        )?;
         let mut reactivated_owner = false;
         if owner_cooldown.is_none()
             && task_status_can_start_turn(task.status)
@@ -10744,6 +11718,23 @@ fn warn_open_waits_on_unavailable_nodes(
         if !warned.insert(warning_key) {
             continue;
         }
+        let fingerprint = stable_short_hash(&format!(
+            "wait-node|{}|{}|{}|{}|{}|{}",
+            wait.id, wait.status, node_id, unavailable.reason, wait.condition, wait.progress
+        ));
+        if attention_fingerprint_recently_sent(team_dir, "wait_node_unavailable", &fingerprint) {
+            append_event(
+                team_dir,
+                "wait_node_unavailable_attention_skipped",
+                serde_json::json!({
+                    "wait": wait.id,
+                    "node": node_id,
+                    "reason": "same_fingerprint_recently_sent",
+                    "fingerprint": fingerprint,
+                }),
+            )?;
+            continue;
+        }
         let owner = wait.owner.as_deref().unwrap_or("unassigned");
         let task = wait.task_id.as_deref().unwrap_or("-");
         let message = if language.is_ja() {
@@ -10775,6 +11766,16 @@ fn warn_open_waits_on_unavailable_nodes(
         if config.members.iter().any(|member| member.name == owner) {
             send_team_message_to_dir(team_dir, "system", owner, &message)?;
         }
+        record_attention_fingerprint(
+            team_dir,
+            "wait_node_unavailable",
+            &fingerprint,
+            serde_json::json!({
+                "wait": wait.id,
+                "node": node_id,
+                "status": wait.status,
+            }),
+        )?;
         append_event(
             team_dir,
             "wait_node_unavailable_attention",
@@ -11306,10 +12307,7 @@ fn handoff_text_file_contains_completion_checklist(path: &Path) -> Result<bool> 
         return Ok(false);
     }
     let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let trimmed = content.trim_start_matches('\u{feff}').trim_start();
-    Ok(trimmed
-        .to_ascii_lowercase()
-        .starts_with("team_completion_checklist:"))
+    Ok(message_has_substantive_completion_checklist(&content))
 }
 
 enum HandoffFileKind {
@@ -11384,6 +12382,17 @@ fn maybe_send_lead_autonomy_tick(
         return Ok(());
     }
     *last_tick = now_instant;
+    if interactive_lead_attached(team_dir)? {
+        append_event(
+            team_dir,
+            "lead_autonomy_tick_deferred_for_interactive_tui",
+            serde_json::json!({
+                "lead": config.lead,
+                "reason": "interactive lead TUI is attached; do not steal the user's prompt",
+            }),
+        )?;
+        return Ok(());
+    }
 
     let tasks = load_tasks(team_dir)?;
     let waits = load_waits(team_dir)?;
@@ -11416,6 +12425,23 @@ fn maybe_send_lead_autonomy_tick(
                 "retry_after_sec": remaining.as_secs(),
                 "open_tasks": open_tasks.len(),
                 "active_turns": active.values().filter(|run| !run.completed).count(),
+            }),
+        )?;
+        return Ok(());
+    }
+    if let Some(lead_run) = active.get(&config.lead)
+        && !lead_run.completed
+    {
+        append_event(
+            team_dir,
+            "lead_autonomy_tick_skipped",
+            serde_json::json!({
+                "lead": config.lead,
+                "reason": "lead_turn_active",
+                "open_tasks": open_tasks.len(),
+                "open_waits": open_waits.len(),
+                "quiet_for_sec": now_instant.duration_since(lead_run.last_activity_at).as_secs(),
+                "last_activity": lead_run.last_activity_kind,
             }),
         )?;
         return Ok(());
@@ -12024,6 +13050,34 @@ fn maybe_send_department_idle_wakeups(
             })
             .count();
         let member_has_open_tasks = member_open_task_count > 0;
+        let unread = mailbox_unread_counts(team_dir, &member.name).unwrap_or_default();
+        if !member_has_open_tasks
+            && unread.direct_unread == 0
+            && let Some(backoff) = recent_stay_backoff_remaining(team_dir, &member.name, interval)?
+        {
+            if last_wakeup
+                .get(&member.name)
+                .is_some_and(|last| now_instant.duration_since(*last) < interval)
+            {
+                continue;
+            }
+            last_wakeup.insert(member.name.clone(), now_instant);
+            idle_since.remove(&member.name);
+            append_event(
+                team_dir,
+                "department_idle_wakeup_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "recent_stay_backoff",
+                    "backoff_remaining_sec": backoff.as_secs(),
+                    "owned_open_tasks": member_open_task_count,
+                    "direct_unread": unread.direct_unread,
+                }),
+            )?;
+            continue;
+        }
         if let Some(unavailable) = member_node_unavailable_from_nodes(member, &nodes) {
             if last_wakeup
                 .get(&member.name)
@@ -12170,7 +13224,7 @@ fn maybe_send_department_idle_wakeups(
             "{}",
             if language.is_ja() {
                 format!(
-                    "Department idle wakeup for @{name}: {idle}s active turn がありません。inbox/open task/handoff/job/artifact を確認し、再開可能・誤割当・重複・ready gate があれば evidence 付き `LEAD_PROPOSAL:` を lead へ。不要なら `STAY:` 一行で終了。busywork は作らないでください。\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks:\n{team_tasks}",
+                    "Department idle wakeup for @{name}: {idle}s active turn がありません。自分宛て未読/担当task/明確なready gateだけ確認し、再開・誤割当・重複・支援提案がある時だけ `LEAD_PROPOSAL:` を evidence 付きで lead へ。不要なら `STAY:` 一行だけで終了してください。\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks snapshot:\n{team_tasks}",
                     name = member.name,
                     idle = idle_for.as_secs(),
                     member_tasks = if member_tasks.is_empty() {
@@ -12186,7 +13240,7 @@ fn maybe_send_department_idle_wakeups(
                 )
             } else {
                 format!(
-                    "Department idle wakeup for @{name}: no active app-server turn for {idle}s. Check inbox/open tasks/handoffs/jobs/artifacts; send lead `LEAD_PROPOSAL:` with evidence if a resume/reassign/review/ready-gate action is useful. If no action is needed, send one-line `STAY:` and finish. Do not invent busywork.\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks:\n{team_tasks}",
+                    "Department idle wakeup for @{name}: no active app-server turn for {idle}s. Check only direct unread mail, your open tasks, and obvious ready-gate/help proposals. Send lead `LEAD_PROPOSAL:` with evidence only if action is useful; otherwise send one-line `STAY:` and stop.\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks snapshot:\n{team_tasks}",
                     name = member.name,
                     idle = idle_for.as_secs(),
                     member_tasks = if member_tasks.is_empty() {
@@ -12223,6 +13277,63 @@ fn maybe_send_department_idle_wakeups(
         }
     }
     Ok(())
+}
+
+fn recent_stay_backoff_remaining(
+    team_dir: &Path,
+    member_name: &str,
+    base_interval: Duration,
+) -> Result<Option<Duration>> {
+    let events_path = team_dir.join("events.jsonl");
+    if !events_path.exists() {
+        return Ok(None);
+    }
+    let events = read_jsonl::<TeamEventRecord>(&events_path)?;
+    let mut stay_count = 0_u32;
+    let mut latest_stay_timestamp = None::<chrono::DateTime<Utc>>;
+    for event in events.into_iter().rev().take(400) {
+        if event.event != "message_sent" {
+            continue;
+        }
+        let Some(from) = event.data.get("from").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if from != member_name {
+            continue;
+        }
+        let message = event
+            .data
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if is_stay_message(message) {
+            stay_count += 1;
+            if latest_stay_timestamp.is_none()
+                && let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            {
+                latest_stay_timestamp = Some(timestamp.with_timezone(&Utc));
+            }
+            continue;
+        }
+        break;
+    }
+    if stay_count == 0 {
+        return Ok(None);
+    }
+    let Some(latest_stay_timestamp) = latest_stay_timestamp else {
+        return Ok(None);
+    };
+    let elapsed = Utc::now() - latest_stay_timestamp;
+    let Ok(elapsed) = elapsed.to_std() else {
+        return Ok(None);
+    };
+    let multiplier = 2_u32.saturating_pow(stay_count.min(3));
+    let backoff = base_interval.saturating_mul(multiplier);
+    if elapsed >= backoff {
+        Ok(None)
+    } else {
+        Ok(Some(backoff - elapsed))
+    }
 }
 
 fn seed_department_idle_wakeup_cooldowns(
@@ -12351,27 +13462,6 @@ fn maybe_send_department_heartbeats(
             )?;
             continue;
         }
-        if member_tasks.is_empty() && !active_run {
-            let entry = heartbeats
-                .entry(member.name.clone())
-                .or_insert(now_instant - interval);
-            if now_instant.duration_since(*entry) < interval {
-                continue;
-            }
-            *entry = now_instant;
-            append_event(
-                team_dir,
-                "department_heartbeat_skipped",
-                serde_json::json!({
-                    "member": member.name,
-                    "role": member.role,
-                    "node": member_node_id(member),
-                    "reason": "no_open_tasks",
-                    "status": format!("{:?}", member.status),
-                }),
-            )?;
-            continue;
-        }
         if active_run {
             let entry = heartbeats
                 .entry(member.name.clone())
@@ -12465,6 +13555,55 @@ fn maybe_send_department_heartbeats(
                     "node": member_node_id(member),
                     "reason": "usage_limit_cooldown",
                     "retry_after_sec": remaining.as_secs(),
+                }),
+            )?;
+            continue;
+        }
+        if member_tasks.is_empty() && !active_run {
+            let entry = heartbeats
+                .entry(member.name.clone())
+                .or_insert(now_instant - interval);
+            if now_instant.duration_since(*entry) < interval {
+                continue;
+            }
+            *entry = now_instant;
+            append_event(
+                team_dir,
+                "department_heartbeat_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "no_open_tasks",
+                    "status": format!("{:?}", member.status),
+                }),
+            )?;
+            continue;
+        }
+        if !active_run
+            && mailbox_unread_counts(team_dir, &member.name)
+                .unwrap_or_default()
+                .direct_unread
+                == 0
+            && let Some(backoff) = recent_stay_backoff_remaining(team_dir, &member.name, interval)?
+        {
+            let entry = heartbeats
+                .entry(member.name.clone())
+                .or_insert(now_instant - interval);
+            if now_instant.duration_since(*entry) < interval {
+                continue;
+            }
+            *entry = now_instant;
+            append_event(
+                team_dir,
+                "department_heartbeat_skipped",
+                serde_json::json!({
+                    "member": member.name,
+                    "role": member.role,
+                    "node": member_node_id(member),
+                    "reason": "recent_stay_backoff",
+                    "backoff_remaining_sec": backoff.as_secs(),
+                    "open_tasks": member_tasks.len(),
                 }),
             )?;
             continue;
@@ -12689,6 +13828,17 @@ fn active_external_wait_ids_for_member(team_dir: &Path, member_name: &str) -> Re
         .collect())
 }
 
+fn active_turn_token_pressure(team_dir: &Path, run: &AppServerMemberRun) -> Result<Option<i64>> {
+    let Some(usage) = latest_thread_token_usage(team_dir, &run.node_id, &run.thread_id)? else {
+        return Ok(None);
+    };
+    if thread_usage_exceeds_rotation_limit(&usage) {
+        Ok(Some(usage.total.total_tokens))
+    } else {
+        Ok(None)
+    }
+}
+
 fn record_deferred_active_turn_context(
     team_dir: &Path,
     run: &AppServerMemberRun,
@@ -12758,6 +13908,54 @@ fn active_turn_messages_are_deferrable_system_nudges(messages: &[MailMessage]) -
     !messages.is_empty() && messages.iter().all(|message| message.from == "system")
 }
 
+fn active_turn_recently_steered(
+    team_dir: &Path,
+    run: &AppServerMemberRun,
+    min_interval: Duration,
+) -> Result<Option<Duration>> {
+    let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl"))?;
+    let now_utc = Utc::now();
+    for event in events
+        .into_iter()
+        .rev()
+        .filter(|event| event.event == "app_server_turn_steered")
+    {
+        let Some(member) = event.data.get("member").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if member != run.member.name {
+            continue;
+        }
+        let Some(thread) = event.data.get("thread").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if thread != run.thread_id {
+            continue;
+        }
+        let Some(turn) = event.data.get("turn").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if turn != run.turn_id {
+            continue;
+        }
+        let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&event.timestamp) else {
+            continue;
+        };
+        let elapsed = now_utc - timestamp.with_timezone(&Utc);
+        if elapsed < chrono::Duration::zero() {
+            return Ok(Some(Duration::ZERO));
+        }
+        let Ok(elapsed) = elapsed.to_std() else {
+            continue;
+        };
+        if elapsed < min_interval {
+            return Ok(Some(min_interval.saturating_sub(elapsed)));
+        }
+        return Ok(None);
+    }
+    Ok(None)
+}
+
 async fn steer_new_team_messages(
     node_clients: &mut HashMap<String, TeamAppServerNodeClient>,
     team_dir: &Path,
@@ -12803,6 +14001,26 @@ async fn steer_new_team_messages(
         let Some(run) = active.get(&member_name).cloned() else {
             continue;
         };
+        if run.member.role == "lead" && interactive_lead_attached(team_dir)? {
+            append_event(
+                team_dir,
+                "interactive_lead_mailbox_delivery_deferred",
+                serde_json::json!({
+                    "member": member_name,
+                    "messages": messages.len(),
+                    "seen": pending.seen,
+                    "reason": "interactive lead TUI is attached; mailbox remains inspectable but no hidden runtime prompt is submitted to the visible lead thread",
+                }),
+            )?;
+            acknowledge_mailbox_delivery(
+                team_dir,
+                mailbox_counts,
+                &member_name,
+                pending.seen,
+                messages.len(),
+            )?;
+            continue;
+        }
         if run.completed {
             if run.member.role == "lead" {
                 let config = load_config(team_dir)?;
@@ -12896,9 +14114,6 @@ async fn steer_new_team_messages(
             continue;
         }
         let active_external_waits = active_external_wait_ids_for_member(team_dir, &member_name)?;
-        if let Some(run) = active.get_mut(&member_name) {
-            run.usage_category = usage_category_for_messages(&run.usage_category, &messages);
-        }
         if !active_external_waits.is_empty() {
             let mut side_started = false;
             if side_channel_replies {
@@ -12965,6 +14180,109 @@ async fn steer_new_team_messages(
                     "thread": run.thread_id,
                     "turn": run.turn_id,
                     "messages": messages.len(),
+                    "deferred_context": context_id,
+                }),
+            )?;
+            acknowledge_mailbox_delivery(
+                team_dir,
+                mailbox_counts,
+                &member_name,
+                pending.seen,
+                messages.len(),
+            )?;
+            continue;
+        }
+        if let Some(wait_remaining) = active_turn_recently_steered(
+            team_dir,
+            &run,
+            Duration::from_secs(MIN_ACTIVE_TURN_STEER_INTERVAL_SECS),
+        )? {
+            let mut side_started = false;
+            if side_channel_replies {
+                let side_messages = messages
+                    .iter()
+                    .filter(|message| side_channel_message_needs_fast_reply(&member_name, message))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !side_messages.is_empty() {
+                    side_started = start_app_server_side_channel_reply(
+                        node_clients,
+                        team_dir,
+                        side_replies,
+                        &run,
+                        side_messages,
+                        model.clone(),
+                        approval_policy.clone(),
+                        dangerously_bypass_approvals_and_sandbox,
+                        language,
+                        false,
+                    )
+                    .await?;
+                }
+            }
+            let context_id =
+                record_deferred_active_turn_context(team_dir, &run, &messages, &[], language)?;
+            append_event(
+                team_dir,
+                "app_server_turn_steer_deferred_rate_limit",
+                serde_json::json!({
+                    "member": member_name,
+                    "node": run.node_id,
+                    "thread": run.thread_id,
+                    "turn": run.turn_id,
+                    "messages": messages.len(),
+                    "min_interval_sec": MIN_ACTIVE_TURN_STEER_INTERVAL_SECS,
+                    "retry_after_sec": wait_remaining.as_secs(),
+                    "side_channel_reply_started": side_started,
+                    "deferred_context": context_id,
+                }),
+            )?;
+            acknowledge_mailbox_delivery(
+                team_dir,
+                mailbox_counts,
+                &member_name,
+                pending.seen,
+                messages.len(),
+            )?;
+            continue;
+        }
+        if let Some(total_tokens) = active_turn_token_pressure(team_dir, &run)? {
+            let mut side_started = false;
+            if side_channel_replies {
+                let side_messages = messages
+                    .iter()
+                    .filter(|message| side_channel_message_needs_fast_reply(&member_name, message))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !side_messages.is_empty() {
+                    side_started = start_app_server_side_channel_reply(
+                        node_clients,
+                        team_dir,
+                        side_replies,
+                        &run,
+                        side_messages,
+                        model.clone(),
+                        approval_policy.clone(),
+                        dangerously_bypass_approvals_and_sandbox,
+                        language,
+                        false,
+                    )
+                    .await?;
+                }
+            }
+            let context_id =
+                record_deferred_active_turn_context(team_dir, &run, &messages, &[], language)?;
+            append_event(
+                team_dir,
+                "app_server_turn_steer_deferred_token_pressure",
+                serde_json::json!({
+                    "member": member_name,
+                    "node": run.node_id,
+                    "thread": run.thread_id,
+                    "turn": run.turn_id,
+                    "messages": messages.len(),
+                    "total_tokens": total_tokens,
+                    "side_channel_reply_started": side_started,
                     "deferred_context": context_id,
                 }),
             )?;
@@ -13061,6 +14379,15 @@ async fn steer_new_team_messages(
                                 system_messages.len(),
                                 Ok::<TurnSteerResponse, String>(response),
                             )?;
+                            let category =
+                                usage_category_for_messages(&run.usage_category, &system_messages);
+                            update_active_turn_usage_category(
+                                team_dir,
+                                active,
+                                &member_name,
+                                category,
+                                "app_server_turn_steer_classified",
+                            )?;
                             mark_side_channel_contexts_injected(
                                 team_dir,
                                 &member_name,
@@ -13136,6 +14463,14 @@ async fn steer_new_team_messages(
                     &run,
                     messages.len(),
                     Ok::<TurnSteerResponse, String>(response),
+                )?;
+                let category = usage_category_for_messages(&run.usage_category, &messages);
+                update_active_turn_usage_category(
+                    team_dir,
+                    active,
+                    &member_name,
+                    category,
+                    "app_server_turn_steer_classified",
                 )?;
                 mark_side_channel_contexts_injected(
                     team_dir,
@@ -13755,22 +15090,881 @@ fn run_lead_synthesis(
     }
 }
 
-fn list_teams(root: &Path) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct TeamListRow {
+    id: String,
+    runtime: String,
+    updated_at: String,
+    open_tasks: usize,
+    open_waits: usize,
+    idle_for_sec: Option<u64>,
+    run_pid: Option<u32>,
+    ui_pid: Option<u32>,
+    goal: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MemberJournalEntry {
+    timestamp: String,
+    member: String,
+    role: String,
+    status: String,
+    node: String,
+    fingerprint: u64,
+    summary: String,
+    tasks: Vec<String>,
+    jobs: Vec<String>,
+    waits: Vec<String>,
+    messages_sent: Vec<String>,
+    messages_received: Vec<String>,
+    events: Vec<String>,
+    last_output_excerpt: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MemberDigestJournalState {
+    #[serde(default)]
+    members: HashMap<String, MemberDigestMemberState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MemberDigestMemberState {
+    fingerprint: u64,
+    last_trigger: String,
+    last_spawned_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MemberDigestLaunchEntry {
+    timestamp: String,
+    member: String,
+    trigger: String,
+    fingerprint: u64,
+    digest_path: String,
+    log_path: String,
+    prompt_path: String,
+}
+
+fn list_teams(root: &Path, args: ListArgs) -> Result<()> {
     let mut teams = load_team_summaries(root)?;
     if teams.is_empty() {
         println!("No teams found.");
         return Ok(());
     }
     teams.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let mut rows = Vec::new();
     for team in teams {
+        let team_dir = root.join(&team.id);
+        let mut status = team_run_status_for_dir(&team_dir, &team.id);
+        if args.live_only && matches!(status, UiTeamRunStatus::Exiting | UiTeamRunStatus::Unknown) {
+            continue;
+        }
+        let tasks = load_tasks(&team_dir).unwrap_or_default();
+        let waits = load_waits(&team_dir).unwrap_or_default();
+        let open_tasks = open_task_count(&tasks);
+        let open_waits = open_wait_count(&waits);
+        let idle_for_sec = if matches!(status, UiTeamRunStatus::Stop) {
+            team_keep_alive_idle_age_secs(&team_dir)?
+        } else {
+            None
+        };
+        if args.pause_idle_after_sec > 0
+            && matches!(status, UiTeamRunStatus::Stop)
+            && idle_for_sec.is_some_and(|age| age >= args.pause_idle_after_sec)
+        {
+            stop_one_team_runtime(root, &team_dir, &team, false, false)?;
+            status = UiTeamRunStatus::Exiting;
+        }
+        rows.push(TeamListRow {
+            id: team.id.clone(),
+            runtime: status.label().to_string(),
+            updated_at: team.updated_at.clone(),
+            open_tasks,
+            open_waits,
+            idle_for_sec,
+            run_pid: read_team_run_pid(&team_dir),
+            ui_pid: read_ui_team_pid(root, &team.id),
+            goal: compact_one_line(&team.goal, 240),
+        });
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<14} {:>5} {:>5} {:>9}  {:<25} {}",
+        "TEAM", "RUNTIME", "TASKS", "WAITS", "IDLE", "UPDATED", "GOAL"
+    );
+    for row in rows {
+        let idle = row
+            .idle_for_sec
+            .map(format_idle_seconds)
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "{}  {}  {}",
-            team.id,
-            team.updated_at,
-            compact_one_line(&team.goal, 240)
+            "{:<24} {:<14} {:>5} {:>5} {:>9}  {:<25} {}",
+            row.id,
+            row.runtime,
+            row.open_tasks,
+            row.open_waits,
+            idle,
+            timestamp_for_ui(&row.updated_at),
+            row.goal
         );
     }
     Ok(())
+}
+
+fn format_idle_seconds(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+fn member_journal_dir(team_dir: &Path) -> PathBuf {
+    team_dir.join("member_journals")
+}
+
+fn member_journal_entries_path(team_dir: &Path, member: &str) -> PathBuf {
+    member_journal_dir(team_dir).join(format!("{}.jsonl", sanitize_id(member)))
+}
+
+fn member_journal_markdown_path(team_dir: &Path, member: &str) -> PathBuf {
+    member_journal_dir(team_dir).join(format!("{}.md", sanitize_id(member)))
+}
+
+fn member_digest_markdown_path(team_dir: &Path, member: &str) -> PathBuf {
+    member_journal_dir(team_dir).join(format!("{}.digest.md", sanitize_id(member)))
+}
+
+fn member_digest_log_path(team_dir: &Path, member: &str) -> PathBuf {
+    member_journal_dir(team_dir).join(format!("{}.digest.log", sanitize_id(member)))
+}
+
+fn member_digest_prompt_path(team_dir: &Path, member: &str) -> PathBuf {
+    member_journal_dir(team_dir).join(format!("{}.digest.prompt.md", sanitize_id(member)))
+}
+
+fn member_digest_launches_path(team_dir: &Path, member: &str) -> PathBuf {
+    member_journal_dir(team_dir).join(format!("{}.digest.jsonl", sanitize_id(member)))
+}
+
+fn member_digest_state_path(team_dir: &Path) -> PathBuf {
+    member_journal_dir(team_dir).join("digest_state.json")
+}
+
+fn update_member_journals(team_dir: &Path, config: &TeamConfig) -> Result<()> {
+    fs::create_dir_all(member_journal_dir(team_dir))?;
+    let tasks = load_tasks(team_dir).unwrap_or_default();
+    let jobs = load_jobs(team_dir).unwrap_or_default();
+    let waits = load_waits(team_dir).unwrap_or_default();
+    let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).unwrap_or_default();
+    let now_ts = now();
+    for member in &config.members {
+        let entry =
+            build_member_journal_entry(team_dir, member, &tasks, &jobs, &waits, &events, &now_ts)?;
+        let path = member_journal_entries_path(team_dir, &member.name);
+        let mut entries = read_jsonl::<MemberJournalEntry>(&path).unwrap_or_default();
+        let should_append = entries
+            .last()
+            .map(|latest| latest.fingerprint != entry.fingerprint)
+            .unwrap_or(true);
+        if should_append {
+            entries.push(entry);
+            let keep_from = entries.len().saturating_sub(240);
+            let retained = entries.into_iter().skip(keep_from).collect::<Vec<_>>();
+            write_jsonl_atomic(&path, &retained)?;
+            write_member_journal_markdown(team_dir, member, &retained)?;
+        } else if !member_journal_markdown_path(team_dir, &member.name).exists() {
+            write_member_journal_markdown(team_dir, member, &entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn maybe_sync_member_journals_to_nodes(
+    team_dir: &Path,
+    nodes: &[TeamNode],
+    node_clients: &HashMap<String, TeamAppServerNodeClient>,
+    last_sync: &mut HashMap<String, Instant>,
+    interval: Duration,
+) -> Result<()> {
+    let src = member_journal_dir(team_dir);
+    if !src.exists() {
+        return Ok(());
+    }
+    let config = load_config(team_dir)?;
+    let now_instant = Instant::now();
+    let dest = format!("$HOME/.codex/teams/{}/member_journals", config.id);
+    for node in nodes {
+        if matches!(node.kind, TeamNodeKind::Local | TeamNodeKind::Manual) {
+            continue;
+        }
+        if !node_clients.contains_key(&node.id) {
+            continue;
+        }
+        if last_sync
+            .get(&node.id)
+            .is_some_and(|last| now_instant.duration_since(*last) < interval)
+        {
+            continue;
+        }
+        last_sync.insert(node.id.clone(), now_instant);
+        match build_path_sync_command(node, &src, &dest, true)
+            .and_then(|(command, _)| run_shell_command(&command, "sync member journals to node"))
+        {
+            Ok(()) => {
+                append_event(
+                    team_dir,
+                    "member_journals_node_synced",
+                    serde_json::json!({
+                        "node": node.id,
+                        "dest": dest,
+                        "source": "local_team_state",
+                        "direction": "local_to_node",
+                    }),
+                )?;
+            }
+            Err(err) => {
+                append_event(
+                    team_dir,
+                    "member_journals_node_sync_failed",
+                    serde_json::json!({
+                        "node": node.id,
+                        "dest": dest,
+                        "error": err.to_string(),
+                    }),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn maybe_generate_member_digest_journals(
+    team_dir: &Path,
+    codex_exe: &Path,
+    model: Option<&str>,
+    profile: Option<&str>,
+    sandbox: Option<&str>,
+    dangerously_bypass_approvals_and_sandbox: bool,
+) -> Result<()> {
+    fs::create_dir_all(member_journal_dir(team_dir))?;
+    let config = load_config(team_dir)?;
+    let tasks = load_tasks(team_dir).unwrap_or_default();
+    let jobs = load_jobs(team_dir).unwrap_or_default();
+    let waits = load_waits(team_dir).unwrap_or_default();
+    let mut state = read_json::<MemberDigestJournalState>(&member_digest_state_path(team_dir))
+        .unwrap_or_default();
+    let mut changed = false;
+    for member in &config.members {
+        let Some((fingerprint, trigger)) =
+            member_digest_trigger_fingerprint(team_dir, member, &tasks, &jobs, &waits)
+        else {
+            continue;
+        };
+        if state
+            .members
+            .get(&member.name)
+            .is_some_and(|existing| existing.fingerprint == fingerprint)
+        {
+            continue;
+        }
+        if state
+            .members
+            .get(&member.name)
+            .and_then(|existing| parse_rfc3339_utc(&existing.last_spawned_at).ok())
+            .is_some_and(|last| Utc::now().signed_duration_since(last).num_seconds() < 300)
+        {
+            continue;
+        }
+        let launch = spawn_member_digest_generation(
+            team_dir,
+            &config,
+            member,
+            &trigger,
+            fingerprint,
+            codex_exe,
+            model,
+            profile,
+            sandbox,
+            dangerously_bypass_approvals_and_sandbox,
+        )?;
+        append_jsonl(
+            &member_digest_launches_path(team_dir, &member.name),
+            &launch,
+        )?;
+        state.members.insert(
+            member.name.clone(),
+            MemberDigestMemberState {
+                fingerprint,
+                last_trigger: trigger,
+                last_spawned_at: launch.timestamp.clone(),
+            },
+        );
+        changed = true;
+    }
+    if changed {
+        write_json_atomic(&member_digest_state_path(team_dir), &state)?;
+    }
+    Ok(())
+}
+
+fn member_digest_trigger_fingerprint(
+    team_dir: &Path,
+    member: &TeamMember,
+    tasks: &[TeamTask],
+    jobs: &[TeamJob],
+    waits: &[TeamWait],
+) -> Option<(u64, String)> {
+    let member_name = member.name.as_str();
+    let mut lines = Vec::<String>::new();
+    if matches!(
+        member.status,
+        MemberStatus::Standby | MemberStatus::Completed | MemberStatus::Failed
+    ) {
+        lines.push(format!("member {} status={:?}", member.name, member.status));
+    }
+    for task in tasks
+        .iter()
+        .filter(|task| task.owner.as_deref() == Some(member_name))
+    {
+        if matches!(
+            task.status,
+            TaskStatus::Completed
+                | TaskStatus::Blocked
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
+        ) {
+            lines.push(format!(
+                "task {} status={} subject={} result={}",
+                task.id,
+                task.status,
+                compact_one_line(&task.subject, 160),
+                compact_one_line(task.result.as_deref().unwrap_or(""), 220)
+            ));
+        }
+    }
+    for job in jobs
+        .iter()
+        .filter(|job| job.owner.as_deref() == Some(member_name))
+    {
+        if matches!(
+            job.status,
+            TeamJobStatus::Completed | TeamJobStatus::Failed | TeamJobStatus::Stopped
+        ) {
+            lines.push(format!(
+                "job {} status={:?} task={} exit={} command={}",
+                job.id,
+                job.status,
+                job.task_id.as_deref().unwrap_or("-"),
+                job.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                compact_one_line(&job.command, 180)
+            ));
+        }
+    }
+    for wait in waits
+        .iter()
+        .filter(|wait| wait.owner.as_deref() == Some(member_name))
+    {
+        if matches!(
+            wait.status,
+            TeamWaitStatus::Completed
+                | TeamWaitStatus::Failed
+                | TeamWaitStatus::Blocked
+                | TeamWaitStatus::Cancelled
+        ) {
+            lines.push(format!(
+                "wait {} status={} task={} title={} progress={} evidence={}",
+                wait.id,
+                wait.status,
+                wait.task_id.as_deref().unwrap_or("-"),
+                compact_one_line(&wait.title, 120),
+                compact_one_line(&wait.progress, 220),
+                compact_one_line(wait.evidence.as_deref().unwrap_or(""), 160)
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort();
+    let machine_fingerprint =
+        read_jsonl::<MemberJournalEntry>(&member_journal_entries_path(team_dir, &member.name))
+            .ok()
+            .and_then(|entries| entries.last().map(|entry| entry.fingerprint))
+            .unwrap_or(0);
+    let mut hasher = DefaultHasher::new();
+    member.name.hash(&mut hasher);
+    lines.hash(&mut hasher);
+    machine_fingerprint.hash(&mut hasher);
+    Some((hasher.finish(), lines.join("\n")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_member_digest_generation(
+    team_dir: &Path,
+    config: &TeamConfig,
+    member: &TeamMember,
+    trigger: &str,
+    fingerprint: u64,
+    codex_exe: &Path,
+    model: Option<&str>,
+    profile: Option<&str>,
+    sandbox: Option<&str>,
+    dangerously_bypass_approvals_and_sandbox: bool,
+) -> Result<MemberDigestLaunchEntry> {
+    let timestamp = now();
+    let digest_path = member_digest_markdown_path(team_dir, &member.name);
+    let log_path = member_digest_log_path(team_dir, &member.name);
+    let prompt_path = member_digest_prompt_path(team_dir, &member.name);
+    let prompt = build_member_digest_prompt(team_dir, config, member, trigger, fingerprint)?;
+    write_text_atomic(&prompt_path, &prompt)?;
+
+    let stdout = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open {}", log_path.display()))?;
+    let stderr = stdout.try_clone()?;
+    let mut command = Command::new(codex_exe);
+    command
+        .arg("exec")
+        .arg("-C")
+        .arg(team_dir)
+        .arg("-o")
+        .arg(&digest_path)
+        .env("CODEX_TEAM_ID", &config.id)
+        .env("CODEX_TEAM_MEMBER", format!("{}_digest", member.name))
+        .env("CODEX_TEAM_ROLE", "journal_digest")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    if let Some(model) = model {
+        command.arg("--model").arg(model);
+    }
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    if let Some(sandbox) = sandbox {
+        command.arg("--sandbox").arg(sandbox);
+    }
+    if dangerously_bypass_approvals_and_sandbox {
+        command.arg("--dangerously-bypass-approvals-and-sandbox");
+    }
+    command.arg(prompt);
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawn AI digest journal for `{}`", member.name))?;
+    append_event(
+        team_dir,
+        "member_digest_journal_started",
+        serde_json::json!({
+            "member": member.name,
+            "pid": child.id(),
+            "trigger_fingerprint": fingerprint,
+            "digest": digest_path,
+            "log": log_path,
+            "prompt": prompt_path,
+        }),
+    )?;
+    Ok(MemberDigestLaunchEntry {
+        timestamp,
+        member: member.name.clone(),
+        trigger: trigger.to_string(),
+        fingerprint,
+        digest_path: digest_path.display().to_string(),
+        log_path: log_path.display().to_string(),
+        prompt_path: prompt_path.display().to_string(),
+    })
+}
+
+fn build_member_digest_prompt(
+    team_dir: &Path,
+    config: &TeamConfig,
+    member: &TeamMember,
+    trigger: &str,
+    fingerprint: u64,
+) -> Result<String> {
+    let machine_journal = fs::read_to_string(member_journal_markdown_path(team_dir, &member.name))
+        .unwrap_or_else(|_| "No machine journal exists yet.".to_string());
+    let previous_digest = fs::read_to_string(member_digest_markdown_path(team_dir, &member.name))
+        .unwrap_or_else(|_| "No previous AI digest exists yet.".to_string());
+    let language_note = if config.language.unwrap_or_default().is_ja() {
+        "Write the digest in Japanese."
+    } else {
+        "Write the digest in English."
+    };
+    Ok(format!(
+        r#"You are writing an AI digest journal for one Codex Teams department.
+
+This digest is an interpretation layer, not the source of truth. Do not invent facts. Base the digest on the machine journal, trigger, tasks/jobs/waits/messages/events, and previous digest below. If evidence is missing, say so.
+
+{language_note}
+
+Team: {team_id}
+Goal: {goal}
+Department: {member}
+Role: {role}
+Node: {node}
+Trigger fingerprint: {fingerprint}
+
+Trigger that caused this digest:
+```text
+{trigger}
+```
+
+Write the digest with exactly these sections:
+
+# AI Digest Journal: {member}
+
+- updated_at:
+- trigger:
+- scope:
+
+## この部署が考えていたこと
+
+## 進めたこと
+
+## 詰まっていること
+
+## 判断・前提
+
+## 他部署への依存
+
+## 次にやるべきこと
+
+## 根拠
+- tasks:
+- jobs:
+- waits:
+- messages:
+- artifacts:
+
+Guidelines:
+- Explain what this department was trying to accomplish and why.
+- Explain what changed since the previous digest.
+- Preserve uncertainties and blockers; do not convert weak evidence into success.
+- Keep it useful for another department that wants to understand this member's background before asking questions.
+- Prefer concise but substantive bullets over generic status prose.
+
+Previous AI digest:
+```md
+{previous_digest}
+```
+
+Current machine journal:
+```md
+{machine_journal}
+```
+"#,
+        language_note = language_note,
+        team_id = config.id,
+        goal = compact_one_line(&config.goal, 1200),
+        member = member.name,
+        role = member.role,
+        node = member_node_id(member),
+        fingerprint = fingerprint,
+        trigger = trigger,
+        previous_digest = tail_chars(&previous_digest, 6000),
+        machine_journal = tail_chars(&machine_journal, 14000),
+    ))
+}
+
+fn build_member_journal_entry(
+    team_dir: &Path,
+    member: &TeamMember,
+    tasks: &[TeamTask],
+    jobs: &[TeamJob],
+    waits: &[TeamWait],
+    events: &[TeamEventRecord],
+    timestamp: &str,
+) -> Result<MemberJournalEntry> {
+    let member_name = member.name.as_str();
+    let node = member_node_id(member);
+    let task_lines = tasks
+        .iter()
+        .filter(|task| task.owner.as_deref() == Some(member_name))
+        .take(12)
+        .map(|task| {
+            format!(
+                "T{} [{}] {}{}",
+                task.id,
+                task.status,
+                compact_one_line(&task.subject, 140),
+                task.result
+                    .as_deref()
+                    .filter(|result| !result.trim().is_empty())
+                    .map(|result| format!(" | result={}", compact_one_line(result, 120)))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>();
+    let job_lines = jobs
+        .iter()
+        .filter(|job| job.owner.as_deref() == Some(member_name))
+        .rev()
+        .take(10)
+        .map(|job| {
+            format!(
+                "{} [{:?}] node={} task={} exit={} cmd={}",
+                job.id,
+                job.status,
+                job.node,
+                job.task_id.as_deref().unwrap_or("-"),
+                job.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                compact_one_line(&job.command, 120)
+            )
+        })
+        .collect::<Vec<_>>();
+    let wait_lines = waits
+        .iter()
+        .filter(|wait| wait.owner.as_deref() == Some(member_name))
+        .rev()
+        .take(10)
+        .map(|wait| {
+            format!(
+                "{} [{}] task={} condition={} progress={} evidence={}",
+                wait.id,
+                wait.status,
+                wait.task_id.as_deref().unwrap_or("-"),
+                compact_one_line(&wait.condition, 120),
+                compact_one_line(&wait.progress, 120),
+                compact_one_line(wait.evidence.as_deref().unwrap_or("-"), 80)
+            )
+        })
+        .collect::<Vec<_>>();
+    let (messages_sent, messages_received) =
+        collect_recent_member_mail(team_dir, member_name, 8).unwrap_or_default();
+    let event_lines = collect_recent_member_events(events, member_name, 10);
+    let last_output_excerpt = read_member_last_output_excerpt(team_dir, member_name, 900);
+    let open_tasks = tasks
+        .iter()
+        .filter(|task| task.owner.as_deref() == Some(member_name) && task_is_open(task))
+        .count();
+    let active_jobs = jobs
+        .iter()
+        .filter(|job| {
+            job.owner.as_deref() == Some(member_name)
+                && matches!(job.status, TeamJobStatus::Running)
+        })
+        .count();
+    let open_waits = waits
+        .iter()
+        .filter(|wait| wait.owner.as_deref() == Some(member_name) && wait.status.is_open())
+        .count();
+    let summary = format!(
+        "status={:?}, node={}, open_tasks={}, active_jobs={}, open_waits={}, recent_sent={}, recent_received={}",
+        member.status,
+        node,
+        open_tasks,
+        active_jobs,
+        open_waits,
+        messages_sent.len(),
+        messages_received.len()
+    );
+    let fingerprint = member_journal_fingerprint(
+        &summary,
+        &task_lines,
+        &job_lines,
+        &wait_lines,
+        &messages_sent,
+        &messages_received,
+        &event_lines,
+        &last_output_excerpt,
+    );
+    Ok(MemberJournalEntry {
+        timestamp: timestamp.to_string(),
+        member: member.name.clone(),
+        role: member.role.clone(),
+        status: format!("{:?}", member.status),
+        node,
+        fingerprint,
+        summary,
+        tasks: task_lines,
+        jobs: job_lines,
+        waits: wait_lines,
+        messages_sent,
+        messages_received,
+        events: event_lines,
+        last_output_excerpt,
+    })
+}
+
+fn member_journal_fingerprint(
+    summary: &str,
+    tasks: &[String],
+    jobs: &[String],
+    waits: &[String],
+    sent: &[String],
+    received: &[String],
+    events: &[String],
+    last_output: &str,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    summary.hash(&mut hasher);
+    tasks.hash(&mut hasher);
+    jobs.hash(&mut hasher);
+    waits.hash(&mut hasher);
+    sent.hash(&mut hasher);
+    received.hash(&mut hasher);
+    events.hash(&mut hasher);
+    last_output.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn collect_recent_member_mail(
+    team_dir: &Path,
+    member_name: &str,
+    limit: usize,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut sent = Vec::new();
+    let mut received = Vec::new();
+    let mailbox_dir = team_dir.join("mailboxes");
+    let Ok(entries) = fs::read_dir(&mailbox_dir) else {
+        return Ok((sent, received));
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        for msg in read_jsonl::<MailMessage>(&path).unwrap_or_default() {
+            let line = format!(
+                "{} {} -> {}: {}",
+                timestamp_for_ui(&msg.timestamp),
+                msg.from,
+                msg.to,
+                compact_one_line(&msg.message, 220)
+            );
+            if msg.from == member_name {
+                sent.push(line.clone());
+            }
+            if msg.to == member_name {
+                received.push(line);
+            }
+        }
+    }
+    sent.sort();
+    received.sort();
+    sent.reverse();
+    received.reverse();
+    sent.truncate(limit);
+    received.truncate(limit);
+    Ok((sent, received))
+}
+
+fn collect_recent_member_events(
+    events: &[TeamEventRecord],
+    member_name: &str,
+    limit: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for event in events.iter().rev() {
+        if !event_mentions_member(event, member_name) {
+            continue;
+        }
+        out.push(format!(
+            "{} {} {}",
+            timestamp_for_ui(&event.timestamp),
+            event.event,
+            compact_one_line(&event.data.to_string(), 260)
+        ));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn event_mentions_member(event: &TeamEventRecord, member_name: &str) -> bool {
+    ["member", "from", "to", "owner", "lead"]
+        .iter()
+        .any(|key| event.data.get(*key).and_then(|value| value.as_str()) == Some(member_name))
+        || event
+            .data
+            .get("recipients")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|value| value.as_str() == Some(member_name))
+            })
+}
+
+fn read_member_last_output_excerpt(team_dir: &Path, member_name: &str, max_chars: usize) -> String {
+    let path = team_dir
+        .join("last_messages")
+        .join(format!("{}.md", sanitize_id(member_name)));
+    let Ok(text) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    tail_chars(text.trim(), max_chars)
+}
+
+fn write_member_journal_markdown(
+    team_dir: &Path,
+    member: &TeamMember,
+    entries: &[MemberJournalEntry],
+) -> Result<()> {
+    let Some(latest) = entries.last() else {
+        return Ok(());
+    };
+    let mut out = String::new();
+    out.push_str(&format!("# Member Journal: {}\n\n", member.name));
+    out.push_str(&format!("- role: {}\n", member.role));
+    out.push_str(&format!("- updated_at: {}\n", latest.timestamp));
+    out.push_str(&format!("- summary: {}\n\n", latest.summary));
+    out.push_str("## Current Tasks\n\n");
+    push_markdown_list(&mut out, &latest.tasks);
+    out.push_str("\n## Jobs\n\n");
+    push_markdown_list(&mut out, &latest.jobs);
+    out.push_str("\n## Waits\n\n");
+    push_markdown_list(&mut out, &latest.waits);
+    out.push_str("\n## Recent Sent Messages\n\n");
+    push_markdown_list(&mut out, &latest.messages_sent);
+    out.push_str("\n## Recent Received Messages\n\n");
+    push_markdown_list(&mut out, &latest.messages_received);
+    out.push_str("\n## Recent Runtime Events\n\n");
+    push_markdown_list(&mut out, &latest.events);
+    if !latest.last_output_excerpt.trim().is_empty() {
+        out.push_str("\n## Last Output Excerpt\n\n```text\n");
+        out.push_str(&latest.last_output_excerpt);
+        out.push_str("\n```\n");
+    }
+    out.push_str("\n## Snapshot History\n\n");
+    for entry in entries.iter().rev().take(16) {
+        out.push_str(&format!(
+            "- {}: {} tasks={} jobs={} waits={} messages_sent={} messages_received={}\n",
+            entry.timestamp,
+            entry.summary,
+            entry.tasks.len(),
+            entry.jobs.len(),
+            entry.waits.len(),
+            entry.messages_sent.len(),
+            entry.messages_received.len()
+        ));
+    }
+    write_text_atomic(&member_journal_markdown_path(team_dir, &member.name), &out)
+}
+
+fn push_markdown_list(out: &mut String, values: &[String]) {
+    if values.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for value in values {
+            out.push_str("- ");
+            out.push_str(value);
+            out.push('\n');
+        }
+    }
 }
 
 fn print_status(team_dir: &Path) -> Result<()> {
@@ -14245,12 +16439,14 @@ fn handle_team_ui_request(
         ("GET", "/") => {
             let selected = request.query.get("team").cloned();
             let selected_cwd = request.query.get("cwd").cloned();
+            let selected_task = request.query.get("task").cloned();
             let selected_translation = request.query.get("translation").cloned();
             let html = render_team_ui(
                 root,
                 args,
                 selected.as_deref(),
                 selected_cwd.as_deref(),
+                selected_task.as_deref(),
                 selected_translation.as_deref(),
             )?;
             write_http_response(stream, "200 OK", "text/html; charset=utf-8", &html)?;
@@ -14351,6 +16547,7 @@ fn handle_team_ui_request(
                     selector: TeamSelector {
                         team: Some(team.clone()),
                     },
+                    all: false,
                     keep_local_app_server: false,
                     no_remote_nodes: false,
                 },
@@ -14368,6 +16565,11 @@ fn handle_team_ui_request(
                         team: Some(team.clone()),
                     },
                     force: true,
+                    exiting: false,
+                    remote_state: false,
+                    containers: false,
+                    ignore_remote_errors: false,
+                    dry_run: false,
                 },
             )?;
             remove_ui_team_pid(root, &team)?;
@@ -14830,6 +17032,7 @@ fn render_team_ui(
     args: &UiArgs,
     selected: Option<&str>,
     selected_cwd: Option<&str>,
+    selected_task: Option<&str>,
     selected_translation: Option<&str>,
 ) -> Result<String> {
     let mut teams = load_team_summaries(root)?;
@@ -14842,6 +17045,14 @@ fn render_team_ui(
     let selected_tasks = selected_dir
         .as_ref()
         .and_then(|dir| load_tasks(dir).ok())
+        .unwrap_or_default();
+    let selected_jobs = selected_dir
+        .as_ref()
+        .and_then(|dir| load_jobs(dir).ok())
+        .unwrap_or_default();
+    let selected_waits = selected_dir
+        .as_ref()
+        .and_then(|dir| load_waits(dir).ok())
         .unwrap_or_default();
     let selected_nodes = selected_dir
         .as_ref()
@@ -15005,6 +17216,16 @@ fn render_team_ui(
             .map(|dir| team_run_status_for_dir(dir, &config.id))
             .unwrap_or(UiTeamRunStatus::Unknown);
         let run_controls = render_team_runtime_controls(&config.id, run_status);
+        let kanban_boards = render_team_kanban_boards(
+            selected_dir.as_deref(),
+            &config,
+            &selected_tasks,
+            &selected_jobs,
+            &selected_waits,
+            &selected_nodes,
+            selected_task,
+            &selected_cwd,
+        );
         let lead_chat = selected_dir
             .as_ref()
             .map(|dir| render_lead_chat(dir, &config.id))
@@ -15020,12 +17241,15 @@ fn render_team_ui(
             .map(|dir| render_token_usage_panel(dir))
             .unwrap_or_default();
         let realtime_view = render_realtime_view(&config.id, &config);
+        let agent_flow_console = render_agent_flow_console_view(&config.id);
         let debug_timeline = render_debug_timeline_view(&config.id);
         format!(
             r#"<section><h2>{id}</h2><p>{goal}</p>
 {run_controls}
+{kanban_boards}
 <h3>Lead Chat</h3>{lead_chat}
 {realtime_view}
+{agent_flow_console}
 {debug_timeline}
 {token_usage_panel}
 <h3>Members</h3><table><tr><th>Name</th><th>Role</th><th>Session</th><th>Tasks</th><th>Node</th><th>Location</th><th>Unread/Direct</th><th>Cooldown</th><th>Thread</th></tr>{members}</table>
@@ -15037,8 +17261,10 @@ fn render_team_ui(
             id = html_escape(&config.id),
             goal = html_escape(&config.goal),
             run_controls = run_controls,
+            kanban_boards = kanban_boards,
             lead_chat = lead_chat,
             realtime_view = realtime_view,
+            agent_flow_console = agent_flow_console,
             debug_timeline = debug_timeline,
             token_usage_panel = token_usage_panel,
             members = members,
@@ -15064,6 +17290,7 @@ main{{padding:20px;overflow:auto}}
 .team span,.team small{{display:block;color:#59636e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .run-state{{display:inline-block;margin-top:7px;padding:1px 7px;border:1px solid #d8dee4;border-radius:999px;font-size:12px;font-style:normal;color:#59636e;background:#f6f8fa}}
 .run-running{{color:#116329;background:#dafbe1;border-color:#4ac26b}}
+.run-stop{{color:#7d4e00;background:#fff8c5;border-color:#d4a72c}}
 .run-stopped{{color:#82071e;background:#ffebe9;border-color:#ff8182}}
 .run-unknown{{color:#59636e;background:#f6f8fa}}
 .context-menu{{display:none;position:fixed;z-index:100;background:#fff;border:1px solid #d8dee4;border-radius:6px;box-shadow:0 8px 24px rgba(27,31,36,.16);padding:6px}}
@@ -15081,6 +17308,65 @@ label{{display:grid;gap:4px}} input,textarea{{font:inherit;padding:8px;border:1p
 .dir-current{{font-weight:600;word-break:break-all}}
 table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{padding:8px;border:1px solid #d8dee4;text-align:left;vertical-align:top}}
 pre{{background:#111827;color:#d1d5db;padding:12px;border-radius:6px;overflow:auto;max-height:360px}}
+.kanban-shell{{margin:16px 0 20px}}
+.kanban-topbar{{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:4px 0 12px}}
+.kanban-topbar h3{{margin:0;font-size:24px}}
+.kanban-topbar p,.board-title p,.panel-title p{{margin:4px 0 0;color:#59636e}}
+.kanban-actions{{display:flex;align-items:center;gap:8px;flex-wrap:wrap}}
+.kanban-actions button,.primary-action,.board-back{{border:1px solid #d8dee4;border-radius:6px;background:#fff;color:#24292f;padding:8px 12px;text-decoration:none}}
+.primary-action{{background:#2563eb;color:#fff;border-color:#2563eb}}
+.kbd{{display:inline-block;padding:4px 8px;background:#f6f8fa;border:1px solid #d8dee4;border-radius:6px;color:#59636e}}
+.kanban-board{{background:#fff;border:1px solid #d8dee4;border-radius:8px;padding:16px;margin:12px 0;overflow:auto}}
+.board-title{{display:flex;justify-content:space-between;align-items:start;gap:12px;margin-bottom:14px}}
+.board-title h4{{font-size:20px;margin:0}}
+.kanban-grid{{display:grid;grid-template-columns:repeat(4,minmax(240px,1fr));gap:12px;min-width:980px}}
+.kanban-col{{display:grid;grid-template-rows:auto 1fr auto;gap:10px;border:1px solid #d8dee4;border-radius:8px;background:#fbfcfe;padding:12px;min-height:360px}}
+.kanban-col.jobs{{min-height:280px}}
+.kanban-col-head{{display:flex;justify-content:space-between;gap:10px}}
+.kanban-col-head strong{{font-size:16px}}
+.kanban-col-head span{{display:block;margin-top:4px;color:#59636e;font-size:12px}}
+.kanban-col-head em{{font-style:normal;background:#eef2f7;border-radius:8px;padding:4px 9px;align-self:start}}
+.kanban-cards{{display:grid;align-content:start;gap:10px}}
+.kanban-card{{display:grid;gap:8px;background:#fff;border:1px solid #d8dee4;border-radius:8px;padding:12px;color:#24292f;text-decoration:none;min-height:118px;box-shadow:0 1px 2px rgba(27,31,36,.04)}}
+.kanban-card.selected{{outline:2px solid #2563eb;outline-offset:1px}}
+.kanban-card strong{{font-size:15px;line-height:1.35}}
+.card-line{{display:flex;justify-content:space-between;gap:8px;align-items:center;color:#59636e}}
+.assignee{{display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:7px;color:#59636e;font-size:13px}}
+.assignee small{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.avatar{{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;background:#dbeafe;color:#0f3d85;font-weight:700;font-size:12px}}
+.status-badge{{display:inline-block;border-radius:7px;padding:3px 8px;font-size:11px;font-weight:700;text-transform:uppercase;white-space:nowrap}}
+.status-badge.todo{{background:#eaf2ff;color:#0969da}}
+.status-badge.active{{background:#dafbe1;color:#116329}}
+.status-badge.review{{background:#fff1d6;color:#9a6700}}
+.status-badge.blocked{{background:#ffebe9;color:#a40e26}}
+.status-badge.completed{{background:#dafbe1;color:#1a7f37}}
+.status-badge.muted{{background:#f6f8fa;color:#57606a}}
+.kanban-note{{margin:0;color:#59636e;font-size:12px;line-height:1.35}}
+.kanban-empty{{margin:8px 0;color:#8c959f;font-size:12px}}
+.kanban-add{{align-self:end;color:#0969da;text-decoration:none;font-weight:600}}
+.task-hero{{display:grid;grid-template-columns:auto 1fr minmax(180px,260px);gap:18px;align-items:center;border:1px solid #d8dee4;border-radius:8px;padding:14px;margin-bottom:14px;background:#fff}}
+.task-square{{display:grid;place-items:center;width:72px;height:72px;border-radius:8px;background:#dcfce7;color:#047857;font-weight:800;font-size:18px}}
+.task-hero h4{{margin:7px 0 4px;font-size:18px}}
+.task-hero p{{margin:0;color:#59636e}}
+.hero-owner{{display:grid;gap:6px;border-left:1px solid #d8dee4;padding-left:16px}}
+.hero-owner span,.hero-owner small{{color:#59636e}}
+.hero-owner strong{{display:flex;align-items:center;gap:8px}}
+.member-board{{display:grid;grid-template-columns:minmax(300px,.85fr) minmax(320px,1fr) minmax(360px,1.25fr);gap:14px;margin:12px 0}}
+.member-panel{{background:#fff;border:1px solid #d8dee4;border-radius:8px;padding:16px;overflow:auto}}
+.panel-title{{display:grid;gap:4px;margin-bottom:12px}}
+.panel-title h4{{margin:0;font-size:18px}}
+.member-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}}
+.member-tab{{border:1px solid #d8dee4;border-radius:6px;padding:6px 10px;background:#fff}}
+.member-tab.active{{border-color:#2563eb;background:#eff6ff;color:#1d4ed8}}
+.journal-panel details{{border-top:1px solid #d8dee4;padding:8px 0}}
+.journal-panel summary{{cursor:pointer;font-weight:700;color:#24292f}}
+.journal-summary{{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}}
+.journal-summary span:not(.status-badge){{border:1px solid #d8dee4;border-radius:6px;padding:3px 7px;background:#f6f8fa;color:#57606a;font-size:12px}}
+.journal-list{{margin:8px 0 0;padding-left:18px;display:grid;gap:5px}}
+.journal-list li{{line-height:1.35}}
+.journal-panel pre{{white-space:pre-wrap;max-height:220px;overflow:auto;background:#f6f8fa;border:1px solid #d8dee4;border-radius:6px;padding:10px}}
+tr.selected{{background:#f6f8ff}}
+@media (max-width: 1100px){{.kanban-grid{{grid-template-columns:repeat(2,minmax(240px,1fr));min-width:0}}.member-board{{grid-template-columns:1fr}}.task-hero{{grid-template-columns:1fr}}.hero-owner{{border-left:0;padding-left:0;border-top:1px solid #d8dee4;padding-top:12px}}}}
 .usage-panel{{margin:14px 0}}
 .usage-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:8px 0 12px}}
 .usage-summary div{{background:#fff;border:1px solid #d8dee4;border-radius:6px;padding:10px}}
@@ -15131,6 +17417,49 @@ code{{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all
 .rt-panebar button{{margin-left:auto;background:#111827;color:#cbd5e1;border:1px solid #334155;border-radius:5px;padding:4px 7px}}
 .rt-term{{margin:0;border-radius:0;background:#020617;color:#d1fae5;max-height:none;height:100%;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;line-height:1.45;white-space:pre-wrap}}
 .rt-status{{padding:7px 12px;color:#94a3b8;background:#0b1220;border-top:1px solid #1e293b;font-size:12px}}
+.af-card{{background:#fff;border:1px solid #d8dee4;border-radius:10px;margin:16px 0;overflow:hidden;box-shadow:0 12px 32px rgba(27,31,36,.08)}}
+.af-head{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid #d8dee4;background:#fbfcfe}}
+.af-title{{display:flex;align-items:center;gap:10px;font-weight:800;font-size:16px}}
+.af-mark{{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:8px;background:#eaf2ff;color:#0969da}}
+.af-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.af-actions input,.af-actions select{{padding:7px 9px;border:1px solid #c9d1d9;border-radius:6px;background:#fff}}
+.af-actions button{{border:1px solid #c9d1d9;border-radius:6px;background:#fff;color:#24292f;padding:7px 10px}}
+.af-layout{{display:grid;grid-template-columns:220px 1fr 260px;min-height:520px}}
+.af-side{{border-right:1px solid #d8dee4;background:#f6f8fa;padding:14px;display:grid;align-content:start;gap:12px}}
+.af-side h4,.af-detail h4{{margin:0;font-size:14px}}
+.af-filter{{display:grid;gap:7px}}
+.af-filter label{{display:flex;gap:8px;align-items:center;color:#39424e}}
+.af-flow-wrap{{position:relative;overflow:auto;background:linear-gradient(#fff,#fff),linear-gradient(90deg,rgba(99,102,241,.06),rgba(20,184,166,.05));background-blend-mode:normal;padding:14px}}
+.af-toolbar{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px;color:#59636e;font-size:12px}}
+.af-stage{{display:grid;gap:0;min-width:860px;position:relative}}
+.af-row{{display:grid;position:relative;min-height:68px;border-bottom:1px solid #eef2f7}}
+.af-row.header{{position:sticky;top:0;z-index:4;background:rgba(255,255,255,.96);border-bottom:1px solid #d8dee4;min-height:54px}}
+.af-time{{padding:12px 10px;color:#59636e;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;border-right:1px dashed #d8dee4}}
+.af-lane-head{{display:grid;place-items:center;padding:9px 8px;border-left:1px dashed rgba(37,99,235,.22)}}
+.af-lane-pill{{display:flex;align-items:center;gap:7px;max-width:160px;border:1px solid #c7d2fe;border-radius:7px;background:#eef2ff;color:#3730a3;padding:7px 10px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.af-lane-dot{{width:8px;height:8px;border-radius:50%;background:#6366f1;flex:0 0 auto}}
+.af-cell{{border-left:1px dashed rgba(37,99,235,.16)}}
+.af-link{{align-self:center;height:0;border-top:2px solid #8c959f;margin:0 22px;z-index:1;position:relative}}
+.af-link::after{{content:"";position:absolute;right:-1px;top:-5px;border-left:7px solid #8c959f;border-top:4px solid transparent;border-bottom:4px solid transparent}}
+.af-link.reverse::after{{left:-1px;right:auto;border-left:0;border-right:7px solid #8c959f}}
+.af-chip{{align-self:center;justify-self:center;max-width:170px;border:1px solid #d8dee4;border-radius:8px;background:#fff;padding:7px 9px;z-index:2;box-shadow:0 2px 8px rgba(27,31,36,.08);cursor:pointer}}
+.af-chip strong{{display:block;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.af-chip span{{display:block;margin-top:3px;color:#59636e;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.af-chip.message{{border-color:#bfdbfe;background:#eff6ff}}
+.af-chip.system{{border-color:#ddd6fe;background:#f5f3ff}}
+.af-chip.event{{border-color:#fde68a;background:#fffbeb}}
+.af-chip.side{{border-color:#fecaca;background:#fff1f2}}
+.af-chip.live{{border-color:#bbf7d0;background:#f0fdf4}}
+.af-chip.last{{border-color:#e5e7eb;background:#f9fafb}}
+.af-chip.selected{{outline:3px solid #2563eb;outline-offset:2px}}
+.af-self{{align-self:center;justify-self:center;width:54px;height:22px;border:2px solid #8c959f;border-left:0;border-radius:0 14px 14px 0;z-index:1}}
+.af-detail{{border-left:1px solid #d8dee4;background:#fff;padding:14px;display:grid;align-content:start;gap:12px}}
+.af-detail dl{{display:grid;grid-template-columns:70px 1fr;gap:8px;margin:0}}
+.af-detail dt{{color:#59636e}}
+.af-detail dd{{margin:0;word-break:break-word}}
+.af-preview{{white-space:pre-wrap;background:#f6f8fa;border:1px solid #d8dee4;border-radius:6px;padding:10px;max-height:260px;overflow:auto;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}}
+.af-status{{padding:8px 14px;color:#59636e;border-top:1px solid #d8dee4;font-size:12px}}
+@media (max-width: 1200px){{.af-layout{{grid-template-columns:1fr}}.af-side,.af-detail{{border:0;border-top:1px solid #d8dee4}}}}
 .dbg-card{{background:#fff;border:1px solid #d8dee4;border-radius:8px;margin:16px 0;overflow:hidden}}
 .dbg-head{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid #d8dee4;background:#f6f8fa}}
 .dbg-title{{font-weight:700}}
@@ -15280,6 +17609,152 @@ if (rtRoot) {{
   card.querySelector('[data-rt-add-v]').addEventListener('click', () => {{ layout='rows'; panes.push({{ member: rtMembers()[panes.length % Math.max(1, rtMembers().length)]?.name || 'lead' }}); rtStart(); rtRender(); }});
   card.querySelector('[data-rt-refresh]').addEventListener('click', () => {{ rtStart(); rtPoll(); }});
 }}
+const afRoot = document.querySelector('[data-agent-flow-team]');
+if (afRoot) {{
+  const teamId = afRoot.dataset.agentFlowTeam;
+  const stage = afRoot.querySelector('.af-stage');
+  const status = afRoot.querySelector('.af-status');
+  const summary = afRoot.querySelector('[data-af-summary]');
+  const search = afRoot.querySelector('[data-af-search]');
+  const windowSelect = afRoot.querySelector('[data-af-window]');
+  const autoscrollButton = afRoot.querySelector('[data-af-autoscroll]');
+  const kindChecks = Array.from(afRoot.querySelectorAll('[data-af-kind]'));
+  let snapshot = null;
+  let selectedId = null;
+  let autoscroll = true;
+  function afEsc(value) {{
+    return String(value ?? '').replace(/[&<>"']/g, (ch) => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));
+  }}
+  function afSplitTargets(value) {{
+    return String(value || '').split(',').map((part) => part.trim()).filter(Boolean);
+  }}
+  function afActor(item) {{
+    const actor = String(item.actor || '').trim();
+    if (actor) return actor;
+    if (item.kind === 'system') return 'system';
+    if (item.kind === 'event') return 'system';
+    return 'unknown';
+  }}
+  function afPrimaryTarget(item) {{
+    const targets = afSplitTargets(item.target);
+    if (targets.length) return targets[0];
+    return afActor(item);
+  }}
+  function afEnabledKinds() {{
+    return new Set(kindChecks.filter((box) => box.checked).map((box) => box.dataset.afKind));
+  }}
+  function afMatches(item) {{
+    if (!afEnabledKinds().has(item.kind)) return false;
+    const q = (search?.value || '').trim().toLowerCase();
+    if (!q) return true;
+    return [item.timestamp, item.kind, item.title, item.actor, item.target, item.body, JSON.stringify(item.meta || {{}})]
+      .join('\\n').toLowerCase().includes(q);
+  }}
+  function afLaneOrder(items) {{
+    const seen = new Set();
+    const lanes = [];
+    const add = (name) => {{
+      const clean = String(name || '').trim();
+      if (!clean || seen.has(clean)) return;
+      seen.add(clean);
+      lanes.push(clean);
+    }};
+    ['user', 'system', 'lead'].forEach(add);
+    for (const item of items) {{
+      add(afActor(item));
+      afSplitTargets(item.target).forEach(add);
+    }}
+    return lanes.slice(0, 12);
+  }}
+  function afKindLabel(kind) {{
+    return ({{ message: 'message', system: 'system', event: 'event', side: 'side', live: 'live', last: 'last' }})[kind] || kind || 'event';
+  }}
+  function afTime(value) {{
+    const text = String(value || '');
+    const match = text.match(/T?(\\d\\d:\\d\\d:\\d\\d)/);
+    return match ? match[1] : text.slice(11, 19) || text;
+  }}
+  function afShort(value, limit = 80) {{
+    const text = String(value || '').replace(/\\s+/g, ' ').trim();
+    return text.length > limit ? `${{text.slice(0, limit - 1)}}…` : text;
+  }}
+  function afRow(item, idx, lanes) {{
+    const actor = afActor(item);
+    const target = afPrimaryTarget(item);
+    const actorIdx = Math.max(0, lanes.indexOf(actor));
+    const targetIdx = Math.max(0, lanes.indexOf(target));
+    const minIdx = Math.min(actorIdx, targetIdx);
+    const maxIdx = Math.max(actorIdx, targetIdx);
+    const id = item._afId;
+    const cells = lanes.map(() => '<div class="af-cell"></div>').join('');
+    const link = actorIdx === targetIdx
+      ? `<div class="af-self" style="grid-column:${{actorIdx + 2}}"></div>`
+      : `<div class="af-link ${{targetIdx < actorIdx ? 'reverse' : ''}}" style="grid-column:${{minIdx + 2}} / ${{maxIdx + 3}}"></div>`;
+    const chip = `<button type="button" class="af-chip ${{afEsc(item.kind)}} ${{selectedId === id ? 'selected' : ''}}" data-af-id="${{id}}" style="grid-column:${{actorIdx + 2}}">
+      <strong>${{afEsc(item.title || afKindLabel(item.kind))}}</strong>
+      <span>${{afEsc(afShort(item.body || item.kind, 96))}}</span>
+    </button>`;
+    return `<div class="af-row" style="grid-template-columns:92px repeat(${{lanes.length}}, minmax(140px, 1fr));">
+      <div class="af-time">${{afEsc(afTime(item.timestamp))}}</div>${{cells}}${{link}}${{chip}}
+    </div>`;
+  }}
+  function afSelect(item) {{
+    selectedId = item?._afId || null;
+    afRoot.querySelector('[data-af-detail-kind]').textContent = item ? afKindLabel(item.kind) : '-';
+    afRoot.querySelector('[data-af-detail-actor]').textContent = item?.actor || afActor(item || {{}}) || '-';
+    afRoot.querySelector('[data-af-detail-target]').textContent = item?.target || '-';
+    afRoot.querySelector('[data-af-detail-time]').textContent = item?.timestamp || '-';
+    afRoot.querySelector('[data-af-detail-title]').textContent = item?.title || '-';
+    afRoot.querySelector('[data-af-detail-body]').textContent = item?.body || 'Select an event chip to inspect the content.';
+    afRender();
+  }}
+  function afRender() {{
+    if (!snapshot) return;
+    const limit = Number(windowSelect?.value || 160);
+    const items = (snapshot.items || [])
+      .map((item, idx) => Object.assign({{ _afId: `${{item.timestamp}}-${{idx}}` }}, item))
+      .filter(afMatches)
+      .slice(-limit);
+    const lanes = afLaneOrder(items);
+    const header = `<div class="af-row header" style="grid-template-columns:92px repeat(${{lanes.length}}, minmax(140px, 1fr));">
+      <div class="af-time">Time</div>
+      ${{lanes.map((lane, idx) => `<div class="af-lane-head"><span class="af-lane-pill"><i class="af-lane-dot" style="background:hsl(${{(idx * 47) % 360}} 70% 52%)"></i>${{afEsc(lane)}}</span></div>`).join('')}}
+    </div>`;
+    stage.innerHTML = header + (items.map((item, idx) => afRow(item, idx, lanes)).join('') || '<p class="hint">No flow events match the current filters.</p>');
+    stage.querySelectorAll('[data-af-id]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        const item = items.find((candidate) => candidate._afId === button.dataset.afId);
+        afSelect(item);
+      }});
+    }});
+    if (summary) summary.textContent = `${{items.length}} events · ${{lanes.length}} lanes · generated ${{snapshot.generated_at}}`;
+    status.textContent = `updated ${{snapshot.generated_at}} · filter window=${{limit}}`;
+    if (autoscroll) {{
+      const wrap = afRoot.querySelector('.af-flow-wrap');
+      wrap.scrollTop = wrap.scrollHeight;
+    }}
+  }}
+  async function afPoll() {{
+    try {{
+      const res = await fetch(`/debug?team=${{encodeURIComponent(teamId)}}`, {{ cache: 'no-store' }});
+      if (!res.ok) throw new Error(`${{res.status}} ${{res.statusText}}`);
+      snapshot = await res.json();
+      afRender();
+    }} catch (err) {{
+      status.textContent = `agent flow error: ${{err.message || err}}`;
+    }}
+  }}
+  kindChecks.forEach((box) => box.addEventListener('change', afRender));
+  search?.addEventListener('input', afRender);
+  windowSelect?.addEventListener('change', afRender);
+  autoscrollButton?.addEventListener('click', () => {{
+    autoscroll = !autoscroll;
+    autoscrollButton.textContent = `Auto-scroll: ${{autoscroll ? 'on' : 'off'}}`;
+  }});
+  afRoot.querySelector('[data-af-refresh]')?.addEventListener('click', afPoll);
+  afPoll();
+  setInterval(afPoll, 2500);
+}}
 const dbgRoot = document.querySelector('[data-debug-team]');
 if (dbgRoot) {{
   const teamId = dbgRoot.dataset.debugTeam;
@@ -15353,6 +17828,586 @@ if (dbgRoot) {{
         ui_runs_log = ui_runs_log,
         detail = detail,
     ))
+}
+
+fn render_team_kanban_boards(
+    team_dir: Option<&Path>,
+    config: &TeamConfig,
+    tasks: &[TeamTask],
+    jobs: &[TeamJob],
+    waits: &[TeamWait],
+    nodes: &[TeamNode],
+    selected_task: Option<&str>,
+    selected_cwd: &str,
+) -> String {
+    let selected_task_id = selected_task
+        .map(sanitize_id)
+        .filter(|id| tasks.iter().any(|task| task.id == *id))
+        .or_else(|| {
+            tasks
+                .iter()
+                .find(|task| task_is_open(task))
+                .or_else(|| tasks.first())
+                .map(|task| task.id.clone())
+        });
+    let selected_task = selected_task_id
+        .as_ref()
+        .and_then(|id| tasks.iter().find(|task| task.id == *id));
+    let selected_member = selected_task
+        .and_then(|task| task.owner.as_deref())
+        .or_else(|| {
+            config
+                .members
+                .iter()
+                .find(|member| member.role != "lead")
+                .map(|m| m.name.as_str())
+        })
+        .unwrap_or("lead");
+    let task_board =
+        render_tasks_kanban_board(config, tasks, selected_task_id.as_deref(), selected_cwd);
+    let job_board = render_jobs_kanban_board(config, selected_task, jobs, waits);
+    let member_board =
+        render_member_assignment_board(config, tasks, nodes, selected_member, team_dir);
+    format!(
+        r#"<section class="kanban-shell">
+<div class="kanban-topbar">
+  <div><h3>Work Boards</h3><p>Tasks, task-scoped jobs/waits, and member assignment for the selected team.</p></div>
+  <div class="kanban-actions"><span class="kbd">⌘ K</span><button type="button">Filter</button><button type="button">Group</button></div>
+</div>
+{task_board}
+{job_board}
+{member_board}
+</section>"#,
+        task_board = task_board,
+        job_board = job_board,
+        member_board = member_board,
+    )
+}
+
+fn render_tasks_kanban_board(
+    config: &TeamConfig,
+    tasks: &[TeamTask],
+    selected_task_id: Option<&str>,
+    selected_cwd: &str,
+) -> String {
+    let columns: [(&str, &str, &[TaskStatus]); 4] = [
+        (
+            "Todo",
+            "Queued or waiting work",
+            &[TaskStatus::Pending, TaskStatus::Ready, TaskStatus::Waiting],
+        ),
+        (
+            "In Progress",
+            "Active execution and review",
+            &[TaskStatus::InProgress, TaskStatus::Review],
+        ),
+        (
+            "Blocked",
+            "Needs unblock or repair",
+            &[TaskStatus::Blocked, TaskStatus::Failed],
+        ),
+        (
+            "Completed",
+            "Accepted or cancelled work",
+            &[TaskStatus::Completed, TaskStatus::Cancelled],
+        ),
+    ];
+    let columns = columns
+        .iter()
+        .map(|(title, subtitle, statuses)| {
+            let cards = tasks
+                .iter()
+                .filter(|task| statuses.contains(&task.status))
+                .map(|task| render_task_kanban_card(config, task, selected_task_id, selected_cwd))
+                .collect::<Vec<_>>();
+            format!(
+                r##"<div class="kanban-col"><div class="kanban-col-head"><div><strong>{title}</strong><span>{subtitle}</span></div><em>{count}</em></div><div class="kanban-cards">{cards}</div><a class="kanban-add" href="#lead-chat">+ Add task via lead</a></div>"##,
+                title = html_escape(title),
+                subtitle = html_escape(subtitle),
+                count = cards.len(),
+                cards = if cards.is_empty() {
+                    r#"<p class="kanban-empty">No items</p>"#.to_string()
+                } else {
+                    cards.join("")
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r##"<section class="kanban-board"><div class="board-title"><div><h4>Tasks Board</h4><p>Project / Tasks</p></div><a class="primary-action" href="#lead-chat">+ New Task</a></div><div class="kanban-grid">{columns}</div></section>"##
+    )
+}
+
+fn render_task_kanban_card(
+    config: &TeamConfig,
+    task: &TeamTask,
+    selected_task_id: Option<&str>,
+    selected_cwd: &str,
+) -> String {
+    let owner = task.owner.as_deref().unwrap_or("unassigned");
+    let role = config
+        .members
+        .iter()
+        .find(|member| member.name == owner)
+        .map(|member| member.role.as_str())
+        .unwrap_or("");
+    let selected_class = if selected_task_id == Some(task.id.as_str()) {
+        " selected"
+    } else {
+        ""
+    };
+    let href = format!(
+        "/?team={}&cwd={}&task={}",
+        url_encode(&config.id),
+        url_encode(selected_cwd),
+        url_encode(&task.id)
+    );
+    let result = task
+        .result
+        .as_deref()
+        .filter(|result| !result.trim().is_empty())
+        .map(|result| {
+            format!(
+                r#"<p class="kanban-note">{}</p>"#,
+                html_escape(&compact_one_line(result, 180))
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<a class="kanban-card{selected_class}" href="{href}">
+<div class="card-line"><code>T{task_id}</code><span class="status-badge {status_class}">{status}</span></div>
+<strong>{subject}</strong>
+<div class="assignee"><span class="avatar">{initial}</span><span>{owner}</span><small>{role}</small></div>
+{result}
+</a>"#,
+        selected_class = selected_class,
+        href = html_escape(&href),
+        task_id = html_escape(&task.id),
+        status_class = task_status_css(task.status),
+        status = html_escape(&task.status.to_string()),
+        subject = html_escape(&compact_one_line(&task.subject, 160)),
+        initial = html_escape(&avatar_initial(owner)),
+        owner = html_escape(owner),
+        role = html_escape(role),
+        result = result,
+    )
+}
+
+fn render_jobs_kanban_board(
+    config: &TeamConfig,
+    selected_task: Option<&TeamTask>,
+    jobs: &[TeamJob],
+    waits: &[TeamWait],
+) -> String {
+    let Some(task) = selected_task else {
+        return r#"<section class="kanban-board"><div class="board-title"><div><h4>Jobs Board</h4><p>Select a task to inspect jobs and waits.</p></div></div></section>"#.to_string();
+    };
+    let task_jobs = jobs
+        .iter()
+        .filter(|job| job.task_id.as_deref() == Some(task.id.as_str()))
+        .collect::<Vec<_>>();
+    let task_waits = waits
+        .iter()
+        .filter(|wait| wait.task_id.as_deref() == Some(task.id.as_str()))
+        .collect::<Vec<_>>();
+    let columns = [
+        ("Todo", "Queued or unknown", "todo"),
+        ("In Progress", "Running or polling", "progress"),
+        ("Review", "Blocked or failed gates", "review"),
+        ("Done", "Completed evidence", "done"),
+    ]
+    .iter()
+    .map(|(title, subtitle, bucket)| {
+        let mut cards = Vec::new();
+        for job in &task_jobs {
+            if job_bucket(job.status.clone()) == *bucket {
+                cards.push(render_job_card(config, job));
+            }
+        }
+        for wait in &task_waits {
+            if wait_bucket(wait.status.clone()) == *bucket {
+                cards.push(render_wait_card(config, wait));
+            }
+        }
+        format!(
+            r##"<div class="kanban-col jobs"><div class="kanban-col-head"><div><strong>{title}</strong><span>{subtitle}</span></div><em>{count}</em></div><div class="kanban-cards">{cards}</div><a class="kanban-add" href="#lead-chat">+ Add job/wait via lead</a></div>"##,
+            title = html_escape(title),
+            subtitle = html_escape(subtitle),
+            count = cards.len(),
+            cards = if cards.is_empty() {
+                r#"<p class="kanban-empty">No items</p>"#.to_string()
+            } else {
+                cards.join("")
+            },
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("");
+    let owner = task.owner.as_deref().unwrap_or("unassigned");
+    let role = config
+        .members
+        .iter()
+        .find(|member| member.name == owner)
+        .map(|member| member.role.as_str())
+        .unwrap_or("");
+    format!(
+        r#"<section class="kanban-board"><div class="board-title"><div><p>Project / Tasks / T{task_id}</p><h4>Jobs Board</h4></div><a class="board-back" href="/?team={team}">← Back to Tasks</a></div>
+<div class="task-hero"><div class="task-square">T{task_id}</div><div><span class="status-badge {status_class}">{status}</span><h4>{subject}</h4><p>{description}</p></div><div class="hero-owner"><span>Owner</span><strong><span class="avatar">{initial}</span>{owner}</strong><small>{role}</small></div></div>
+<div class="kanban-grid">{columns}</div></section>"#,
+        task_id = html_escape(&task.id),
+        team = url_encode(&config.id),
+        status_class = task_status_css(task.status),
+        status = html_escape(&task.status.to_string()),
+        subject = html_escape(&compact_one_line(&task.subject, 180)),
+        description = html_escape(&compact_one_line(&task.description, 220)),
+        initial = html_escape(&avatar_initial(owner)),
+        owner = html_escape(owner),
+        role = html_escape(role),
+        columns = columns,
+    )
+}
+
+fn render_job_card(config: &TeamConfig, job: &TeamJob) -> String {
+    let owner = job.owner.as_deref().unwrap_or("unassigned");
+    let role = config
+        .members
+        .iter()
+        .find(|member| member.name == owner)
+        .map(|member| member.role.as_str())
+        .unwrap_or("");
+    format!(
+        r#"<article class="kanban-card job-card"><div class="card-line"><code>{id}</code><span class="status-badge {status_class}">{status:?}</span></div><strong>{command}</strong><div class="assignee"><span class="avatar">{initial}</span><span>{owner}</span><small>{role}</small></div><p class="kanban-note">node={node} cwd={cwd} exit={exit}</p></article>"#,
+        id = html_escape(&job.id),
+        status_class = job_status_css(job.status.clone()),
+        status = job.status,
+        command = html_escape(&compact_one_line(&job.command, 150)),
+        initial = html_escape(&avatar_initial(owner)),
+        owner = html_escape(owner),
+        role = html_escape(role),
+        node = html_escape(&job.node),
+        cwd = html_escape(&job.cwd),
+        exit = job
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    )
+}
+
+fn render_wait_card(config: &TeamConfig, wait: &TeamWait) -> String {
+    let owner = wait.owner.as_deref().unwrap_or("unassigned");
+    let role = config
+        .members
+        .iter()
+        .find(|member| member.name == owner)
+        .map(|member| member.role.as_str())
+        .unwrap_or("");
+    let evidence = wait
+        .evidence
+        .as_deref()
+        .filter(|evidence| !evidence.trim().is_empty())
+        .unwrap_or("-");
+    format!(
+        r#"<article class="kanban-card wait-card"><div class="card-line"><code>{id}</code><span class="status-badge {status_class}">{status}</span></div><strong>{title}</strong><div class="assignee"><span class="avatar">{initial}</span><span>{owner}</span><small>{role}</small></div><p class="kanban-note">{progress}</p><p class="kanban-note">evidence={evidence}</p></article>"#,
+        id = html_escape(&wait.id),
+        status_class = wait_status_css(wait.status.clone()),
+        status = html_escape(&wait.status.to_string()),
+        title = html_escape(&compact_one_line(&wait.title, 150)),
+        initial = html_escape(&avatar_initial(owner)),
+        owner = html_escape(owner),
+        role = html_escape(role),
+        progress = html_escape(&compact_one_line(&wait.progress, 170)),
+        evidence = html_escape(&compact_one_line(evidence, 120)),
+    )
+}
+
+fn render_member_assignment_board(
+    config: &TeamConfig,
+    tasks: &[TeamTask],
+    nodes: &[TeamNode],
+    selected_member: &str,
+    team_dir: Option<&Path>,
+) -> String {
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect::<HashMap<_, _>>();
+    let rows = config
+        .members
+        .iter()
+        .filter(|member| member.role != "lead")
+        .map(|member| {
+            let node_id = member.node.as_deref().unwrap_or("local");
+            let location = node_by_id
+                .get(node_id)
+                .map(format_node_location)
+                .unwrap_or_else(|| node_id.to_string());
+            format!(
+                r#"<tr class="{selected}"><td><span class="avatar">{initial}</span><strong>{name}</strong></td><td>{role}</td><td><span class="status-badge {status_class}">{status:?}</span></td><td>{location}</td></tr>"#,
+                selected = if member.name == selected_member { "selected" } else { "" },
+                initial = html_escape(&avatar_initial(&member.name)),
+                name = html_escape(&member.name),
+                role = html_escape(&member.role),
+                status_class = member_status_css(member.status.clone()),
+                status = member.status,
+                location = html_escape(&location),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let mut member_tasks = tasks
+        .iter()
+        .filter(|task| task.owner.as_deref() == Some(selected_member))
+        .collect::<Vec<_>>();
+    if member_tasks.is_empty() {
+        member_tasks = tasks.iter().take(8).collect();
+    }
+    let task_rows = member_tasks
+        .into_iter()
+        .map(|task| {
+            format!(
+                r#"<tr><td>T{id}</td><td>{subject}</td><td><span class="status-badge {status_class}">{status}</span></td></tr>"#,
+                id = html_escape(&task.id),
+                subject = html_escape(&compact_one_line(&task.subject, 120)),
+                status_class = task_status_css(task.status),
+                status = html_escape(&task.status.to_string()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let member_tabs = config
+        .members
+        .iter()
+        .filter(|member| member.role != "lead")
+        .map(|member| {
+            format!(
+                r#"<span class="member-tab {selected}">{name}</span>"#,
+                selected = if member.name == selected_member {
+                    "active"
+                } else {
+                    ""
+                },
+                name = html_escape(&member.name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let journal_panel = render_member_journal_panel(team_dir, config, selected_member);
+    format!(
+        r#"<section class="member-board"><div class="member-panel"><div class="panel-title"><h4>Member Assignment</h4><p>Manage and track departments working on this team.</p></div><table><tr><th>Member Name</th><th>Role</th><th>Status</th><th>Location</th></tr>{rows}</table></div><div class="member-panel"><div class="panel-title"><h4>Member Tasks</h4><p>Browse assigned work for the selected member.</p><div class="member-tabs">{member_tabs}</div></div><table><tr><th>Task ID</th><th>Task Name</th><th>Status</th></tr>{task_rows}</table></div>{journal_panel}</section>"#,
+        rows = rows,
+        member_tabs = member_tabs,
+        task_rows = if task_rows.is_empty() {
+            r#"<tr><td colspan="3">No assigned tasks</td></tr>"#.to_string()
+        } else {
+            task_rows
+        },
+        journal_panel = journal_panel,
+    )
+}
+
+fn render_member_journal_panel(
+    team_dir: Option<&Path>,
+    config: &TeamConfig,
+    selected_member: &str,
+) -> String {
+    let Some(team_dir) = team_dir else {
+        return r#"<div class="member-panel"><div class="panel-title"><h4>Member Journal</h4><p>No team state loaded.</p></div></div>"#.to_string();
+    };
+    let member_tabs = config
+        .members
+        .iter()
+        .filter(|member| member.role != "lead")
+        .map(|member| {
+            format!(
+                r#"<span class="member-tab {selected}">Member {name}</span>"#,
+                selected = if member.name == selected_member {
+                    "active"
+                } else {
+                    ""
+                },
+                name = html_escape(&member.name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let selected = config
+        .members
+        .iter()
+        .find(|member| member.name == selected_member)
+        .or_else(|| config.members.iter().find(|member| member.role != "lead"));
+    let Some(member) = selected else {
+        return r#"<div class="member-panel"><div class="panel-title"><h4>Member Journal</h4><p>No member selected.</p></div></div>"#.to_string();
+    };
+    let entries =
+        read_jsonl::<MemberJournalEntry>(&member_journal_entries_path(team_dir, &member.name))
+            .unwrap_or_default();
+    let latest = entries.last().cloned().or_else(|| {
+        let tasks = load_tasks(team_dir).unwrap_or_default();
+        let jobs = load_jobs(team_dir).unwrap_or_default();
+        let waits = load_waits(team_dir).unwrap_or_default();
+        let events =
+            read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).unwrap_or_default();
+        build_member_journal_entry(team_dir, member, &tasks, &jobs, &waits, &events, &now()).ok()
+    });
+    let body = if let Some(entry) = latest {
+        let tasks = render_member_journal_list(&entry.tasks, 5);
+        let jobs = render_member_journal_list(&entry.jobs, 4);
+        let waits = render_member_journal_list(&entry.waits, 4);
+        let received = render_member_journal_list(&entry.messages_received, 5);
+        let sent = render_member_journal_list(&entry.messages_sent, 5);
+        let events = render_member_journal_list(&entry.events, 5);
+        let history = entries
+            .iter()
+            .rev()
+            .take(8)
+            .map(|entry| {
+                format!(
+                    r#"<tr><td>{}</td><td>{}</td></tr>"#,
+                    html_escape(&timestamp_for_ui(&entry.timestamp)),
+                    html_escape(&compact_one_line(&entry.summary, 160))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let last_output = if entry.last_output_excerpt.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<details><summary>Last Output Excerpt</summary><pre>{}</pre></details>"#,
+                html_escape(&entry.last_output_excerpt)
+            )
+        };
+        format!(
+            r#"<div class="journal-summary"><span class="status-badge active">{status}</span><span>{node}</span><span>{updated}</span></div>
+<p class="kanban-note">{summary}</p>
+<details open><summary>Tasks</summary>{tasks}</details>
+<details><summary>Jobs</summary>{jobs}</details>
+<details><summary>Waits</summary>{waits}</details>
+<details open><summary>Received</summary>{received}</details>
+<details><summary>Sent</summary>{sent}</details>
+<details><summary>Events</summary>{events}</details>
+{last_output}
+<details><summary>Snapshot History</summary><table><tr><th>Time</th><th>Summary</th></tr>{history}</table></details>"#,
+            status = html_escape(&entry.status),
+            node = html_escape(&entry.node),
+            updated = html_escape(&timestamp_for_ui(&entry.timestamp)),
+            summary = html_escape(&entry.summary),
+            tasks = tasks,
+            jobs = jobs,
+            waits = waits,
+            received = received,
+            sent = sent,
+            events = events,
+            last_output = last_output,
+            history = if history.is_empty() {
+                r#"<tr><td colspan="2">No snapshots yet</td></tr>"#.to_string()
+            } else {
+                history
+            },
+        )
+    } else {
+        r#"<p class="kanban-empty">No journal entries yet. The runtime writes this periodically while the team is active.</p>"#.to_string()
+    };
+    let journal_path = member_journal_markdown_path(team_dir, &member.name);
+    let digest_path = member_digest_markdown_path(team_dir, &member.name);
+    let digest = fs::read_to_string(&digest_path)
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| {
+            format!(
+                r#"<details open><summary>AI Digest</summary><p class="hint">Digest: <code>{path}</code></p><pre>{digest}</pre></details>"#,
+                path = html_escape(&digest_path.display().to_string()),
+                digest = html_escape(&tail_chars(text.trim(), 6000)),
+            )
+        })
+        .unwrap_or_else(|| {
+            r#"<details><summary>AI Digest</summary><p class="hint">No AI digest yet. It is generated after task/job/wait/member milestone changes.</p></details>"#.to_string()
+        });
+    format!(
+        r#"<div class="member-panel journal-panel"><div class="panel-title"><h4>Member Journal</h4><p>Periodic department activity diary for the selected member.</p><div class="member-tabs">{member_tabs}</div></div><p class="hint">Machine Markdown: <code>{path}</code></p>{digest}{body}</div>"#,
+        member_tabs = member_tabs,
+        path = html_escape(&journal_path.display().to_string()),
+        digest = digest,
+        body = body,
+    )
+}
+
+fn render_member_journal_list(values: &[String], limit: usize) -> String {
+    if values.is_empty() {
+        return r#"<ul class="journal-list"><li>none</li></ul>"#.to_string();
+    }
+    let items = values
+        .iter()
+        .take(limit)
+        .map(|value| format!(r#"<li>{}</li>"#, html_escape(value)))
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<ul class="journal-list">{items}</ul>"#)
+}
+
+fn job_bucket(status: TeamJobStatus) -> &'static str {
+    match status {
+        TeamJobStatus::Running => "progress",
+        TeamJobStatus::Completed => "done",
+        TeamJobStatus::Failed => "review",
+        TeamJobStatus::Stopped | TeamJobStatus::Unknown => "todo",
+    }
+}
+
+fn wait_bucket(status: TeamWaitStatus) -> &'static str {
+    match status {
+        TeamWaitStatus::Waiting => "todo",
+        TeamWaitStatus::Running | TeamWaitStatus::Polling => "progress",
+        TeamWaitStatus::Blocked | TeamWaitStatus::Failed => "review",
+        TeamWaitStatus::Completed | TeamWaitStatus::Cancelled => "done",
+    }
+}
+
+fn task_status_css(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending | TaskStatus::Ready | TaskStatus::Waiting => "todo",
+        TaskStatus::InProgress => "active",
+        TaskStatus::Review => "review",
+        TaskStatus::Blocked | TaskStatus::Failed => "blocked",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Cancelled => "muted",
+    }
+}
+
+fn job_status_css(status: TeamJobStatus) -> &'static str {
+    match status {
+        TeamJobStatus::Running => "active",
+        TeamJobStatus::Completed => "completed",
+        TeamJobStatus::Failed => "blocked",
+        TeamJobStatus::Stopped | TeamJobStatus::Unknown => "todo",
+    }
+}
+
+fn wait_status_css(status: TeamWaitStatus) -> &'static str {
+    match status {
+        TeamWaitStatus::Waiting => "todo",
+        TeamWaitStatus::Running | TeamWaitStatus::Polling => "active",
+        TeamWaitStatus::Blocked | TeamWaitStatus::Failed => "blocked",
+        TeamWaitStatus::Completed => "completed",
+        TeamWaitStatus::Cancelled => "muted",
+    }
+}
+
+fn member_status_css(status: MemberStatus) -> &'static str {
+    match status {
+        MemberStatus::Online | MemberStatus::Running => "active",
+        MemberStatus::Standby => "todo",
+        MemberStatus::Completed => "completed",
+        MemberStatus::Failed | MemberStatus::Offline => "blocked",
+    }
+}
+
+fn avatar_initial(name: &str) -> String {
+    name.chars()
+        .find(|ch| ch.is_alphanumeric())
+        .map(|ch| ch.to_uppercase().collect::<String>())
+        .unwrap_or_else(|| "?".to_string())
 }
 
 fn parse_form(raw: &str) -> HashMap<String, String> {
@@ -15980,6 +19035,59 @@ fn render_debug_timeline_view(team_id: &str) -> String {
     )
 }
 
+fn render_agent_flow_console_view(team_id: &str) -> String {
+    format!(
+        r#"<section class="af-card" data-agent-flow-team="{team}">
+<div class="af-head">
+  <div class="af-title"><span class="af-mark">⌁</span><span>Agent Flow Console</span></div>
+  <div class="af-actions">
+    <input type="search" data-af-search placeholder="Search events, members, messages">
+    <select data-af-window>
+      <option value="80">Last 80</option>
+      <option value="160" selected>Last 160</option>
+      <option value="320">Last 320</option>
+      <option value="600">Last 600</option>
+    </select>
+    <button type="button" data-af-autoscroll>Auto-scroll: on</button>
+    <button type="button" data-af-refresh>Refresh</button>
+  </div>
+</div>
+<div class="af-layout">
+  <aside class="af-side">
+    <h4>Event Type</h4>
+    <div class="af-filter">
+      <label><input type="checkbox" data-af-kind="message" checked> Messages</label>
+      <label><input type="checkbox" data-af-kind="system" checked> System wakeups</label>
+      <label><input type="checkbox" data-af-kind="event" checked> Runtime events</label>
+      <label><input type="checkbox" data-af-kind="side" checked> Side-channel</label>
+      <label><input type="checkbox" data-af-kind="live" checked> Live buffers</label>
+      <label><input type="checkbox" data-af-kind="last" checked> Last replies</label>
+    </div>
+    <h4>Reading Guide</h4>
+    <p class="hint">Each vertical lane is a member or system actor. Chips are turns, messages, wakeups, side-channel replies, and live/last buffer updates. Arrows show actor to recipient when the event has both.</p>
+  </aside>
+  <div class="af-flow-wrap">
+    <div class="af-toolbar"><span data-af-summary>loading</span><span>Realtime sequence view</span></div>
+    <div class="af-stage"><p class="hint">Loading agent flow...</p></div>
+  </div>
+  <aside class="af-detail">
+    <h4>Selected Event</h4>
+    <dl>
+      <dt>Type</dt><dd data-af-detail-kind>-</dd>
+      <dt>From</dt><dd data-af-detail-actor>-</dd>
+      <dt>To</dt><dd data-af-detail-target>-</dd>
+      <dt>Time</dt><dd data-af-detail-time>-</dd>
+      <dt>Title</dt><dd data-af-detail-title>-</dd>
+    </dl>
+    <div class="af-preview" data-af-detail-body>Select an event chip to inspect the content.</div>
+  </aside>
+</div>
+<div class="af-status">loading</div>
+</section>"#,
+        team = html_escape(team_id),
+    )
+}
+
 fn render_team_runtime_controls(team_id: &str, status: UiTeamRunStatus) -> String {
     format!(
         r#"<section class="runtime-card">
@@ -16547,7 +19655,8 @@ fn expand_home(path: String) -> String {
 #[derive(Clone, Copy)]
 enum UiTeamRunStatus {
     Running,
-    Stopped,
+    Stop,
+    Exiting,
     Unknown,
 }
 
@@ -16555,7 +19664,8 @@ impl UiTeamRunStatus {
     fn label(self) -> &'static str {
         match self {
             UiTeamRunStatus::Running => "running",
-            UiTeamRunStatus::Stopped => "runtime stopped",
+            UiTeamRunStatus::Stop => "stop(idle)",
+            UiTeamRunStatus::Exiting => "exiting",
             UiTeamRunStatus::Unknown => "unknown",
         }
     }
@@ -16563,7 +19673,8 @@ impl UiTeamRunStatus {
     fn css_class(self) -> &'static str {
         match self {
             UiTeamRunStatus::Running => "run-running",
-            UiTeamRunStatus::Stopped => "run-stopped",
+            UiTeamRunStatus::Stop => "run-stop",
+            UiTeamRunStatus::Exiting => "run-stopped",
             UiTeamRunStatus::Unknown => "run-unknown",
         }
     }
@@ -16794,12 +19905,51 @@ fn stop_ui_team_process(root: &Path, team: &str) -> Result<()> {
 }
 
 fn stop_team_runtime(root: &Path, args: StopArgs) -> Result<()> {
+    if args.all {
+        let mut teams = load_team_summaries(root)?;
+        teams.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut stopped = 0_usize;
+        for config in teams {
+            let team_dir = root.join(&config.id);
+            if matches!(
+                team_run_status_for_dir(&team_dir, &config.id),
+                UiTeamRunStatus::Running | UiTeamRunStatus::Stop
+            ) {
+                stop_one_team_runtime(
+                    root,
+                    &team_dir,
+                    &config,
+                    args.keep_local_app_server,
+                    args.no_remote_nodes,
+                )?;
+                stopped += 1;
+            }
+        }
+        println!("Paused {stopped} live team runtime(s).");
+        return Ok(());
+    }
     let team_dir = resolve_team_dir(root, args.selector.team.as_deref())?;
     let config = load_config(&team_dir)?;
+    stop_one_team_runtime(
+        root,
+        &team_dir,
+        &config,
+        args.keep_local_app_server,
+        args.no_remote_nodes,
+    )
+}
+
+fn stop_one_team_runtime(
+    root: &Path,
+    team_dir: &Path,
+    config: &TeamConfig,
+    keep_local_app_server: bool,
+    no_remote_nodes: bool,
+) -> Result<()> {
     let mut stopped_pids = Vec::<u32>::new();
     for pid in [
         read_ui_team_pid(root, &config.id),
-        read_team_run_pid(&team_dir),
+        read_team_run_pid(team_dir),
     ]
     .into_iter()
     .flatten()
@@ -16809,27 +19959,27 @@ fn stop_team_runtime(root: &Path, args: StopArgs) -> Result<()> {
             stopped_pids.push(pid);
         }
     }
-    if !args.keep_local_app_server {
-        if let Some(pid) = stop_registered_app_server_for_team(&team_dir)? {
+    if !keep_local_app_server {
+        if let Some(pid) = stop_registered_app_server_for_team(team_dir)? {
             stopped_pids.push(pid);
         }
     }
     let mut stopped_nodes = Vec::<String>::new();
-    if !args.no_remote_nodes {
-        stopped_nodes = stop_remote_node_app_servers(&team_dir)?;
+    if !no_remote_nodes {
+        stopped_nodes = stop_remote_node_app_servers(team_dir)?;
     }
     stopped_pids.extend(stop_local_team_id_processes(&config.id)?);
-    let _ = fs::remove_file(team_run_pid_path(&team_dir));
+    let _ = fs::remove_file(team_run_pid_path(team_dir));
     let _ = remove_ui_team_pid(root, &config.id);
-    set_running_members_to_standby_for_pause(&team_dir)?;
+    set_running_members_to_standby_for_pause(team_dir)?;
     append_event(
-        &team_dir,
+        team_dir,
         "team_runtime_paused",
         serde_json::json!({
             "pids": stopped_pids,
             "remote_nodes": stopped_nodes,
-            "keep_local_app_server": args.keep_local_app_server,
-            "no_remote_nodes": args.no_remote_nodes,
+            "keep_local_app_server": keep_local_app_server,
+            "no_remote_nodes": no_remote_nodes,
         }),
     )?;
     println!("Paused team `{}`", config.id);
@@ -17196,6 +20346,9 @@ fn ui_team_run_status(root: &Path, team: &TeamConfig) -> UiTeamRunStatus {
 
 fn team_run_status_for_dir(team_dir: &Path, team_id: &str) -> UiTeamRunStatus {
     let mut saw_pid = false;
+    let tasks = load_tasks(team_dir).unwrap_or_default();
+    let waits = load_waits(team_dir).unwrap_or_default();
+    let open_work = open_task_count(&tasks) > 0 || open_wait_count(&waits) > 0;
     for pid in [
         team_dir
             .parent()
@@ -17207,19 +20360,23 @@ fn team_run_status_for_dir(team_dir: &Path, team_id: &str) -> UiTeamRunStatus {
     {
         saw_pid = true;
         if process_alive(pid) && process_looks_like_codex_team(pid) {
-            return UiTeamRunStatus::Running;
+            return if open_work {
+                UiTeamRunStatus::Running
+            } else {
+                UiTeamRunStatus::Stop
+            };
         }
     }
     if saw_pid {
-        return UiTeamRunStatus::Stopped;
+        return UiTeamRunStatus::Exiting;
     }
     let Ok(events) = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")) else {
         return UiTeamRunStatus::Unknown;
     };
     for event in events.into_iter().rev().take(20) {
         match event.event.as_str() {
-            "team_runtime_paused" => return UiTeamRunStatus::Stopped,
-            "app_server_keep_alive_stopped" => return UiTeamRunStatus::Stopped,
+            "team_runtime_paused" => return UiTeamRunStatus::Exiting,
+            "app_server_keep_alive_stopped" => return UiTeamRunStatus::Exiting,
             "app_server_keep_alive_idle" => return UiTeamRunStatus::Unknown,
             _ => {}
         }
@@ -17227,17 +20384,276 @@ fn team_run_status_for_dir(team_dir: &Path, team_id: &str) -> UiTeamRunStatus {
     UiTeamRunStatus::Unknown
 }
 
+fn team_keep_alive_idle_age_secs(team_dir: &Path) -> Result<Option<u64>> {
+    let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl"))?;
+    for event in events.into_iter().rev() {
+        match event.event.as_str() {
+            "app_server_keep_alive_idle" => {
+                let timestamp = DateTime::parse_from_rfc3339(&event.timestamp)
+                    .with_context(|| format!("parse event timestamp {}", event.timestamp))?;
+                let elapsed = Utc::now()
+                    .signed_duration_since(timestamp.with_timezone(&Utc))
+                    .num_seconds()
+                    .max(0) as u64;
+                return Ok(Some(elapsed));
+            }
+            "app_server_keep_alive_stopped" | "team_runtime_paused" => return Ok(None),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 fn cleanup_team(root: &Path, args: CleanupArgs) -> Result<()> {
+    if args.exiting {
+        let mut teams = load_team_summaries(root)?;
+        teams.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut deleted = 0_usize;
+        for config in teams {
+            let team_dir = root.join(&config.id);
+            if !matches!(
+                team_run_status_for_dir(&team_dir, &config.id),
+                UiTeamRunStatus::Exiting
+            ) {
+                continue;
+            }
+            cleanup_one_team(root, &team_dir, &config, &args)?;
+            deleted += 1;
+        }
+        if args.dry_run {
+            println!("Would delete {deleted} exiting team workspace(s).");
+        } else {
+            println!("Deleted {deleted} exiting team workspace(s).");
+        }
+        return Ok(());
+    }
     let team_dir = resolve_team_dir(root, args.selector.team.as_deref())?;
     let config = load_config(&team_dir)?;
-    if !args.force {
+    cleanup_one_team(root, &team_dir, &config, &args)
+}
+
+fn cleanup_one_team(
+    root: &Path,
+    team_dir: &Path,
+    config: &TeamConfig,
+    args: &CleanupArgs,
+) -> Result<()> {
+    if !args.force && !args.dry_run {
         bail!("refusing to delete `{}` without --force", config.id);
+    }
+    if args.dry_run {
+        println!("Would delete team `{}`", config.id);
+        println!("  local state: {}", team_dir.display());
+    }
+    let runtime_status = team_run_status_for_dir(team_dir, &config.id);
+    if matches!(
+        runtime_status,
+        UiTeamRunStatus::Running | UiTeamRunStatus::Stop
+    ) {
+        if args.dry_run {
+            println!("  would pause live runtime before cleanup");
+        } else {
+            stop_one_team_runtime(
+                root,
+                team_dir,
+                config,
+                false,
+                !(args.remote_state || args.containers),
+            )?;
+        }
+    }
+    if args.remote_state || args.containers {
+        cleanup_remote_team_resources(team_dir, config, args)?;
+    }
+    if args.dry_run {
+        return Ok(());
     }
     remove_member_worktrees(&config);
     fs::remove_dir_all(&team_dir)
         .with_context(|| format!("failed to remove {}", team_dir.display()))?;
+    let _ = remove_ui_team_pid(root, &config.id);
     println!("Deleted team `{}`", config.id);
     Ok(())
+}
+
+fn cleanup_remote_team_resources(
+    team_dir: &Path,
+    config: &TeamConfig,
+    args: &CleanupArgs,
+) -> Result<()> {
+    let nodes = load_nodes(team_dir)?;
+    let mut failures = Vec::<String>::new();
+    for node in nodes {
+        if matches!(node.kind, TeamNodeKind::Local | TeamNodeKind::Manual) {
+            continue;
+        }
+        let mut node_actions = Vec::<String>::new();
+        if args.remote_state {
+            match cleanup_remote_team_state_for_node(&node, &config.id, args.dry_run) {
+                Ok(action) => node_actions.push(action),
+                Err(err) => failures.push(format!("{} remote-state: {err:#}", node.id)),
+            }
+        }
+        if args.containers && matches!(node.kind, TeamNodeKind::Docker | TeamNodeKind::SshDocker) {
+            match remove_team_container_for_node(&node, args.dry_run) {
+                Ok(action) => node_actions.push(action),
+                Err(err) => failures.push(format!("{} container: {err:#}", node.id)),
+            }
+        }
+        if !node_actions.is_empty() {
+            println!("{}: {}", node.id, node_actions.join("; "));
+        }
+    }
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("remote cleanup failed: {failure}");
+        }
+        if !args.ignore_remote_errors {
+            bail!(
+                "remote cleanup failed for {} operation(s); rerun with --ignore-remote-errors to delete local state anyway",
+                failures.len()
+            );
+        }
+    }
+    if !args.dry_run {
+        append_event(
+            team_dir,
+            "team_remote_cleanup_completed",
+            serde_json::json!({
+                "remote_state": args.remote_state,
+                "containers": args.containers,
+                "failures": failures,
+                "ignore_remote_errors": args.ignore_remote_errors,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn cleanup_remote_team_state_for_node(
+    node: &TeamNode,
+    team_id: &str,
+    dry_run: bool,
+) -> Result<String> {
+    let script = remote_team_state_cleanup_shell(team_id);
+    match node.kind {
+        TeamNodeKind::Ssh => {
+            let host = node.host.as_deref().context("ssh node needs host")?;
+            if dry_run {
+                return Ok(format!("would delete remote state on ssh:{host}"));
+            }
+            run_ssh_command(host, &script)?;
+            Ok(format!("deleted remote state on ssh:{host}"))
+        }
+        TeamNodeKind::Docker => {
+            let container = node
+                .container
+                .as_deref()
+                .context("docker node needs container")?;
+            if dry_run {
+                return Ok(format!("would delete remote state in docker:{container}"));
+            }
+            run_shell_capture(
+                &format!(
+                    "docker exec {} bash -lc {}",
+                    shell_quote(container),
+                    shell_quote(&script)
+                ),
+                "delete docker node team state",
+            )?;
+            Ok(format!("deleted remote state in docker:{container}"))
+        }
+        TeamNodeKind::SshDocker => {
+            let host = node.host.as_deref().context("ssh-docker node needs host")?;
+            let container = node
+                .container
+                .as_deref()
+                .context("ssh-docker node needs container")?;
+            if dry_run {
+                return Ok(format!(
+                    "would delete remote state on ssh:{host} and ssh-docker:{host}:{container}"
+                ));
+            }
+            run_ssh_command(host, &script)?;
+            run_ssh_command(
+                host,
+                &format!(
+                    "docker exec {} bash -lc {}",
+                    shell_quote(container),
+                    shell_quote(&script)
+                ),
+            )?;
+            Ok(format!(
+                "deleted remote state on ssh:{host} and ssh-docker:{host}:{container}"
+            ))
+        }
+        TeamNodeKind::Local | TeamNodeKind::Manual => Ok("skipped local/manual node".to_string()),
+    }
+}
+
+fn remote_team_state_cleanup_shell(team_id: &str) -> String {
+    format!(
+        r#"set -euo pipefail
+team_id={team_id}
+if [ -z "$team_id" ] || [ "$team_id" = "." ] || [ "$team_id" = "/" ]; then
+  echo "refusing unsafe team id: $team_id" >&2
+  exit 64
+fi
+bases="${{CODEX_HOME:-}} ${{HOME:-/root}}/.codex"
+for base in $bases; do
+  [ -n "$base" ] || continue
+  case "$base" in "/"|"/root"|"/home"|"/tmp") continue ;; esac
+  target="$base/teams/$team_id"
+  case "$target" in
+    */teams/"$team_id") ;;
+    *) echo "refusing unsafe target: $target" >&2; exit 65 ;;
+  esac
+  if [ -d "$target" ]; then
+    rm -rf -- "$target"
+    echo "deleted $target"
+  fi
+done
+"#,
+        team_id = shell_quote(team_id),
+    )
+}
+
+fn remove_team_container_for_node(node: &TeamNode, dry_run: bool) -> Result<String> {
+    match node.kind {
+        TeamNodeKind::Docker => {
+            let container = node
+                .container
+                .as_deref()
+                .context("docker node needs container")?;
+            if dry_run {
+                return Ok(format!("would remove docker container {container}"));
+            }
+            run_shell_capture(
+                &format!("docker rm -f {}", shell_quote(container)),
+                "remove docker team container",
+            )?;
+            Ok(format!("removed docker container {container}"))
+        }
+        TeamNodeKind::SshDocker => {
+            let host = node.host.as_deref().context("ssh-docker node needs host")?;
+            let container = node
+                .container
+                .as_deref()
+                .context("ssh-docker node needs container")?;
+            if dry_run {
+                return Ok(format!(
+                    "would remove docker container {container} on ssh:{host}"
+                ));
+            }
+            run_ssh_command(host, &format!("docker rm -f {}", shell_quote(container)))?;
+            Ok(format!(
+                "removed docker container {container} on ssh:{host}"
+            ))
+        }
+        TeamNodeKind::Local | TeamNodeKind::Manual | TeamNodeKind::Ssh => {
+            Ok("skipped non-container node".to_string())
+        }
+    }
 }
 
 fn remove_member_worktrees(config: &TeamConfig) {
@@ -18331,12 +21747,12 @@ fn add_team_member(team_dir: &Path, args: MemberAddArgs) -> Result<()> {
     }
     let mission = if args.mission.trim().is_empty() {
         format!(
-            "Department mission for {}: support the team goal where this department's role is useful.\n\nOperate as one department-level Codex session. If the mission is broad or heavy, use available subagent/agent tools, skills, MCP servers, or internal decomposition inside this department.",
+            "Department mission for {}: support the team goal where this department's role is useful.\n\nOperate as one department-level Codex session. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad or heavy, proactively use available helpers inside this department.",
             member.name
         )
     } else {
         format!(
-            "Department mission for {}: {}\n\nOperate as one department-level Codex session. If the mission is broad or heavy, use available subagent/agent tools, skills, MCP servers, or internal decomposition inside this department.",
+            "Department mission for {}: {}\n\nOperate as one department-level Codex session. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad or heavy, proactively use available helpers inside this department.",
             member.name, args.mission
         )
     };
@@ -19598,6 +23014,7 @@ fn format_waits_text_filtered(team_dir: &Path, args: &WaitListArgs) -> Result<St
 }
 
 fn add_team_wait(team_dir: &Path, args: WaitAddArgs) -> Result<()> {
+    let _lock = lock_team_state(team_dir)?;
     let config = load_config(team_dir)?;
     let id = allocate_wait_id(team_dir)?;
     let owner = args
@@ -19776,6 +23193,155 @@ fn wait_has_terminal_failure_evidence(team_dir: &Path, wait: &TeamWait) -> bool 
         || evidence.ends_with(".txt")
         || evidence.ends_with(".yaml")
         || evidence.ends_with(".yml"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TeamWaitAutoCheck {
+    FileExists(String),
+    FileContains { path: String, pattern: String },
+    Command(String),
+}
+
+fn auto_complete_wait_checks(team_dir: &Path) -> Result<Vec<String>> {
+    let waits = load_waits(team_dir)?;
+    let mut completed = Vec::new();
+    for wait in waits.into_iter().filter(|wait| wait.status.is_open()) {
+        let checks = parse_wait_auto_checks(&wait);
+        if checks.is_empty() {
+            continue;
+        }
+        match run_wait_auto_checks(team_dir, &wait, &checks) {
+            Ok(()) => {
+                set_team_wait(
+                    team_dir,
+                    WaitSetArgs {
+                        id: wait.id.clone(),
+                        status: Some(TeamWaitStatus::Completed),
+                        progress: Some(format!(
+                            "auto_completed: all {} AUTO_CHECK item(s) passed. Previous progress: {}",
+                            checks.len(),
+                            wait.progress
+                        )),
+                        evidence: wait.evidence.clone(),
+                        clear_evidence: false,
+                    },
+                )?;
+                append_event(
+                    team_dir,
+                    "wait_auto_completed",
+                    serde_json::json!({
+                        "wait": wait.id,
+                        "owner": wait.owner.as_deref(),
+                        "task": wait.task_id.as_deref(),
+                        "checks": checks.len(),
+                    }),
+                )?;
+                completed.push(wait.id);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(completed)
+}
+
+fn parse_wait_auto_checks(wait: &TeamWait) -> Vec<TeamWaitAutoCheck> {
+    let mut checks = Vec::new();
+    for line in format!(
+        "{}\n{}\n{}",
+        wait.condition,
+        wait.progress,
+        wait.evidence.as_deref().unwrap_or_default()
+    )
+    .lines()
+    {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("AUTO_CHECK ")
+            .or_else(|| trimmed.strip_prefix("auto_check "))
+        else {
+            continue;
+        };
+        if let Some(path) = rest
+            .strip_prefix("file_exists ")
+            .or_else(|| rest.strip_prefix("path_exists "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            checks.push(TeamWaitAutoCheck::FileExists(path.to_string()));
+            continue;
+        }
+        if let Some(spec) = rest
+            .strip_prefix("file_contains ")
+            .or_else(|| rest.strip_prefix("log_contains "))
+            .map(str::trim)
+            && let Some((path, pattern)) = spec.split_once("::")
+        {
+            let path = path.trim();
+            let pattern = pattern.trim();
+            if !path.is_empty() && !pattern.is_empty() {
+                checks.push(TeamWaitAutoCheck::FileContains {
+                    path: path.to_string(),
+                    pattern: pattern.to_string(),
+                });
+            }
+            continue;
+        }
+        if let Some(command) = rest
+            .strip_prefix("command ")
+            .or_else(|| rest.strip_prefix("cmd "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            checks.push(TeamWaitAutoCheck::Command(command.to_string()));
+        }
+    }
+    checks
+}
+
+fn run_wait_auto_checks(
+    team_dir: &Path,
+    wait: &TeamWait,
+    checks: &[TeamWaitAutoCheck],
+) -> Result<()> {
+    let node = load_wait_check_node(team_dir, wait)?;
+    for check in checks {
+        match check {
+            TeamWaitAutoCheck::FileExists(path) => {
+                let command = format!("test -e {}", shell_quote(path));
+                run_wait_check_command(&node, &command)
+                    .with_context(|| format!("file does not exist: {path}"))?;
+            }
+            TeamWaitAutoCheck::FileContains { path, pattern } => {
+                let command = format!("grep -F -- {} {}", shell_quote(pattern), shell_quote(path));
+                run_wait_check_command(&node, &command)
+                    .with_context(|| format!("pattern not found in {path}: {pattern}"))?;
+            }
+            TeamWaitAutoCheck::Command(command) => {
+                run_wait_check_command(&node, command)
+                    .with_context(|| format!("AUTO_CHECK command failed: {command}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_wait_check_node(team_dir: &Path, wait: &TeamWait) -> Result<TeamNode> {
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
+    let node_id = wait.node.as_deref().unwrap_or("local");
+    nodes
+        .into_iter()
+        .find(|node| node.id == node_id)
+        .with_context(|| format!("wait `{}` AUTO_CHECK node `{node_id}` not found", wait.id))
+}
+
+fn run_wait_check_command(node: &TeamNode, command: &str) -> Result<String> {
+    let command = if let Some(cwd) = node.cwd.as_deref().filter(|value| !value.trim().is_empty()) {
+        format!("cd {} && {}", shell_quote(cwd), command)
+    } else {
+        command.to_string()
+    };
+    run_node_command_capture(node, &command)
 }
 
 fn record_task_wait_registration(
@@ -21374,22 +24940,53 @@ fn sha256sum_file(path: &Path) -> Result<String> {
 
 fn task_required_local_output_paths(team_dir: &Path, task: &TeamTask) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    for ownership in load_ownerships(team_dir)?
-        .into_iter()
+    let ownerships = load_ownerships(team_dir)?;
+    for ownership in ownerships
+        .iter()
         .filter(|ownership| task.owner.as_deref() == Some(ownership.owner.as_str()))
         .filter(|ownership| ownership_mentions_task(ownership, task))
         .filter(|ownership| ownership_path_is_probably_local(team_dir, &ownership.path))
     {
-        paths.push(PathBuf::from(ownership.path));
+        paths.push(PathBuf::from(&ownership.path));
     }
 
     for path in extract_probable_local_output_paths_from_task_text(team_dir, task) {
         paths.push(path);
     }
 
+    if paths.is_empty() && task_requires_formal_handoff_package(task) {
+        for ownership in ownerships
+            .iter()
+            .filter(|ownership| task.owner.as_deref() == Some(ownership.owner.as_str()))
+            .filter(|ownership| ownership_path_is_probably_local(team_dir, &ownership.path))
+            .filter(|ownership| ownership_looks_like_owner_handoff_output(ownership))
+        {
+            paths.push(PathBuf::from(&ownership.path));
+        }
+    }
+
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+fn ownership_looks_like_owner_handoff_output(ownership: &FileOwnership) -> bool {
+    let lower = format!("{} {}", ownership.path, ownership.note).to_ascii_lowercase();
+    [
+        "artifact",
+        "artifacts",
+        "handoff",
+        "completion",
+        "checklist",
+        "manifest",
+        "report",
+        "evidence",
+        "成果物",
+        "完了",
+        "レビュー",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn task_required_declared_non_local_output_paths(
@@ -21976,10 +25573,17 @@ Coordinate through the native team store with these shell commands:
 - "$CODEX_TEAM_CLI" team message --team "$CODEX_TEAM_ID" lead "<message>"
 - "$CODEX_TEAM_CLI" team message --team "$CODEX_TEAM_ID" all "<message>"
 
+Shared member journal:
+- Treat the member journal as the team's shared activity memory, not as a private lead-only report. It summarizes what each department has been doing, their tasks/jobs/waits, recent messages, events, and last output excerpts.
+- On the local machine, read it at `~/.codex/teams/{team_id}/member_journals/`. Your own journal is `~/.codex/teams/{team_id}/member_journals/{member_name}.md`.
+- Before substantial work, after long waits/jobs, and before handoff/completion, you must skim your own journal and the journals of departments you depend on. Treat those journals as background context for why the work exists, what each department is trying to accomplish, what decisions were already made, what blockers remain, and what intent should be preserved.
+- If you are unsure about a requirement, handoff, artifact, failure, or another department's intent, first consult the relevant member journals and current inbox/task/wait/job state. Then discuss with lead or the relevant department using a concrete question that cites what you understood from the journal. Do not ask generic context questions before checking the journal.
+- The runtime generates journals from the authoritative local team state. Do not edit journal files as a way to communicate; use `team message`, `team task`, `team job`, and `team wait` so the next journal snapshot is derived from real state.
+
 The message command defaults the sender to CODEX_TEAM_MEMBER, so teammates can DM each other without passing --from. Use `all` for a broadcast.
 When you send team messages through a shell command, treat message text as data. Do not put unescaped backticks, `$()`, or other command-substitution syntax inside double-quoted CLI arguments. Prefer plain identifiers without markdown backticks in shell-delivered messages, or use safe single-quote/heredoc/stdin-style quoting when available. If a sent message loses an identifier because of shell expansion, resend the exact identifier immediately and record the correction.
 
-Start by reading your inbox, the task list, the wait list, and the ownership list. Before editing a file, claim the path with the ownership command. If another department owns the path, do not edit it until that department hands it off or lead explicitly reassigns ownership. Check your inbox again after important task updates and before finishing. Discuss disagreements, blockers, handoffs, and review findings through team messages. Own your department mission end to end. If the work is broad, research-heavy, implementation-heavy, review-heavy, or otherwise benefits from parallel thinking, actively use available subagent/agent tools, skills, MCP servers, and internal decomposition within this department; do not try to carry all substantial work in one main thread when helpers are available. Do not ask the lead to create duplicate peer departments solely for load balancing. Work on tasks assigned to your department. You may also self-claim an unassigned `ready` task with `team task claim` only when it clearly matches your department mission and you can own it end to end; after claiming, message lead with the reason and intended artifacts. When handing a file to another department, send a message and release or ask lead to reassign ownership. If you start work that cannot finish until an observable condition becomes true, register it as `team wait` unless it is already a tracked `team job`. Include the exact completion condition, current request/job/log/checkpoint identifier, owner, task, and expected evidence. Do not mark a task completed while one of its waits is open. If you are blocked waiting for another department, a research gate, credentials, an artifact, lead decision, or any other condition, set your assigned task to `blocked` or register/update a wait, message lead and the relevant department, and finish; do not mark it completed just because your current turn is waiting. If you notice a blocked, pending, or review task whose gate appears cleared, whose prerequisite artifact/handoff has arrived, or whose next owner is ambiguous, do not start owned work for another department; send lead a concise `LEAD_PROPOSAL:` message with the evidence and proposed resume/reassign/review action. If this department is assigned to a non-local node, treat that node as your operational site. If Codex authentication is requested via device code, let the team runtime's direct local browser automation handle the device URL/code; report only if that automation fails and you remain unauthenticated.
+Start by reading your inbox, the task list, the wait list, and the ownership list. Before editing a file, claim the path with the ownership command. If another department owns the path, do not edit it until that department hands it off or lead explicitly reassigns ownership. Check your inbox again after important task updates and before finishing. Discuss disagreements, blockers, handoffs, and review findings through team messages. Own your department mission end to end. The user explicitly authorizes this department to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the work is broad, research-heavy, implementation-heavy, review-heavy, or otherwise benefits from parallel thinking, actively use available helpers within this department; do not try to carry all substantial work in one main thread when helpers are available. Do not ask the lead to create duplicate peer departments solely for load balancing. Work on tasks assigned to your department. You may also self-claim an unassigned `ready` task with `team task claim` only when it clearly matches your department mission and you can own it end to end; after claiming, message lead with the reason and intended artifacts. When handing a file to another department, send a message and release or ask lead to reassign ownership. If you start work that cannot finish until an observable condition becomes true, register it as `team wait` unless it is already a tracked `team job`. Include the exact completion condition, current request/job/log/checkpoint identifier, owner, task, and expected evidence. Do not mark a task completed while one of its waits is open. If you are blocked waiting for another department, a research gate, credentials, an artifact, lead decision, or any other condition, set your assigned task to `blocked` or register/update a wait, message lead and the relevant department, and finish; do not mark it completed just because your current turn is waiting. If you notice a blocked, pending, or review task whose gate appears cleared, whose prerequisite artifact/handoff has arrived, or whose next owner is ambiguous, do not start owned work for another department; send lead a concise `LEAD_PROPOSAL:` message with the evidence and proposed resume/reassign/review action. If this department is assigned to a non-local node, treat that node as your operational site. If Codex authentication is requested via device code, let the team runtime's direct local browser automation handle the device URL/code; report only if that automation fails and you remain unauthenticated.
 
 Active collaboration protocol:
 - Broadcast a short initial plan to `all` when starting nontrivial work, including intended outputs, consumers, and known risks.
@@ -22044,7 +25648,7 @@ Evidence validation policy:
 
 MCP and context policy:
 - Remote/SSH/Docker departments must not assume local MCP servers are reachable just because local config was synced. If an MCP server is unavailable on the remote node, report it as a tooling limit and ask lead/local research to perform MCP-backed reasoning or retrieval locally, then consume the resulting files/messages on the remote node.
-- Keep live turn context compact. Do not paste full logs, full papers, long generated files, or huge command output into team messages. Save large evidence to files, register or message paths, and summarize only the decision-relevant facts. This keeps long-running lead/secretary sessions from ballooning.
+- Keep live turn context compact. Do not paste full logs, full papers, long generated files, or huge command output into team messages. Save large evidence to files, register or message paths, and summarize only the decision-relevant facts. This keeps long-running lead sessions from ballooning.
 
 Docker/container ownership boundary:
 - If your department needs Docker as the real execution environment for the main task, your host-side responsibility is to build the image, create or replace a stable long-lived container, mount the relevant workspace, expose needed ports/GPU, and register/report it as a team Docker node. Use `sleep infinity` or an equivalent long-lived command for that team container unless the lead explicitly chooses another lifecycle.
@@ -22134,6 +25738,15 @@ App-server managed team run:
   - "$TEAM_CLI" message --from "{member}" all "<message>"
   - "$TEAM_CLI" message --from "{member}" <member> "<direct question>"
   - "$TEAM_CLI" message --from "{member}" <member[,member...]> "<same message to a small explicit group>"
+
+Shared member journal:
+- The journal is the team shared activity memory for departments. It is not only for lead or the dashboard.
+- Local authoritative copy: `~/.codex/teams/{team_id}/member_journals/`.
+- Node-readable copy: `$HOME/.codex/teams/{team_id}/member_journals/`. The runtime periodically syncs this one-way from local team state to SSH/Docker nodes, so remote/container departments can read it too.
+- Your own journal is `$HOME/.codex/teams/{team_id}/member_journals/{member}.md`; other departments have sibling `.md` files.
+- Before substantial work, after long waits/jobs, and before handoff/completion, you must skim your own journal plus relevant departments' journals. Treat them as the background and intent record for this team: what each department is doing, why it matters, what assumptions/decisions already exist, which artifacts are authoritative, and what blockers or handoffs are pending.
+- If you are unsure about a requirement, handoff, artifact, failure, or another department's intent, first consult the relevant journals plus current inbox/task/wait/job state. Then message lead or the relevant department with a concrete question that cites what you understood from the journal. Do not ask generic context questions before checking the journal.
+- Do not edit journal files as communication. They are generated snapshots. Use team messages/tasks/jobs/waits so the next journal update captures the real state.
 
 When a teammate sends you a message, the orchestrator may steer this active turn with the new message. Treat that as live team discussion and respond or adjust your work if needed. Ask clarifying or review questions back to related departments whenever their judgment could improve the result; do not silently make cross-department decisions.
 When you send team messages through a shell command, treat message text as data. Do not put unescaped backticks, `$()`, or other command-substitution syntax inside double-quoted CLI arguments. Prefer plain identifiers without markdown backticks in shell-delivered messages, or use safe single-quote/heredoc/stdin-style quoting when available. If a sent message loses an identifier because of shell expansion, resend the exact identifier immediately and record the correction.
@@ -22245,16 +25858,7 @@ fn build_reactive_steer_prompt(
     messages: &[MailMessage],
     language: TeamPromptLanguage,
 ) -> String {
-    let message_lines = messages
-        .iter()
-        .map(|message| {
-            format!(
-                "- [{}] {} -> {}: {}",
-                message.timestamp, message.from, message.to, message.message
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let message_lines = format_mail_messages_for_prompt(messages, language);
 
     if language.is_ja() {
         format!(
@@ -22322,6 +25926,11 @@ Member: {member_name}
 Role: {role}
 
 You are a real app-server thread. Your job is orchestration, not implementation. Read current team state and your inbox, then send concise coordination only when useful.
+
+Core operating rules:
+- If Docker image/container work appears, the host/SSH department owns image build and long-lived container creation only. After each real container is created or recreated for ongoing team work, register/update exactly one Docker or ssh-docker node and make sure a container-internal department is started or resumed there. Installs inside the container, app/model/sample execution, tests, smoke, rendering, debugging, and final runtime verification belong to that container-internal department except for intentionally read-only external servers.
+- Track long-running work and externally completed conditions. Use `team job` for inspectable PID-backed commands. Use `team wait` for MCP/API/tool polling, service-side processing, handoff gates, human/account/credential gates, remote workflows, and any other observable condition without a reliable team-managed PID. Add `AUTO_CHECK` lines when a wait can be mechanically verified.
+- Keep collaboration high-signal. Departments should ask necessary questions and publish concrete handoffs, but avoid empty STAY/status chatter. Prefer exact blocker, owner, evidence path, next action, and TEAM_COMPLETION_CHECKLIST over broad progress narration.
 
 Coordinate toward the user's current task, not toward an implicit endless improvement loop. Create, resume, reassign, or stand down departments based on current tasks, mailboxes, artifacts, and blockers. If a task description says "after runtime", "after validation", "after handoff", or names an upstream task, set that upstream task in `--depends-on`; do not start downstream validation/review before its real handoff exists. Before clearing a non-local runtime/validation department, inspect the contract and task text for every named predecessor package, prior review/audit note, validation report, source matrix, config, or generated input; sync those artifacts to the node and root-correct verify their manifests, not only the immediate method package or producer package. If you notice you created the wrong dependency list or cleared a task before required predecessor artifacts were synced, immediately fix it with `team task set <TASK_ID> --depends-on ... --status waiting|blocked --result "<corrected gate>"`, sync/verify the missing artifacts, and message the affected departments to standby until the handoff lands. Only start an automatic improvement/research loop when the active user instruction or an explicit domain skill requires that behavior.
 {autoresearch_policy}
@@ -22394,7 +26003,7 @@ Remote/container artifact handoff policy: when a non-local department needs a lo
 
 Tooling policy: lead should expect departments to install missing task tools instead of downgrading work quality. If `team node inspect` or a department report shows missing Node.js, Python tooling, browsers, build tools, CUDA libraries, package managers, or test utilities, instruct the responsible department to install what is needed on its own node and verify with the best practical checks. In Docker containers, root installs are acceptable. On SSH/local nodes, use project-local or user-local installs first, and passwordless sudo (`sudo -n`) only when available. Do not require user intervention for ordinary package installs. Ask for a fallback only when install is impossible, unsafe, or requires an interactive password.
 
-For any long-running or externally-completed work, make the completion condition explicit. Use `team job start/status/logs/artifact` for PID-backed commands that the team CLI can run and inspect. Use `team wait add/list/set` for anything with a completion condition but no reliable team-managed PID, including tool/API polling, service-side processing, human/account/credential gates, external queues, remote workflows owned by another process, or any other waitable dependency. Do not hardcode the category: if a task cannot continue until some observable condition becomes true, register a wait with owner, task, condition, progress/request/log identifiers, and final evidence. A task with an open wait is not complete. Do not mark an external/tool/API/MCP/deep_research wait as failed merely because no response has arrived yet or because a turn is quiet; keep it `running` or `polling` while it may still be in progress, and use `failed` only with terminal failure evidence such as a saved error artifact/URL or `terminal_failure:` progress note. When the wait is completed/failed/blocked, resume the owner to inspect the result and publish the real handoff, next action, or blocker.
+For any long-running or externally-completed work, make the completion condition explicit. Use `team job start/status/logs/artifact` for PID-backed commands that the team CLI can run and inspect. Use `team wait add/list/set` for anything with a completion condition but no reliable team-managed PID, including tool/API polling, service-side processing, human/account/credential gates, external queues, remote workflows owned by another process, or any other waitable dependency. Do not hardcode the category: if a task cannot continue until some observable condition becomes true, register a wait with owner, task, condition, progress/request/log identifiers, and final evidence. When the condition is mechanically checkable, include one or more lines in the wait condition/progress/evidence using `AUTO_CHECK file_exists <path>`, `AUTO_CHECK log_contains <path> :: <literal text>`, or `AUTO_CHECK command <shell command>`. The runtime will run these checks on the wait node and auto-complete the wait when all checks pass; lead still owns meaning/quality judgment. A task with an open wait is not complete. Do not mark an external/tool/API/MCP/deep_research wait as failed merely because no response has arrived yet or because a turn is quiet; keep it `running` or `polling` while it may still be in progress, and use `failed` only with terminal failure evidence such as a saved error artifact/URL or `terminal_failure:` progress note. When the wait is completed/failed/blocked, resume the owner to inspect the result and publish the real handoff, next action, or blocker.
 
 Collaboration policy: departments should over-communicate compared with a solo Codex session. Require each nontrivial department to broadcast an initial plan, ask producer/consumer departments for judgment on uncertain choices, report failures with exact logs and proposed next actions, and hand off artifacts to the departments that must consume or review them. Departments have different natural speeds; do not equate slower output with failure, and do not push for low-quality premature artifacts just to satisfy a heartbeat. For slow or quiet work, require status evidence, current subtask, running tool/job/MCP details, risks, and the next checkpoint. Departments are also allowed to act as observers: if they see a blocked/pending/review task that appears ready or misassigned, they should send lead a `LEAD_PROPOSAL:` with evidence instead of silently waiting or starting unassigned work. Treat proposals as advisory signals; validate them against current tasks, ownerships, mailboxes, jobs, and artifacts before resuming or reassigning anyone. A completed task without a `TEAM_COMPLETION_CHECKLIST` in the department's final response is not a clean completion; resume that department with a concrete mission to send missing messages, evidence, verification, and handoff paths instead of doing its work yourself. If a department ends too quickly after a substantial mission, treat that as suspicious until its checklist and mailbox messages prove real work or a valid blocker.
 
@@ -22435,16 +26044,7 @@ fn build_reactive_lead_turn_prompt(
     team_id: &str,
     language: TeamPromptLanguage,
 ) -> String {
-    let message_lines = messages
-        .iter()
-        .map(|message| {
-            format!(
-                "- [{}] {} -> {}: {}",
-                message.timestamp, message.from, message.to, message.message
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let message_lines = format_mail_messages_for_prompt(messages, language);
 
     let prompt = format!(
         r#"Reactive lead update for {member} ({role}).
@@ -22479,7 +26079,7 @@ Use the team CLI if you need context:
 - "{codex}" team member --team "{team_id}" standby <member> --reason "<why active work is no longer needed>"
 - "{codex}" team inbox --team "{team_id}" lead
 
-Respond as lead only if coordination, prioritization, clarification, ownership reassignment, placement add/remove, department add/standby/resume, job/wait tracking, tooling setup, a handoff, or a `LEAD_PROPOSAL:` is useful. Current-run mailbox messages and team-owned artifacts are authoritative; stale files/images/containers from earlier teams should not override the current plan unless you deliberately adopt them with provenance and require fresh validation. If a message reveals SSH/Docker/container work, inspect/create/update the placement node and assign/resume a department there. If a teammate sends `LEAD_PROPOSAL:`, treat it as advisory: inspect the cited task, dependency, artifact, job, wait, mailbox, and ownership state, then either resume/reassign/merge/cancel with a concrete instruction or reply why the proposal is premature. If a blocked department's gate has cleared, resume it with a concrete next mission instead of treating its earlier waiting turn as completed work. If a run hits a gated/private/401/403 external dependency or unprovided credential, preserve the evidence, keep QA blocked, and resume research/ops to find a documented public fallback or choose another current runnable option; do not accept partial output as completion. If a skill or department created/recreated a Docker container, register or update the Docker node immediately and let the auto-added container department take over work inside that container. Keep exactly one active Docker node for a given purpose; if lead and a department both created containers, choose the intended active node, standby the duplicate container department, and remove the stale node so its tasks are cancelled. If the host/SSH department is about to continue the main task through `docker run`/`docker exec`, stop it at image/container creation and redirect runtime execution, installs, rendering, and verification to the container-internal department. If a teammate reports a missing normal tool or weakens verification because something is unavailable, tell that department to install the needed dependency on its node when reasonable; Docker root installs and passwordless sudo/user-local installs are allowed. If a teammate starts long-running work, use `team job --owner <department> --task <task-id>` when there is a trackable command PID, or `team wait add --owner <department> --task <task-id>` when completion depends on an external/non-PID condition; require an exact condition and later evidence. If a department completed without a TEAM_COMPLETION_CHECKLIST or without notifying consumers, resume it and demand the missing handoff/evidence; avoid substituting your own direct `team job` unless no department can reasonably own the work. Keep this short and concrete.
+Respond as lead only if coordination, prioritization, clarification, ownership reassignment, placement add/remove, department add/standby/resume, job/wait tracking, tooling setup, a handoff, or a `LEAD_PROPOSAL:` is useful. Current-run mailbox messages and team-owned artifacts are authoritative; stale files/images/containers from earlier teams should not override the current plan unless you deliberately adopt them with provenance and require fresh validation. If a message reveals SSH/Docker/container work, inspect/create/update the placement node and assign/resume a department there. If Docker image/container work appears, host/SSH departments may build or recreate the image/container, but ongoing installs, runtime execution, tests, smoke, rendering, debugging, and final verification must move to a registered Docker/ssh-docker node with a container-internal department, except for intentionally read-only external servers. If a teammate sends `LEAD_PROPOSAL:`, treat it as advisory: inspect the cited task, dependency, artifact, job, wait, mailbox, and ownership state, then either resume/reassign/merge/cancel with a concrete instruction or reply why the proposal is premature. If a blocked department's gate has cleared, resume it with a concrete next mission instead of treating its earlier waiting turn as completed work. If a run hits a gated/private/401/403 external dependency or unprovided credential, preserve the evidence, keep QA blocked, and resume research/ops to find a documented public fallback or choose another current runnable option; do not accept partial output as completion. If a skill or department created/recreated a Docker container, register or update the Docker node immediately and let the auto-added container department take over work inside that container. Keep exactly one active Docker node for a given purpose; if lead and a department both created containers, choose the intended active node, standby the duplicate container department, and remove the stale node so its tasks are cancelled. If the host/SSH department is about to continue the main task through `docker run`/`docker exec`, stop it at image/container creation and redirect runtime execution, installs, rendering, and verification to the container-internal department. If a teammate reports a missing normal tool or weakens verification because something is unavailable, tell that department to install the needed dependency on its node when reasonable; Docker root installs and passwordless sudo/user-local installs are allowed. If a teammate starts long-running work, use `team job --owner <department> --task <task-id>` when there is a trackable command PID, or `team wait add --owner <department> --task <task-id>` when completion depends on an external/non-PID condition; require an exact condition and later evidence, including `AUTO_CHECK` lines when the condition is mechanically checkable. If a department completed without a TEAM_COMPLETION_CHECKLIST or without notifying consumers, resume it and demand the missing handoff/evidence; avoid substituting your own direct `team job` unless no department can reasonably own the work. Avoid generic STAY/status chatter; ask for or send concise blocker, owner, evidence, next action, or handoff data. Keep this short and concrete.
 "#,
         member = member.name,
         role = member.role,
@@ -22498,16 +26098,7 @@ fn build_reactive_member_turn_prompt(
     standby: bool,
     language: TeamPromptLanguage,
 ) -> String {
-    let message_lines = messages
-        .iter()
-        .map(|message| {
-            format!(
-                "- [{}] {} -> {}: {}",
-                message.timestamp, message.from, message.to, message.message
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let message_lines = format_mail_messages_for_prompt(messages, language);
     let mode = if standby {
         "You are currently in standby: answer questions, clarify prior work, and help with handoffs, but do not take new implementation work unless lead explicitly resumes you."
     } else {
@@ -23261,6 +26852,10 @@ fn timestamp_for_ui(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
+fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
+}
+
 fn now() -> String {
     tokyo_now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
@@ -24007,6 +27602,103 @@ mod tests {
     }
 
     #[test]
+    fn autoresearch_audit_warns_on_blocked_latest_iteration_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let now = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-autoresearch-blocked".to_string(),
+            goal: "Autoresearch loop for laboratory instrument digital twin / 実験装置デジタルツイン using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
+                .to_string(),
+            lead: "lead".to_string(),
+            members: vec![TeamMember {
+                name: "lead".to_string(),
+                role: "lead".to_string(),
+                status: MemberStatus::Standby,
+                joined_at: now.clone(),
+                thread_id: None,
+                workspace_path: None,
+                node: None,
+            }],
+            language: Some(TeamPromptLanguage::Ja),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("config");
+        write_test_task(
+            team_dir,
+            "20",
+            Some("audit"),
+            TaskStatus::Blocked,
+            Vec::new(),
+            Some("iteration5 final audit"),
+        );
+
+        let report = build_autoresearch_audit_report(team_dir).expect("audit");
+
+        assert!(report.contains("| latest_iteration_blockers | WARN |"));
+        assert!(report.contains("blocked_tasks=#20:audit:task 20"));
+        assert!(report.contains("## Open Tasks"));
+        assert!(report.contains("- 20 [blocked] owner=audit"));
+    }
+
+    #[test]
+    fn autoresearch_runtime_audit_writes_snapshot_without_team_steer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let created = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-autoresearch-runtime-audit".to_string(),
+            goal: "自動研究として phase0.md と phase1.md を使い、deep_thinker/deep_researcher、ssh saitou Dockerfile build、container 実験、結果を見て次実験を永遠に繰り返す。実験装置デジタルツイン研究。".to_string(),
+            lead: "lead".to_string(),
+            members: vec![TeamMember {
+                name: "lead".to_string(),
+                role: "lead".to_string(),
+                status: MemberStatus::Standby,
+                joined_at: created.clone(),
+                thread_id: None,
+                workspace_path: None,
+                node: None,
+            }],
+            language: Some(TeamPromptLanguage::Ja),
+            created_at: created.clone(),
+            updated_at: created,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("config");
+
+        let mut last_audit = Instant::now() - Duration::from_secs(601);
+        maybe_write_autoresearch_runtime_audit(team_dir, &mut last_audit, Duration::from_secs(600))
+            .expect("runtime audit");
+
+        let audit_dir = team_dir.join("autoresearch_audits");
+        let entries = fs::read_dir(&audit_dir)
+            .expect("audit dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("entries");
+        assert_eq!(entries.len(), 1);
+        let report = fs::read_to_string(entries[0].path()).expect("report");
+        assert!(report.contains("# Autoresearch Audit"));
+        assert!(report.contains("| theme |"));
+
+        let lead_mailbox =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "lead")).expect("lead mailbox");
+        assert!(lead_mailbox.is_empty());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event == "autoresearch_runtime_audit_written"
+                && event
+                    .data
+                    .get("note")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|note| note.contains("no team mailbox steer"))
+        }));
+    }
+
+    #[test]
     fn team_prompts_require_external_template_compliance() {
         let now = now();
         let lead = TeamMember {
@@ -24278,6 +27970,47 @@ mod tests {
     }
 
     #[test]
+    fn wait_add_uses_state_lock_for_unique_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path().to_path_buf();
+        write_test_config(&team_dir);
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let team_dir = team_dir.clone();
+            handles.push(std::thread::spawn(move || {
+                add_team_wait(
+                    &team_dir,
+                    WaitAddArgs {
+                        title: format!("concurrent wait {i}"),
+                        owner: Some("lead".to_string()),
+                        task: None,
+                        node: None,
+                        condition: "unique id".to_string(),
+                        status: TeamWaitStatus::Waiting,
+                        progress: String::new(),
+                        evidence: None,
+                    },
+                )
+                .expect("add wait");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("join");
+        }
+
+        let waits = load_waits(&team_dir).expect("waits");
+        let ids = waits
+            .iter()
+            .map(|wait| wait.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(waits.len(), 8);
+        assert_eq!(ids.len(), 8);
+        assert!(ids.contains("wait-1"));
+        assert!(ids.contains("wait-8"));
+    }
+
+    #[test]
     fn wait_completion_resumes_owner_for_handoff() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -24324,6 +28057,95 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message.message.contains("WAIT_STATUS") && message.message.contains("wait-1")
         }));
+    }
+
+    #[test]
+    fn wait_auto_check_completes_file_and_log_conditions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "8",
+            Some("engineering"),
+            TaskStatus::Waiting,
+            Vec::new(),
+            Some("Waiting on wait-1"),
+        );
+        let evidence = team_dir.join("handoff.md");
+        let log = team_dir.join("pytest.log");
+        fs::write(&evidence, "handoff ready").expect("write evidence");
+        fs::write(&log, "7 passed\nrc=0\n").expect("write log");
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        let now = now();
+        write_json_atomic(
+            &wait_path(team_dir, "wait-1"),
+            &TeamWait {
+                id: "wait-1".to_string(),
+                title: "runtime evidence".to_string(),
+                owner: Some("engineering".to_string()),
+                task_id: Some("8".to_string()),
+                node: None,
+                condition: format!(
+                    "AUTO_CHECK file_exists {}\nAUTO_CHECK log_contains {} :: 7 passed",
+                    evidence.display(),
+                    log.display()
+                ),
+                status: TeamWaitStatus::Polling,
+                progress: "waiting for machine evidence".to_string(),
+                evidence: Some(evidence.display().to_string()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write wait");
+
+        let completed = auto_complete_wait_checks(team_dir).expect("auto checks");
+        assert_eq!(completed, vec!["wait-1".to_string()]);
+        let wait = read_json::<TeamWait>(&wait_path(team_dir, "wait-1")).expect("wait");
+        assert_eq!(wait.status, TeamWaitStatus::Completed);
+        assert!(wait.progress.contains("auto_completed"));
+        let messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering")).expect("messages");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.message.contains("WAIT_STATUS"))
+        );
+    }
+
+    #[test]
+    fn wait_auto_check_leaves_wait_open_when_check_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        let now = now();
+        write_json_atomic(
+            &wait_path(team_dir, "wait-1"),
+            &TeamWait {
+                id: "wait-1".to_string(),
+                title: "runtime evidence".to_string(),
+                owner: Some("engineering".to_string()),
+                task_id: None,
+                node: None,
+                condition: format!(
+                    "AUTO_CHECK file_exists {}",
+                    team_dir.join("missing.txt").display()
+                ),
+                status: TeamWaitStatus::Polling,
+                progress: String::new(),
+                evidence: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write wait");
+
+        let completed = auto_complete_wait_checks(team_dir).expect("auto checks");
+        assert!(completed.is_empty());
+        let wait = read_json::<TeamWait>(&wait_path(team_dir, "wait-1")).expect("wait");
+        assert_eq!(wait.status, TeamWaitStatus::Polling);
     }
 
     #[test]
@@ -24732,7 +28554,7 @@ mod tests {
 
         let status = format_status_text(&team_dir).expect("status");
 
-        assert!(status.contains("Runtime: runtime stopped run_pid=999999(dead)"));
+        assert!(status.contains("Runtime: exiting run_pid=999999(dead)"));
         assert!(status.contains("open_tasks=1"));
         assert!(status.contains("Runtime warning: open work remains"));
         assert!(status.contains(
@@ -25713,6 +29535,75 @@ method_package:
     }
 
     #[test]
+    fn mailbox_counts_compact_large_resume_backlog_for_open_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let mailbox = mailbox_path(team_dir, "engineering");
+        let messages = (0..30)
+            .map(|idx| MailMessage {
+                from: "lead".to_string(),
+                to: "engineering".to_string(),
+                timestamp: now(),
+                message: format!("old unread backlog message {idx}"),
+                read: false,
+            })
+            .collect::<Vec<_>>();
+        write_jsonl_atomic(&mailbox, &messages).expect("write mailbox");
+        write_test_task(
+            team_dir,
+            "1",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            None,
+        );
+        let config = load_config(team_dir).expect("load config");
+        let tasks = load_tasks(team_dir).expect("tasks");
+
+        let counts = current_mailbox_counts(team_dir, &config.members, &tasks).expect("counts");
+
+        let compacted_until = 30 - MAX_RUNTIME_START_UNREAD_MAILBOX_TAIL_MESSAGES;
+        assert_eq!(counts.get("engineering"), Some(&compacted_until));
+        let compacted =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "engineering")).expect("mailbox");
+        assert_eq!(compacted.len(), 31);
+        assert!(
+            compacted
+                .iter()
+                .take(compacted_until)
+                .all(|message| message.read)
+        );
+        assert!(
+            compacted
+                .iter()
+                .skip(compacted_until)
+                .all(|message| !message.read)
+        );
+        assert!(
+            compacted
+                .last()
+                .expect("summary")
+                .message
+                .contains("Mailbox resume compaction")
+        );
+        let mut mailbox_counts = counts;
+        let member = config
+            .members
+            .iter()
+            .find(|member| member.name == "engineering")
+            .expect("member");
+        let pending =
+            collect_new_active_mailbox_messages(team_dir, member, true, &mut mailbox_counts)
+                .expect("collect")
+                .expect("pending");
+        assert_eq!(
+            pending.messages.len(),
+            MAX_RUNTIME_START_UNREAD_MAILBOX_TAIL_MESSAGES + 1
+        );
+    }
+
+    #[test]
     fn mailbox_counts_skip_old_worker_mail_when_no_open_task() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -26448,7 +30339,7 @@ authoritative_predecessor:
         write_test_task(
             team_dir,
             "1",
-            Some("engineering"),
+            Some("research"),
             TaskStatus::InProgress,
             Vec::new(),
             None,
@@ -27384,6 +31275,91 @@ authoritative_predecessor:
     }
 
     #[test]
+    fn idle_wakeup_backs_off_after_stay_without_direct_work() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let now = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-idle-stay".to_string(),
+            goal: "test".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Online,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "research".to_string(),
+                    role: "research".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+            ],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        append_event(
+            team_dir,
+            "message_sent",
+            serde_json::json!({
+                "from": "research",
+                "to": ["lead"],
+                "message": "STAY: no action needed",
+                "source": "team_relay",
+            }),
+        )
+        .expect("stay event");
+
+        let mut idle_since = HashMap::from([(
+            "research".to_string(),
+            Instant::now() - Duration::from_secs(601),
+        )]);
+        let mut last_wakeup = HashMap::new();
+        let mut last_batch = Instant::now() - Duration::from_secs(601);
+        let mut cursor = 0_usize;
+        maybe_send_department_idle_wakeups(
+            team_dir,
+            &config,
+            &HashMap::new(),
+            &mut idle_since,
+            &mut last_wakeup,
+            &mut last_batch,
+            &mut cursor,
+            Duration::from_secs(600),
+            TeamPromptLanguage::En,
+        )
+        .expect("idle wakeup");
+
+        let messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "research")).expect("mailbox");
+        assert!(messages.is_empty());
+        let events =
+            read_jsonl::<serde_json::Value>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(|value| value.as_str())
+                == Some("department_idle_wakeup_skipped")
+                && event
+                    .get("data")
+                    .and_then(|data| data.get("reason"))
+                    .and_then(|value| value.as_str())
+                    == Some("recent_stay_backoff")
+        }));
+    }
+
+    #[test]
     fn heartbeat_skips_department_recently_woken_by_idle_wakeup() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -27968,7 +31944,7 @@ authoritative_predecessor:
         write_test_task(
             team_dir,
             "1",
-            Some("engineering"),
+            Some("research"),
             TaskStatus::InProgress,
             Vec::new(),
             None,
@@ -29582,6 +33558,76 @@ authoritative_predecessor:
     }
 
     #[test]
+    fn completion_blocker_accepts_owner_level_artifact_ownership_for_formal_handoff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let artifact_dir = team_dir.join("artifacts").join("audit");
+        fs::create_dir_all(artifact_dir.join("evidence")).expect("artifact dir");
+        fs::write(artifact_dir.join("audit_report.md"), "# audit\nPASS\n").expect("report");
+        fs::write(artifact_dir.join("audit_ledger.json"), "{\"pass\":true}\n").expect("ledger");
+        fs::write(
+            artifact_dir.join("completion-checklist.md"),
+            "# checklist\n\nTEAM_COMPLETION_CHECKLIST:\n- artifacts: artifacts/audit\n- verification: sha256sum -c audit_manifest.sha256 rc=0\n- messages_sent: lead and all\n- consumers_notified: lead and all\n- blockers_or_limits: none\n",
+        )
+        .expect("checklist");
+        fs::write(
+            artifact_dir
+                .join("evidence")
+                .join("host_18081_curl_final.transcript.txt"),
+            "SSH_SCRIPT_RC=0\n",
+        )
+        .expect("evidence");
+        let manifest = Command::new("sha256sum")
+            .args([
+                "audit_report.md",
+                "audit_ledger.json",
+                "completion-checklist.md",
+                "evidence/host_18081_curl_final.transcript.txt",
+            ])
+            .current_dir(&artifact_dir)
+            .output()
+            .expect("sha256sum");
+        assert!(manifest.status.success());
+        fs::write(artifact_dir.join("audit_manifest.sha256"), manifest.stdout).expect("manifest");
+        send_team_message_to_dir(
+            team_dir,
+            "quality",
+            "lead",
+            "audit final handoff\n\nTEAM_COMPLETION_CHECKLIST:\n- artifacts: artifacts/audit\n- verification: sha256sum -c artifacts/audit/audit_manifest.sha256 rc=0\n- messages_sent: lead and all\n- consumers_notified: lead and all\n- blockers_or_limits: none\n",
+        )
+        .expect("message");
+        write_ownerships(
+            team_dir,
+            &[FileOwnership {
+                path: artifact_dir.display().to_string(),
+                owner: "quality".to_string(),
+                note:
+                    "レビュー、動作確認、token usage 所見、TEAM_COMPLETION_CHECKLIST の一次所有。"
+                        .to_string(),
+                updated_at: now(),
+            }],
+        )
+        .expect("write ownerships");
+        write_test_task(
+            team_dir,
+            "4",
+            Some("quality"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some(
+                "audit final PASS. TEAM_COMPLETION_CHECKLIST sent; sha256sum -c artifacts/audit/audit_manifest.sha256 rc=0.",
+            ),
+        );
+        let task = read_json::<TeamTask>(&task_path(team_dir, "4")).expect("task");
+
+        let issue = task_completion_missing_required_local_outputs(team_dir, &task)
+            .expect("completion blocker");
+
+        assert_eq!(issue, None);
+    }
+
+    #[test]
     fn completion_blocker_accepts_subject_declared_remote_output_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -30890,6 +34936,146 @@ authoritative_predecessor:
         assert!(design_prompt.contains("Additional constraints for autoresearch goals"));
         assert!(design_prompt.contains("local research/planning department"));
         assert!(design_prompt.contains("saitou"));
+        assert!(design_prompt.contains("Do not create local placeholder"));
+        assert!(design_prompt.contains("Do not read or invoke ordinary user-facing team-launch"));
+        assert!(!design_prompt.contains("codex-team-secretary"));
+        assert!(!design_prompt.to_lowercase().contains("secretary"));
+    }
+
+    #[test]
+    fn department_design_prompt_masks_user_facing_team_secretary_trigger_words() {
+        let prompt = build_lead_department_design_prompt(
+            "Use codex-team-secretary style secretary routing for this team.",
+            &[],
+            TeamPromptLanguage::En,
+        );
+        let lower = prompt.to_lowercase();
+        assert!(!lower.contains("codex-team-secretary"));
+        assert!(!lower.contains("secretary"));
+        assert!(lower.contains("coordinator"));
+    }
+
+    #[test]
+    fn department_design_drops_future_container_local_placeholders() {
+        let mut args = StartArgs {
+            goal: "Build a Docker image on ssh saitou, create a container, then do implementation and tests inside the container.".to_string(),
+            id: None,
+            members: Vec::new(),
+            nodes: Vec::new(),
+            tasks: Vec::new(),
+            language: None,
+        };
+        let design = LeadDepartmentDesign {
+            nodes: vec![LeadNodeDesign {
+                id: "saitou".to_string(),
+                kind: TeamNodeKind::Ssh,
+                host: Some("saitou".to_string()),
+                container: None,
+                cwd: None,
+                note: "remote build host".to_string(),
+            }],
+            departments: vec![
+                LeadDepartment {
+                    name: "ops".to_string(),
+                    role: "ops".to_string(),
+                    mission: "Build the Docker image on saitou and report TEAM_NODE when the container exists.".to_string(),
+                    node: Some("saitou".to_string()),
+                },
+                LeadDepartment {
+                    name: "implementation".to_string(),
+                    role: "engineering".to_string(),
+                    mission: "Wait for the future container and implement the API inside the container.".to_string(),
+                    node: Some("local".to_string()),
+                },
+                LeadDepartment {
+                    name: "quality".to_string(),
+                    role: "quality".to_string(),
+                    mission: "Run tests inside the Docker container after it is created.".to_string(),
+                    node: Some("local".to_string()),
+                },
+            ],
+        };
+
+        apply_department_design(&mut args, design);
+
+        assert_eq!(args.members, vec!["ops:ops@saitou"]);
+        assert_eq!(args.tasks.len(), 1);
+        assert!(args.tasks[0].contains("Build the Docker image"));
+    }
+
+    #[test]
+    fn department_design_keeps_local_audit_of_container_results() {
+        let mut args = StartArgs {
+            goal: "Build a Docker image on ssh saitou, create a container, then implement and test the app inside the container.".to_string(),
+            id: None,
+            members: Vec::new(),
+            nodes: Vec::new(),
+            tasks: Vec::new(),
+            language: None,
+        };
+        let design = LeadDepartmentDesign {
+            nodes: vec![LeadNodeDesign {
+                id: "saitou".to_string(),
+                kind: TeamNodeKind::Ssh,
+                host: Some("saitou".to_string()),
+                container: None,
+                cwd: None,
+                note: "remote build host".to_string(),
+            }],
+            departments: vec![
+                LeadDepartment {
+                    name: "ops".to_string(),
+                    role: "ops".to_string(),
+                    mission: "Build the Docker image on saitou and report TEAM_NODE when the container exists.".to_string(),
+                    node: Some("saitou".to_string()),
+                },
+                LeadDepartment {
+                    name: "quality_audit".to_string(),
+                    role: "quality".to_string(),
+                    mission: "Review the container-internal department's implementation, pytest logs, HTTP smoke test results, artifacts, and completion evidence from local.".to_string(),
+                    node: Some("local".to_string()),
+                },
+            ],
+        };
+
+        apply_department_design(&mut args, design);
+
+        assert_eq!(
+            args.members,
+            vec!["ops:ops@saitou", "quality_audit:quality"]
+        );
+        assert_eq!(args.tasks.len(), 2);
+        assert!(args.tasks[1].contains("pytest logs"));
+    }
+
+    #[test]
+    fn reactive_prompt_compacts_large_mailbox_messages() {
+        let member = TeamMember {
+            name: "worker".to_string(),
+            role: "engineering".to_string(),
+            status: MemberStatus::Running,
+            joined_at: now(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let messages = (0..(MAX_REACTIVE_PROMPT_MESSAGES + 3))
+            .map(|idx| MailMessage {
+                from: "lead".to_string(),
+                to: "worker".to_string(),
+                message: format!("message-{idx} {}", "x".repeat(2_000)),
+                timestamp: now(),
+                read: false,
+            })
+            .collect::<Vec<_>>();
+
+        let prompt = build_reactive_steer_prompt(&member, &messages, TeamPromptLanguage::En);
+
+        assert!(prompt.contains("older message(s) are omitted"));
+        assert!(!prompt.contains("message-0"));
+        assert!(prompt.contains("message-14"));
+        assert!(prompt.contains("..."));
+        assert!(prompt.len() < 20_000);
     }
 
     #[test]
@@ -31048,6 +35234,87 @@ authoritative_predecessor:
     }
 
     #[test]
+    fn lead_autonomy_tick_skips_when_lead_turn_is_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        fs::create_dir_all(team_dir.join("tasks")).expect("tasks dir");
+        fs::create_dir_all(team_dir.join("mailboxes")).expect("mailboxes dir");
+        let now = now();
+        let lead = TeamMember {
+            name: "lead".to_string(),
+            role: "lead".to_string(),
+            status: MemberStatus::Running,
+            joined_at: now.clone(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let config = TeamConfig {
+            version: 1,
+            id: "team-active-lead".to_string(),
+            goal: "continuous research loop".to_string(),
+            lead: "lead".to_string(),
+            members: vec![lead.clone()],
+            language: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("write config");
+        write_test_task(
+            team_dir,
+            "1",
+            Some("lead"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            None,
+        );
+        let mut active = HashMap::new();
+        active.insert(
+            "lead".to_string(),
+            AppServerMemberRun {
+                member: lead,
+                node_id: "local".to_string(),
+                cwd: team_dir.to_path_buf(),
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                completed: false,
+                failed: false,
+                standby_after_turn: false,
+                usage_category: "lead_tick".to_string(),
+                team_message_scan_offset: 0,
+                last_activity_at: Instant::now(),
+                last_activity_kind: "turn_started".to_string(),
+                last_stale_notice_at: None,
+                retry_not_before: None,
+                side_context_ids: Vec::new(),
+            },
+        );
+        let mut last_tick = Instant::now() - Duration::from_secs(181);
+
+        maybe_send_lead_autonomy_tick(
+            team_dir,
+            &config,
+            &active,
+            &mut last_tick,
+            Duration::from_secs(180),
+            TeamPromptLanguage::En,
+        )
+        .expect("lead tick");
+
+        let lead_messages =
+            read_jsonl::<MailMessage>(&mailbox_path(team_dir, "lead")).expect("lead mailbox");
+        assert!(lead_messages.is_empty());
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "lead_autonomy_tick_skipped"
+                    && event.data.get("reason").and_then(|value| value.as_str())
+                        == Some("lead_turn_active"))
+        );
+    }
+
+    #[test]
     fn token_usage_panel_groups_latest_turn_usage_by_feature() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -31148,6 +35415,45 @@ authoritative_predecessor:
     }
 
     #[test]
+    fn resume_runtime_base_cwd_prefers_saved_lead_workspace() {
+        let fallback = PathBuf::from("/tmp/current-shell");
+        let config = TeamConfig {
+            version: 1,
+            id: "team-resume-cwd".to_string(),
+            goal: "resume cwd test".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now(),
+                    thread_id: None,
+                    workspace_path: Some("/home/yukimaru/research/project".to_string()),
+                    node: Some("local".to_string()),
+                },
+                TeamMember {
+                    name: "evaluation".to_string(),
+                    role: "quality".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: now(),
+                    thread_id: None,
+                    workspace_path: Some("/home/yukimaru/research/project/eval".to_string()),
+                    node: Some("local".to_string()),
+                },
+            ],
+            language: None,
+            created_at: now(),
+            updated_at: now(),
+        };
+
+        assert_eq!(
+            resume_runtime_base_cwd(&config, &fallback),
+            PathBuf::from("/home/yukimaru/research/project")
+        );
+    }
+
+    #[test]
     fn thread_usage_rotation_limit_uses_total_and_context_ratio() {
         let mut record = TeamTokenUsageRecord {
             timestamp: now(),
@@ -31179,6 +35485,127 @@ authoritative_predecessor:
     }
 
     #[test]
+    fn active_turn_token_pressure_detects_oversized_thread_before_steering() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        let member = TeamMember {
+            name: "worker".to_string(),
+            role: "engineering".to_string(),
+            status: MemberStatus::Running,
+            joined_at: now(),
+            thread_id: Some("thread-1".to_string()),
+            workspace_path: None,
+            node: None,
+        };
+        let run = AppServerMemberRun {
+            member: member.clone(),
+            node_id: "local".to_string(),
+            cwd: team_dir.to_path_buf(),
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed: false,
+            failed: false,
+            standby_after_turn: false,
+            usage_category: "team_message".to_string(),
+            team_message_scan_offset: 0,
+            last_activity_at: Instant::now(),
+            last_activity_kind: "turn_started".to_string(),
+            last_stale_notice_at: None,
+            retry_not_before: None,
+            side_context_ids: Vec::new(),
+        };
+        let mut active = HashMap::new();
+        active.insert(member.name.clone(), run.clone());
+        let mut thread_to_member = HashMap::new();
+        thread_to_member.insert(thread_key("local", "thread-1"), member.name);
+
+        record_token_usage_update(
+            team_dir,
+            "local",
+            ThreadTokenUsageUpdatedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                token_usage: codex_app_server_protocol::ThreadTokenUsage {
+                    total: TokenUsageBreakdown {
+                        total_tokens: MAX_APP_SERVER_THREAD_TOTAL_TOKENS + 1,
+                        input_tokens: MAX_APP_SERVER_THREAD_TOTAL_TOKENS + 1,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        reasoning_output_tokens: 0,
+                    },
+                    last: TokenUsageBreakdown {
+                        total_tokens: 0,
+                        input_tokens: 0,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        reasoning_output_tokens: 0,
+                    },
+                    model_context_window: Some(258_400),
+                },
+            },
+            &active,
+            &HashMap::new(),
+            &thread_to_member,
+        )
+        .expect("record usage");
+
+        assert_eq!(
+            active_turn_token_pressure(team_dir, &run).expect("token pressure"),
+            Some(MAX_APP_SERVER_THREAD_TOTAL_TOKENS + 1)
+        );
+    }
+
+    #[test]
+    fn active_turn_recent_steer_rate_limit_detects_hot_thread() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let member = TeamMember {
+            name: "worker".to_string(),
+            role: "engineering".to_string(),
+            status: MemberStatus::Running,
+            joined_at: now(),
+            thread_id: Some("thread-1".to_string()),
+            workspace_path: None,
+            node: None,
+        };
+        let run = AppServerMemberRun {
+            member,
+            node_id: "local".to_string(),
+            cwd: team_dir.to_path_buf(),
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed: false,
+            failed: false,
+            standby_after_turn: false,
+            usage_category: "team_message".to_string(),
+            team_message_scan_offset: 0,
+            last_activity_at: Instant::now(),
+            last_activity_kind: "turn_started".to_string(),
+            last_stale_notice_at: None,
+            retry_not_before: None,
+            side_context_ids: Vec::new(),
+        };
+        append_event(
+            team_dir,
+            "app_server_turn_steered",
+            serde_json::json!({
+                "member": "worker",
+                "node": "local",
+                "thread": "thread-1",
+                "turn": "turn-1",
+                "messages": 1,
+            }),
+        )
+        .expect("steer event");
+
+        let remaining = active_turn_recently_steered(team_dir, &run, Duration::from_secs(30))
+            .expect("rate limit")
+            .expect("recent steer");
+        assert!(remaining <= Duration::from_secs(30));
+    }
+
+    #[test]
     fn usage_category_for_messages_identifies_system_triggers() {
         let base = MailMessage {
             from: "system".to_string(),
@@ -31202,6 +35629,30 @@ authoritative_predecessor:
         assert_eq!(
             usage_category_for_messages("lead_reactive", &[user]),
             "user_message"
+        );
+
+        let stay = MailMessage {
+            from: "research".to_string(),
+            to: "lead".to_string(),
+            message: "STAY: no open task or blocker.".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[stay]),
+            "team_noop_stay"
+        );
+
+        let handoff = MailMessage {
+            from: "runtime".to_string(),
+            to: "lead".to_string(),
+            message: "TEAM_COMPLETION_CHECKLIST: final handoff ready".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[handoff]),
+            "team_handoff"
         );
     }
 
