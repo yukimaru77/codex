@@ -323,10 +323,11 @@ fn launch_existing_interactive_lead_team(
             .arg("resume")
             .arg("--team")
             .arg(&config.id)
-            .arg("--app-server-url")
-            .arg(app_server_url)
             .arg("--cd")
             .arg(&cwd);
+        if !runtime_refresh_required {
+            command.arg("--app-server-url").arg(app_server_url);
+        }
         if idle_exit_after_sec > 0 {
             command
                 .arg("--idle-exit-after-sec")
@@ -371,13 +372,15 @@ fn launch_existing_interactive_lead_team(
         if let Some(lead_thread_id) = read_team_lead_thread_id(&team_dir)?
             && (runtime_alive || old_lead_thread_id.as_deref() != Some(lead_thread_id.as_str()))
         {
-            write_interactive_lead_attachment(&team_dir, &lead_thread_id, app_server_url, &cwd)?;
+            let active_app_server_url =
+                read_local_node_app_server_url(&team_dir)?.unwrap_or_else(|| app_server_url.to_string());
+            write_interactive_lead_attachment(&team_dir, &lead_thread_id, &active_app_server_url, &cwd)?;
             append_event(
                 &team_dir,
                 "interactive_lead_tui_attached",
                 serde_json::json!({
                     "thread": lead_thread_id,
-                    "app_server_url": app_server_url,
+                    "app_server_url": active_app_server_url,
                     "cwd": cwd,
                     "resumed_existing_team": !runtime_alive,
                 }),
@@ -385,7 +388,7 @@ fn launch_existing_interactive_lead_team(
             return Ok(TeamInteractiveLeadLaunch {
                 team_id: config.id,
                 team_dir,
-                app_server_url: app_server_url.to_string(),
+                app_server_url: active_app_server_url,
                 lead_thread_id,
             });
         }
@@ -410,6 +413,14 @@ fn launch_existing_interactive_lead_team(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn read_local_node_app_server_url(team_dir: &Path) -> Result<Option<String>> {
+    Ok(load_nodes(team_dir)?
+        .into_iter()
+        .find(|node| node.id == "local")
+        .and_then(|node| node.url)
+        .filter(|url| !url.trim().is_empty()))
 }
 
 fn interactive_runtime_refresh_required(
