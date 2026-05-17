@@ -291,13 +291,32 @@ fn launch_existing_interactive_lead_team(
         .clone()
         .unwrap_or(std::env::current_dir().context("resolve current directory")?);
     let old_lead_thread_id = read_team_lead_thread_id(&team_dir)?;
+    let runtime_refresh_required =
+        interactive_runtime_refresh_required(shared, language, idle_exit_after_sec);
     let runtime_alive = read_team_run_pid(&team_dir)
         .map(|pid| process_alive(pid) && process_looks_like_codex_team(pid))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && !runtime_refresh_required;
 
     let mut child = if runtime_alive {
         None
     } else {
+        if runtime_refresh_required {
+            append_event(
+                &team_dir,
+                "interactive_lead_runtime_refresh_requested",
+                serde_json::json!({
+                    "dangerously_bypass_approvals_and_sandbox": shared.dangerously_bypass_approvals_and_sandbox,
+                    "sandbox": shared
+                        .sandbox_mode
+                        .map(sandbox_mode_cli_arg_name),
+                    "model": shared.model.as_deref(),
+                    "profile": shared.config_profile.as_deref(),
+                    "language": language.map(|language| language.cli_value()),
+                    "idle_exit_after_sec": idle_exit_after_sec,
+                }),
+            )?;
+        }
         let mut command = Command::new(std::env::current_exe()?);
         command
             .arg("team")
@@ -393,6 +412,20 @@ fn launch_existing_interactive_lead_team(
     }
 }
 
+fn interactive_runtime_refresh_required(
+    shared: &SharedCliOptions,
+    language: Option<TeamPromptLanguage>,
+    idle_exit_after_sec: u64,
+) -> bool {
+    shared.dangerously_bypass_approvals_and_sandbox
+        || shared.sandbox_mode.is_some()
+        || shared.model.is_some()
+        || shared.config_profile.is_some()
+        || shared.cwd.is_some()
+        || language.is_some()
+        || idle_exit_after_sec > 0
+}
+
 fn read_team_lead_thread_id(team_dir: &Path) -> Result<Option<String>> {
     if !team_dir.join("config.json").exists() {
         return Ok(None);
@@ -418,6 +451,39 @@ fn app_server_registry_path() -> Result<PathBuf> {
     let codex_home =
         codex_core::config::find_codex_home().context("failed to resolve CODEX_HOME")?;
     Ok(codex_home.join("app-server.json").to_path_buf())
+}
+
+#[cfg(test)]
+mod interactive_tests {
+    use super::*;
+    use codex_utils_cli::SandboxModeCliArg;
+
+    #[test]
+    fn interactive_attach_refreshes_runtime_for_yolo() {
+        let shared = SharedCliOptions {
+            dangerously_bypass_approvals_and_sandbox: true,
+            ..SharedCliOptions::default()
+        };
+
+        assert!(interactive_runtime_refresh_required(&shared, None, 0));
+    }
+
+    #[test]
+    fn interactive_attach_refreshes_runtime_for_sandbox_override() {
+        let shared = SharedCliOptions {
+            sandbox_mode: Some(SandboxModeCliArg::DangerFullAccess),
+            ..SharedCliOptions::default()
+        };
+
+        assert!(interactive_runtime_refresh_required(&shared, None, 0));
+    }
+
+    #[test]
+    fn interactive_attach_reuses_runtime_without_runtime_overrides() {
+        let shared = SharedCliOptions::default();
+
+        assert!(!interactive_runtime_refresh_required(&shared, None, 0));
+    }
 }
 
 pub(crate) fn register_app_server_transport(
