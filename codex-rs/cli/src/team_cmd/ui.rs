@@ -823,6 +823,7 @@ fn render_token_usage_panel(team_dir: &Path) -> String {
     let mut total = TeamTokenUsageBreakdown::default();
     let mut by_category = HashMap::<String, TeamTokenUsageBreakdown>::new();
     let mut by_member = HashMap::<String, TeamTokenUsageBreakdown>::new();
+    let mut by_category_member = HashMap::<String, TeamTokenUsageBreakdown>::new();
     let mut by_node = HashMap::<String, TeamTokenUsageBreakdown>::new();
     let mut updates = usage_updates.into_values().collect::<Vec<_>>();
     updates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -836,6 +837,13 @@ fn render_token_usage_panel(team_dir: &Path) -> String {
             .entry(format!("{} ({})", record.member, record.role))
             .or_default()
             .add_assign(record.last);
+        by_category_member
+            .entry(format!(
+                "{} / {} ({})",
+                record.category, record.member, record.role
+            ))
+            .or_default()
+            .add_assign(record.last);
         by_node
             .entry(record.node.clone())
             .or_default()
@@ -844,6 +852,8 @@ fn render_token_usage_panel(team_dir: &Path) -> String {
 
     let category_rows = render_token_usage_rows(by_category, total.total_tokens, 12);
     let member_rows = render_token_usage_rows(by_member, total.total_tokens, 12);
+    let category_member_rows =
+        render_token_usage_rows(by_category_member, total.total_tokens, 16);
     let node_rows = render_token_usage_rows(by_node, total.total_tokens, 8);
     let hotspot_rows = render_token_usage_hotspot_rows(&updates, 12);
     let side_context_rows = render_side_channel_context_pressure_rows(team_dir);
@@ -881,6 +891,7 @@ fn render_token_usage_panel(team_dir: &Path) -> String {
 <div class="usage-grid">
   <details open><summary>By Feature</summary><table><tr><th>Feature</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{category_rows}</table></details>
   <details><summary>By Member</summary><table><tr><th>Member</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{member_rows}</table></details>
+  <details><summary>By Feature x Member</summary><table><tr><th>Feature / Member</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{category_member_rows}</table></details>
   <details><summary>By Node</summary><table><tr><th>Node</th><th>Share</th><th>Total</th><th>Input</th><th>Cached</th><th>Uncached</th><th>Output</th><th>Reasoning</th></tr>{node_rows}</table></details>
 </div>
 <details open><summary>Token Bottlenecks</summary><table><tr><th>Time</th><th>Feature</th><th>Member</th><th>Node</th><th>Turn</th><th>Last Total</th><th>Uncached</th><th>Context</th></tr>{hotspot_rows}</table></details>
@@ -896,6 +907,7 @@ fn render_token_usage_panel(team_dir: &Path) -> String {
         reasoning_output_tokens = html_escape(&format_tokens(total.reasoning_output_tokens)),
         category_rows = category_rows,
         member_rows = member_rows,
+        category_member_rows = category_member_rows,
         node_rows = node_rows,
         hotspot_rows = hotspot_rows,
         side_context_rows = side_context_rows,
@@ -1321,6 +1333,7 @@ main{{padding:20px;overflow:auto}}
 .team span,.team small{{display:block;color:#59636e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .run-state{{display:inline-block;margin-top:7px;padding:1px 7px;border:1px solid #d8dee4;border-radius:999px;font-size:12px;font-style:normal;color:#59636e;background:#f6f8fa}}
 .run-running{{color:#116329;background:#dafbe1;border-color:#4ac26b}}
+.run-waiting{{color:#4d3d00;background:#fff4b8;border-color:#d4a72c}}
 .run-stop{{color:#7d4e00;background:#fff8c5;border-color:#d4a72c}}
 .run-stopped{{color:#82071e;background:#ffebe9;border-color:#ff8182}}
 .run-unknown{{color:#59636e;background:#f6f8fa}}

@@ -22,6 +22,233 @@ struct TeamAppServerNodeClient {
     request_counter: i64,
 }
 
+#[cfg(test)]
+const TEAM_WAIT_IDLE_ACTIVE_QUIET_THRESHOLD_SECS: u64 = 180;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TeamWaitIdleState {
+    wait_ids: Vec<String>,
+    job_ids: Vec<String>,
+    task_ids: Vec<String>,
+    active_members: Vec<String>,
+}
+
+impl TeamWaitIdleState {
+    fn key(&self) -> String {
+        format!(
+            "waits={};jobs={};tasks={};active={}",
+            self.wait_ids.join(","),
+            self.job_ids.join(","),
+            self.task_ids.join(","),
+            self.active_members.join(",")
+        )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.wait_ids.is_empty()
+            && self.job_ids.is_empty()
+            && self.task_ids.is_empty()
+            && self.active_members.is_empty()
+    }
+}
+
+fn team_multi_agent_config_overrides(
+    language: TeamPromptLanguage,
+) -> HashMap<String, serde_json::Value> {
+    let mut config = HashMap::new();
+    config.insert(
+        "features.multi_agent_v2.usage_hint_enabled".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    config.insert(
+        "features.multi_agent_v2.usage_hint_text".to_string(),
+        serde_json::Value::String(team_multi_agent_tool_usage_hint(language)),
+    );
+    config.insert(
+        "features.multi_agent_v2.root_agent_usage_hint_text".to_string(),
+        serde_json::Value::String(team_multi_agent_root_usage_hint(language)),
+    );
+    config.insert(
+        "features.multi_agent_v2.subagent_usage_hint_text".to_string(),
+        serde_json::Value::String(team_multi_agent_subagent_usage_hint(language)),
+    );
+    config
+}
+
+fn append_team_multi_agent_developer_instructions(
+    existing: Option<String>,
+    language: TeamPromptLanguage,
+) -> String {
+    match existing {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!(
+                "{existing}\n\n{}",
+                team_multi_agent_root_usage_hint(language)
+            )
+        }
+        _ => team_multi_agent_root_usage_hint(language),
+    }
+}
+
+fn team_multi_agent_tool_usage_hint(language: TeamPromptLanguage) -> String {
+    if language.is_ja() {
+        return r#"Codex Teams subagent policy:
+- このスレッドが Codex Team の lead または部署として起動されている場合、ユーザーの team 実行依頼は、その team 内で必要な subagent を使う許可を含むものとして扱ってください。
+- 追加の明示的なユーザー許可を待つ必要はありません。調査、実装分割、検証、ログ解析、レビュー、リモート/Docker作業など、実質的な部署作業では subagent/agent tools/parallel helpers の利用をデフォルトにしてください。使わない場合は「なぜこの turn では不要か」を短く記録してください。
+- delegate する仕事は具体的かつ有界にし、team の ownership、node、cwd、成果物境界を尊重してください。
+- 重複作業を避け、subagent の結果は team message、handoff、artifact、evidence として親部署が統合してください。
+- lead が部署を作るべき仕事と、部署内部で subagent に任せるべき仕事を混同しないでください。subagent は部署の内部補助であり、team 全体の意思決定は lead が行います。"#
+            .to_string();
+    }
+    r#"Codex Teams subagent policy:
+- When this thread is running as a Codex Team lead or department, the user's request to run a team counts as authorization to use subagents inside that team.
+- Do not wait for a separate explicit user request solely to delegate. For substantial department work, default to using subagents, agent tools, or parallel helpers for research, implementation slices, verification, log analysis, review, or remote/Docker support. If you do not use them in a substantial turn, briefly record why they were unnecessary.
+- Keep delegated work concrete and bounded, and respect team ownership, node, cwd, and artifact boundaries.
+- Avoid duplicate work. The parent department must integrate subagent results into team messages, handoffs, artifacts, or evidence.
+- Do not confuse lead-created departments with department-internal subagents. Subagents are helpers inside a department; team-level orchestration remains the lead's responsibility."#
+        .to_string()
+}
+
+fn team_multi_agent_root_usage_hint(language: TeamPromptLanguage) -> String {
+    if language.is_ja() {
+        return r#"Codex Teams root-session override:
+あなたは Codex Team の lead または部署セッションです。通常の「ユーザーが明示的に subagent を頼んだ場合だけ spawn_agent を使う」という制限は、この team 実行中は上書きされます。team 起動依頼そのものが、部署内部の bounded な subagent 利用を許可しています。
+
+実質的な部署作業では subagent/agent tools/parallel helpers の利用をデフォルトにしてください。使わない場合は理由を短く残してください。使う場合は目的、入力、成果物、担当範囲を明確にしてください。team の mailbox、task、wait、job、node、ownership と整合させ、結果は親部署が統合して lead や他部署に共有してください。"#
+            .to_string();
+    }
+    r#"Codex Teams root-session override:
+You are a Codex Team lead or department session. During this team run, the usual restriction that spawn_agent requires a separate explicit user request is overridden. The team request itself authorizes bounded subagent use inside departments.
+
+For substantial department work, default to using subagents, agent tools, or parallel helpers. If you do not use them, briefly record why they were unnecessary. When you delegate, define the objective, inputs, outputs, and ownership clearly. Keep the work aligned with team mailbox, tasks, waits, jobs, nodes, and ownership. The parent department must integrate and share the results with the lead or other departments."#
+        .to_string()
+}
+
+fn team_multi_agent_subagent_usage_hint(language: TeamPromptLanguage) -> String {
+    if language.is_ja() {
+        return r#"Codex Teams subagent context:
+あなたは Codex Team の部署から呼ばれた subagent です。委任された範囲に集中し、勝手に team 部署や node を増減しないでください。発見、成果物、検証結果、blocker は親部署に簡潔に返してください。team 全体の判断や他部署への正式な handoff は親部署または lead が行います。"#
+            .to_string();
+    }
+    r#"Codex Teams subagent context:
+You are a subagent invoked by a Codex Team department. Stay within the delegated scope and do not create or remove team departments or nodes on your own. Return concise findings, artifacts, verification results, and blockers to the parent department. Team-level decisions and formal handoffs to other departments are handled by the parent department or lead."#
+        .to_string()
+}
+
+async fn start_team_app_server_thread(
+    node_client: &mut TeamAppServerNodeClient,
+    team_dir: &Path,
+    node_id: &str,
+    member_name: &str,
+    purpose: &str,
+    mut params: ThreadStartParams,
+    language: TeamPromptLanguage,
+) -> Result<ThreadStartResponse> {
+    let original_params = params.clone();
+    params.developer_instructions = Some(append_team_multi_agent_developer_instructions(
+        params.developer_instructions.take(),
+        language,
+    ));
+    let mut config = params.config.take().unwrap_or_default();
+    for (key, value) in team_multi_agent_config_overrides(language) {
+        config.insert(key, value);
+    }
+    params.config = Some(config);
+
+    match node_client
+        .client
+        .request_typed(ClientRequest::ThreadStart {
+            request_id: next_request_id(&mut node_client.request_counter),
+            params,
+        })
+        .await
+    {
+        Ok(thread) => Ok(thread),
+        Err(err) => {
+            let warning = format!(
+                "Codex Teams multi-agent override failed for @{member_name} on node `{node_id}` ({purpose}); retrying without override: {err}"
+            );
+            eprintln!("warning: {warning}");
+            let _ = append_event(
+                team_dir,
+                "team_multi_agent_override_failed",
+                serde_json::json!({
+                    "member": member_name,
+                    "node": node_id,
+                    "purpose": purpose,
+                    "error": err.to_string(),
+                    "fallback": "thread_start_without_multi_agent_override",
+                }),
+            );
+            node_client
+                .client
+                .request_typed(ClientRequest::ThreadStart {
+                    request_id: next_request_id(&mut node_client.request_counter),
+                    params: original_params,
+                })
+                .await
+                .map_err(|fallback_err| anyhow!(fallback_err))
+        }
+    }
+}
+
+async fn fork_team_app_server_thread(
+    node_client: &mut TeamAppServerNodeClient,
+    team_dir: &Path,
+    node_id: &str,
+    member_name: &str,
+    purpose: &str,
+    mut params: ThreadForkParams,
+    language: TeamPromptLanguage,
+) -> Result<ThreadForkResponse> {
+    let original_params = params.clone();
+    params.developer_instructions = Some(append_team_multi_agent_developer_instructions(
+        params.developer_instructions.take(),
+        language,
+    ));
+    let mut config = params.config.take().unwrap_or_default();
+    for (key, value) in team_multi_agent_config_overrides(language) {
+        config.insert(key, value);
+    }
+    params.config = Some(config);
+
+    match node_client
+        .client
+        .request_typed(ClientRequest::ThreadFork {
+            request_id: next_request_id(&mut node_client.request_counter),
+            params,
+        })
+        .await
+    {
+        Ok(thread) => Ok(thread),
+        Err(err) => {
+            let warning = format!(
+                "Codex Teams multi-agent override failed for @{member_name} fork on node `{node_id}` ({purpose}); retrying without override: {err}"
+            );
+            eprintln!("warning: {warning}");
+            let _ = append_event(
+                team_dir,
+                "team_multi_agent_override_failed",
+                serde_json::json!({
+                    "member": member_name,
+                    "node": node_id,
+                    "purpose": purpose,
+                    "error": err.to_string(),
+                    "fallback": "thread_fork_without_multi_agent_override",
+                }),
+            );
+            node_client
+                .client
+                .request_typed(ClientRequest::ThreadFork {
+                    request_id: next_request_id(&mut node_client.request_counter),
+                    params: original_params,
+                })
+                .await
+                .map_err(|fallback_err| anyhow!(fallback_err))
+        }
+    }
+}
+
 struct AppServerSideReply {
     member: TeamMember,
     node_id: String,
@@ -53,6 +280,21 @@ fn usage_category_for_event(event_name: &str) -> &'static str {
 fn usage_category_for_messages(default: &str, messages: &[MailMessage]) -> String {
     if messages.iter().any(|message| message.from == "user") {
         return "user_message".to_string();
+    }
+    if messages
+        .iter()
+        .any(|message| {
+            let text = message.message.trim_start();
+            text.starts_with("WAIT_STATUS:") || text.starts_with("WAIT_STILL_OPEN:")
+        })
+    {
+        return "team_wait_status".to_string();
+    }
+    if messages.iter().any(|message| {
+        let text = message.message.trim_start();
+        text.starts_with("JOB_STATUS:") || text.starts_with("AUX_JOB_STATUS:")
+    }) {
+        return "team_job_status".to_string();
     }
     if messages
         .iter()
@@ -99,66 +341,144 @@ fn usage_category_for_messages(default: &str, messages: &[MailMessage]) -> Strin
 fn usage_category_for_team_messages(messages: &[MailMessage]) -> String {
     let mut saw_non_system = false;
     let mut saw_noop_stay = false;
+    let mut saw_wait_status = false;
+    let mut saw_job_status = false;
+    let mut saw_lead_proposal = false;
+    let mut saw_debate_request = false;
+    let mut saw_debate_response = false;
+    let mut saw_decision_record = false;
+    let mut saw_review_request = false;
+    let mut saw_review_response = false;
     let mut saw_handoff = false;
+    let mut saw_final_handoff = false;
+    let mut saw_artifact_handoff = false;
+    let mut saw_artifact_plan = false;
     let mut saw_blocker = false;
+    let mut saw_failure_blocker = false;
+    let mut saw_dependency_gate = false;
     let mut saw_review = false;
+    let mut saw_audit_review = false;
     let mut saw_status = false;
     for message in messages.iter().filter(|message| message.from != "system") {
         saw_non_system = true;
         let text = message.message.trim();
-        let lower = text.to_ascii_lowercase();
+        let has_marker = |marker: &str| {
+            text.lines().any(|line| {
+                line.trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with(marker)
+            })
+        };
         if is_stay_message(text) {
             saw_noop_stay = true;
             continue;
         }
-        if lower.contains("team_completion_checklist")
-            || lower.contains("handoff")
-            || lower.contains("final handoff")
-            || lower.contains("成果物")
-            || lower.contains("完了報告")
-            || lower.contains("引き継ぎ")
+        if text.starts_with("WAIT_STATUS:") {
+            saw_wait_status = true;
+        }
+        if text.starts_with("JOB_STATUS:")
+            || text.starts_with("JOB_UPDATE:")
+            || text.starts_with("AUX_JOB_STATUS:")
+        {
+            saw_job_status = true;
+        }
+        if has_marker("LEAD_PROPOSAL:") {
+            saw_lead_proposal = true;
+        }
+        if has_marker("DEBATE_REQUEST:") {
+            saw_debate_request = true;
+        }
+        if has_marker("DEBATE_RESPONSE:") {
+            saw_debate_response = true;
+        }
+        if has_marker("DECISION_RECORD:") {
+            saw_decision_record = true;
+        }
+        if has_marker("REVIEW_REQUEST") {
+            saw_review_request = true;
+        }
+        if has_marker("REVIEW_RESPONSE") {
+            saw_review_response = true;
+        }
+        if has_marker("ARTIFACT_PLAN:") {
+            saw_artifact_plan = true;
+        }
+        if has_marker("TEAM_COMPLETION_CHECKLIST")
+            || has_marker("FINAL_HANDOFF")
+            || has_marker("PLANNER_FINAL_HANDOFF")
+        {
+            saw_final_handoff = true;
+        }
+        if has_marker("ARTIFACT_HANDOFF:") {
+            saw_artifact_handoff = true;
+        }
+        if has_marker("TEAM_COMPLETION_CHECKLIST")
+            || has_marker("FINAL_HANDOFF")
+            || has_marker("PLANNER_FINAL_HANDOFF")
+            || has_marker("ARTIFACT_HANDOFF:")
         {
             saw_handoff = true;
         }
-        if lower.contains("blocker")
-            || lower.contains("blocked")
-            || lower.contains("failed")
-            || lower.contains("failure")
-            || lower.contains("terminal_failure")
-            || lower.contains("詰ま")
-            || lower.contains("失敗")
-            || lower.contains("ブロック")
+        if has_marker("FAILURE:")
+            || has_marker("TERMINAL_FAILURE:")
+            || has_marker("JOB_FAILED:")
         {
+            saw_failure_blocker = true;
+        }
+        if has_marker("DEPENDENCY_GATE:")
+            || has_marker("CREDENTIAL_GATE:")
+            || has_marker("AUTH_GATE:")
+        {
+            saw_dependency_gate = true;
+        }
+        if has_marker("BLOCKER:") {
             saw_blocker = true;
         }
-        if lower.contains("review")
-            || lower.contains("qa")
-            || lower.contains("quality")
-            || lower.contains("audit")
-            || lower.contains("findings")
-            || lower.contains("検証")
-            || lower.contains("レビュー")
-            || lower.contains("監査")
-        {
+        if has_marker("REVIEW_REQUEST") || has_marker("REVIEW_RESPONSE") {
             saw_review = true;
         }
-        if lower.contains("status")
-            || lower.contains("standby")
-            || lower.contains("waiting")
-            || lower.contains("wait-")
-            || lower.contains("進捗")
-            || lower.contains("待機")
-        {
+        if has_marker("AUDIT_REVIEW:") {
+            saw_audit_review = true;
+        }
+        if has_marker("STATUS:") || has_marker("STAY:") {
             saw_status = true;
         }
     }
     if !saw_non_system {
         return "team_message".to_string();
     }
-    if saw_blocker {
+    if saw_lead_proposal {
+        "team_lead_proposal".to_string()
+    } else if saw_debate_request {
+        "team_debate_request".to_string()
+    } else if saw_debate_response {
+        "team_debate_response".to_string()
+    } else if saw_decision_record {
+        "team_decision_record".to_string()
+    } else if saw_review_request {
+        "team_review_request".to_string()
+    } else if saw_review_response {
+        "team_review_response".to_string()
+    } else if saw_wait_status {
+        "team_wait_status".to_string()
+    } else if saw_job_status {
+        "team_job_status".to_string()
+    } else if saw_final_handoff {
+        "team_final_handoff".to_string()
+    } else if saw_artifact_plan {
+        "team_artifact_plan".to_string()
+    } else if saw_handoff && saw_artifact_handoff {
+        "team_artifact_handoff".to_string()
+    } else if saw_failure_blocker {
+        "team_failure_blocker".to_string()
+    } else if saw_dependency_gate {
+        "team_dependency_gate".to_string()
+    } else if saw_blocker {
         "team_blocker".to_string()
+    } else if saw_audit_review {
+        "team_audit_review".to_string()
     } else if saw_review {
-        "team_review".to_string()
+        "team_review_request".to_string()
     } else if saw_handoff {
         "team_handoff".to_string()
     } else if saw_noop_stay && !saw_status {
@@ -170,6 +490,78 @@ fn usage_category_for_team_messages(messages: &[MailMessage]) -> String {
     }
 }
 
+fn artifact_plan_delivery_senders(member_name: &str, messages: &[MailMessage]) -> Vec<String> {
+    if usage_category_for_messages("team_message", messages) != "team_artifact_plan" {
+        return Vec::new();
+    }
+    if messages.iter().any(|message| {
+        message.from == "system" || artifact_plan_message_has_action_marker(&message.message)
+    }) {
+        return Vec::new();
+    }
+    let mut senders = messages
+        .iter()
+        .filter(|message| message.to == member_name || message.to == "all")
+        .filter(|message| !message.from.is_empty())
+        .map(|message| message.from.clone())
+        .collect::<Vec<_>>();
+    senders.sort();
+    senders.dedup();
+    senders
+}
+
+fn artifact_plan_message_has_action_marker(message: &str) -> bool {
+    message.lines().any(|line| {
+        let upper = line.trim_start().to_ascii_uppercase();
+        upper.starts_with("ACTION_REQUIRED:")
+            || upper.starts_with("BLOCKER:")
+            || upper.starts_with("LEAD_PROPOSAL:")
+            || upper.starts_with("DECISION_RECORD:")
+            || upper.starts_with("DEBATE_REQUEST:")
+            || upper.starts_with("DEBATE_RESPONSE:")
+            || upper.starts_with("REVIEW_REQUEST")
+            || upper.starts_with("REVIEW_RESPONSE")
+            || upper.starts_with("JOB_STATUS:")
+            || upper.starts_with("JOB_UPDATE:")
+            || upper.starts_with("WAIT_STATUS:")
+            || upper.starts_with("WAIT_STILL_OPEN:")
+            || upper.starts_with("TEAM_COMPLETION_CHECKLIST")
+            || upper.starts_with("FINAL_HANDOFF")
+    })
+}
+
+fn artifact_plan_delivery_fingerprint(member_name: &str, sender: &str) -> String {
+    format!("member={member_name};sender={sender}")
+}
+
+fn repeated_artifact_plan_delivery(team_dir: &Path, member_name: &str, messages: &[MailMessage]) -> bool {
+    let senders = artifact_plan_delivery_senders(member_name, messages);
+    !senders.is_empty()
+        && senders.iter().all(|sender| {
+            attention_fingerprint_recently_sent(
+                team_dir,
+                "artifact_plan_delivery",
+                &artifact_plan_delivery_fingerprint(member_name, sender),
+            )
+        })
+}
+
+fn record_artifact_plan_delivery(team_dir: &Path, member_name: &str, messages: &[MailMessage]) -> Result<()> {
+    for sender in artifact_plan_delivery_senders(member_name, messages) {
+        record_attention_fingerprint(
+            team_dir,
+            "artifact_plan_delivery",
+            &artifact_plan_delivery_fingerprint(member_name, &sender),
+            serde_json::json!({
+                "member": member_name,
+                "sender": sender,
+                "messages": messages.len(),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
 fn is_stay_message(message: &str) -> bool {
     let trimmed = message.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -179,10 +571,6 @@ fn is_stay_message(message: &str) -> bool {
         || lower.starts_with("no action")
         || lower.starts_with("no-op")
         || lower.starts_with("noop")
-        || trimmed.starts_with("不要")
-        || trimmed.starts_with("追加対応不要")
-        || trimmed.contains("追加対応は不要")
-        || trimmed.contains("追加作業なし")
 }
 
 fn update_active_turn_usage_category(
@@ -353,6 +741,7 @@ async fn maybe_rotate_app_server_thread_before_turn(
     model: Option<String>,
     sandbox: Option<SandboxMode>,
     approval_policy: Option<AskForApproval>,
+    language: TeamPromptLanguage,
 ) -> Result<()> {
     if !run.completed {
         return Ok(());
@@ -364,21 +753,23 @@ async fn maybe_rotate_app_server_thread_before_turn(
         return Ok(());
     }
     let old_thread = run.thread_id.clone();
-    let new_thread: ThreadStartResponse = node_client
-        .client
-        .request_typed(ClientRequest::ThreadStart {
-            request_id: next_request_id(&mut node_client.request_counter),
-            params: ThreadStartParams {
-                model,
-                cwd: Some(run.cwd.display().to_string()),
-                sandbox,
-                approval_policy,
-                ephemeral: Some(false),
-                ..ThreadStartParams::default()
-            },
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
+    let new_thread: ThreadStartResponse = start_team_app_server_thread(
+        node_client,
+        team_dir,
+        &run.node_id,
+        &run.member.name,
+        "context_rotation_thread",
+        ThreadStartParams {
+            model,
+            cwd: Some(run.cwd.display().to_string()),
+            sandbox,
+            approval_policy,
+            ephemeral: Some(false),
+            ..ThreadStartParams::default()
+        },
+        language,
+    )
+    .await?;
     thread_to_member.remove(&thread_key(&run.node_id, &old_thread));
     thread_to_member.insert(
         thread_key(&run.node_id, &new_thread.thread.id),
@@ -410,6 +801,8 @@ async fn maybe_rotate_app_server_thread_before_turn(
 #[allow(clippy::too_many_arguments)]
 async fn start_app_server_member_turn(
     node_clients: &mut HashMap<String, TeamAppServerNodeClient>,
+    node_processes: &mut Vec<NodeAppServerProcess>,
+    nodes: &[TeamNode],
     team_dir: &Path,
     active: &mut HashMap<String, AppServerMemberRun>,
     thread_to_member: &mut HashMap<String, String>,
@@ -420,127 +813,532 @@ async fn start_app_server_member_turn(
     sandbox: Option<SandboxMode>,
     approval_policy: Option<AskForApproval>,
     dangerously_bypass_approvals_and_sandbox: bool,
+    relay_port: u16,
     event_name: &str,
 ) -> Result<bool> {
-    let Some(run) = active.get_mut(member_name) else {
-        bail!("member `{member_name}` has no app-server thread");
-    };
-    if let Some(remaining) = app_server_retry_remaining(run) {
+    let language = load_config(team_dir)?.language.unwrap_or_default();
+    let mut recovered_once = false;
+
+    loop {
+        let (node_id, thread_id) = {
+            let Some(run) = active.get_mut(member_name) else {
+                bail!("member `{member_name}` has no app-server thread");
+            };
+            if let Some(remaining) = app_server_retry_remaining(run) {
+                append_event(
+                    team_dir,
+                    "app_server_member_turn_start_deferred",
+                    serde_json::json!({
+                        "member": member_name,
+                        "node": run.node_id.clone(),
+                        "thread": run.thread_id.clone(),
+                        "reason": "temporary app-server/model usage-limit cooldown",
+                        "retry_after_sec": remaining.as_secs(),
+                        "event": event_name,
+                    }),
+                )?;
+                set_member_status(team_dir, member_name, MemberStatus::Standby)?;
+                return Ok(false);
+            }
+            (run.node_id.clone(), run.thread_id.clone())
+        };
+
+        if !node_clients.contains_key(&node_id) {
+            if node_id != "local" && !recovered_once {
+                match recover_member_thread_on_node(
+                    node_clients,
+                    node_processes,
+                    nodes,
+                    team_dir,
+                    active,
+                    thread_to_member,
+                    member_name,
+                    model.clone(),
+                    sandbox.clone(),
+                    approval_policy.clone(),
+                    relay_port,
+                    language,
+                    "node client missing before turn start",
+                )
+                .await
+                {
+                    Ok(()) => {
+                        recovered_once = true;
+                        append_event(
+                            team_dir,
+                            "app_server_member_turn_start_recovered",
+                            serde_json::json!({
+                                "member": member_name,
+                                "node": node_id,
+                                "old_thread": thread_id,
+                                "event": event_name,
+                                "reason": "node client was missing; recovered node and member thread",
+                            }),
+                        )?;
+                        continue;
+                    }
+                    Err(err) => {
+                        mark_app_server_member_turn_start_failed(
+                            team_dir,
+                            active,
+                            member_name,
+                            &node_id,
+                            &thread_id,
+                            "node client missing and recovery failed",
+                            event_name,
+                            &err.to_string(),
+                        )?;
+                        return Ok(false);
+                    }
+                }
+            }
+            append_event(
+                team_dir,
+                "app_server_member_turn_start_skipped",
+                serde_json::json!({
+                    "member": member_name,
+                    "node": node_id,
+                    "thread": thread_id,
+                    "reason": "node client missing",
+                    "event": event_name,
+                }),
+            )?;
+            block_member_tasks_if_active(
+                team_dir,
+                member_name,
+                "Member could not be resumed because its app-server node client is missing.",
+            )?;
+            if let Some(run) = active.get_mut(member_name) {
+                run.completed = true;
+                run.failed = false;
+                run.standby_after_turn = false;
+            }
+            set_member_status(team_dir, member_name, MemberStatus::Standby)?;
+            return Ok(false);
+        }
+
+        let rotation_result = {
+            let run = active
+                .get_mut(member_name)
+                .with_context(|| format!("member `{member_name}` has no app-server thread"))?;
+            let node_client = node_clients
+                .get_mut(&node_id)
+                .with_context(|| format!("app-server client missing for node `{node_id}`"))?;
+            maybe_rotate_app_server_thread_before_turn(
+                node_client,
+                team_dir,
+                run,
+                thread_to_member,
+                model.clone(),
+                sandbox.clone(),
+                approval_policy.clone(),
+                language,
+            )
+            .await
+        };
+        if let Err(err) = rotation_result {
+            if node_id != "local" && !recovered_once {
+                match recover_member_thread_on_node(
+                    node_clients,
+                    node_processes,
+                    nodes,
+                    team_dir,
+                    active,
+                    thread_to_member,
+                    member_name,
+                    model.clone(),
+                    sandbox.clone(),
+                    approval_policy.clone(),
+                    relay_port,
+                    language,
+                    &format!("thread rotation failed before turn start: {err}"),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        recovered_once = true;
+                        append_event(
+                            team_dir,
+                            "app_server_member_turn_start_recovered",
+                            serde_json::json!({
+                                "member": member_name,
+                                "node": node_id,
+                                "old_thread": thread_id,
+                                "event": event_name,
+                                "reason": "thread rotation failure recovered before turn start",
+                            }),
+                        )?;
+                        continue;
+                    }
+                    Err(recovery_err) => {
+                        append_event(
+                            team_dir,
+                            "app_server_node_recovery_failed",
+                            serde_json::json!({
+                                "member": member_name,
+                                "node": node_id,
+                                "thread": thread_id,
+                                "event": event_name,
+                                "original_error": err.to_string(),
+                                "error": recovery_err.to_string(),
+                            }),
+                        )?;
+                    }
+                }
+            }
+            mark_app_server_member_turn_start_failed(
+                team_dir,
+                active,
+                member_name,
+                &node_id,
+                &thread_id,
+                "thread rotation failed before turn start",
+                event_name,
+                &err.to_string(),
+            )?;
+            return Ok(false);
+        }
+
+        let (turn_cwd, turn_thread_id) = {
+            let run = active
+                .get(member_name)
+                .with_context(|| format!("member `{member_name}` has no app-server thread"))?;
+            (run.cwd.clone(), run.thread_id.clone())
+        };
+        let (turn_prompt, side_context_ids) =
+            append_side_channel_context_prompt(team_dir, member_name, "", prompt.clone(), language)?;
+        let turn_result = {
+            let node_client = node_clients
+                .get_mut(&node_id)
+                .with_context(|| format!("app-server client missing for node `{node_id}`"))?;
+            node_client
+                .client
+                .request_typed(ClientRequest::TurnStart {
+                    request_id: next_request_id(&mut node_client.request_counter),
+                    params: TurnStartParams {
+                        thread_id: turn_thread_id.clone(),
+                        input: vec![text_input(turn_prompt)],
+                        cwd: Some(turn_cwd.clone()),
+                        model: model.clone(),
+                        approval_policy: approval_policy.clone(),
+                        sandbox_policy: if dangerously_bypass_approvals_and_sandbox {
+                            Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess)
+                        } else {
+                            None
+                        },
+                        ..TurnStartParams::default()
+                    },
+                })
+                .await
+        };
+
+        let turn: TurnStartResponse = match turn_result {
+            Ok(turn) => turn,
+            Err(err) => {
+                let err = anyhow!(err);
+                if node_id != "local" && !recovered_once {
+                    match recover_member_thread_on_node(
+                        node_clients,
+                        node_processes,
+                        nodes,
+                        team_dir,
+                        active,
+                        thread_to_member,
+                        member_name,
+                        model.clone(),
+                        sandbox.clone(),
+                        approval_policy.clone(),
+                        relay_port,
+                        language,
+                        &format!("turn start failed: {err}"),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            recovered_once = true;
+                            append_event(
+                                team_dir,
+                                "app_server_member_turn_start_recovered",
+                                serde_json::json!({
+                                    "member": member_name,
+                                    "node": node_id,
+                                    "old_thread": turn_thread_id,
+                                    "event": event_name,
+                                    "reason": "turn start failure recovered; retrying once on fresh node thread",
+                                }),
+                            )?;
+                            continue;
+                        }
+                        Err(recovery_err) => {
+                            append_event(
+                                team_dir,
+                                "app_server_node_recovery_failed",
+                                serde_json::json!({
+                                    "member": member_name,
+                                    "node": node_id,
+                                    "thread": turn_thread_id,
+                                    "event": event_name,
+                                    "original_error": err.to_string(),
+                                    "error": recovery_err.to_string(),
+                                }),
+                            )?;
+                        }
+                    }
+                }
+                mark_app_server_member_turn_start_failed(
+                    team_dir,
+                    active,
+                    member_name,
+                    &node_id,
+                    &turn_thread_id,
+                    "turn start failed",
+                    event_name,
+                    &err.to_string(),
+                )?;
+                return Ok(false);
+            }
+        };
+
+        let (member, usage_category, event_node_id, event_thread_id) = {
+            let run = active
+                .get_mut(member_name)
+                .with_context(|| format!("member `{member_name}` has no app-server thread"))?;
+            run.turn_id = turn.turn.id.clone();
+            run.completed = false;
+            run.failed = false;
+            run.standby_after_turn = false;
+            run.usage_category = usage_category_for_event(event_name).to_string();
+            run.retry_not_before = None;
+            run.last_activity_at = Instant::now();
+            run.last_activity_kind = "turn_started".to_string();
+            run.last_stale_notice_at = None;
+            run.side_context_ids = side_context_ids.clone();
+            (
+                run.member.clone(),
+                run.usage_category.clone(),
+                run.node_id.clone(),
+                run.thread_id.clone(),
+            )
+        };
+        reset_member_live_message_for_new_turn(team_dir, member_name, &turn.turn.id)?;
+        set_member_status(team_dir, member_name, MemberStatus::Running)?;
+        mark_side_channel_contexts_injected(team_dir, member_name, &side_context_ids, &turn.turn.id)?;
         append_event(
             team_dir,
-            "app_server_member_turn_start_deferred",
+            event_name,
             serde_json::json!({
                 "member": member_name,
-                "node": run.node_id.clone(),
-                "thread": run.thread_id.clone(),
-                "reason": "temporary app-server/model usage-limit cooldown",
-                "retry_after_sec": remaining.as_secs(),
-                "event": event_name,
+                "node": event_node_id,
+                "thread": event_thread_id,
+                "turn": turn.turn.id,
+                "cwd": turn_cwd,
             }),
         )?;
-        set_member_status(team_dir, member_name, MemberStatus::Standby)?;
-        return Ok(false);
+        record_turn_usage_index(
+            team_dir,
+            &member,
+            &event_node_id,
+            &event_thread_id,
+            &turn.turn.id,
+            &usage_category,
+            event_name,
+        )?;
+        return Ok(true);
     }
-    let Some(node_client) = node_clients.get_mut(&run.node_id) else {
-        append_event(
-            team_dir,
-            "app_server_member_turn_start_skipped",
-            serde_json::json!({
-                "member": member_name,
-                "node": run.node_id,
-                "thread": run.thread_id.clone(),
-                "reason": "node client missing",
-                "event": event_name,
-            }),
-        )?;
-        block_member_tasks_if_active(
-            team_dir,
-            member_name,
-            "Member could not be resumed because its app-server node client is missing.",
-        )?;
+}
+
+fn mark_app_server_member_turn_start_failed(
+    team_dir: &Path,
+    active: &mut HashMap<String, AppServerMemberRun>,
+    member_name: &str,
+    node_id: &str,
+    thread_id: &str,
+    reason: &str,
+    event_name: &str,
+    error: &str,
+) -> Result<()> {
+    append_event(
+        team_dir,
+        "app_server_member_turn_start_failed",
+        serde_json::json!({
+            "member": member_name,
+            "node": node_id,
+            "thread": thread_id,
+            "reason": reason,
+            "event": event_name,
+            "error": error,
+        }),
+    )?;
+    if node_id != "local" {
+        let _ = set_node_connection(team_dir, node_id, TeamNodeStatus::Failed, None);
+    }
+    block_member_tasks_if_active(
+        team_dir,
+        member_name,
+        &format!("Member could not be resumed because {reason}: {error}"),
+    )?;
+    if let Some(run) = active.get_mut(member_name) {
         run.completed = true;
         run.failed = false;
         run.standby_after_turn = false;
-        set_member_status(team_dir, member_name, MemberStatus::Standby)?;
-        return Ok(false);
-    };
-    maybe_rotate_app_server_thread_before_turn(
-        node_client,
-        team_dir,
-        run,
-        thread_to_member,
-        model.clone(),
-        sandbox,
-        approval_policy.clone(),
-    )
-    .await?;
-    let turn_cwd = run.cwd.clone();
-    let language = load_config(team_dir)?.language.unwrap_or_default();
-    let (prompt, side_context_ids) =
-        append_side_channel_context_prompt(team_dir, member_name, "", prompt, language)?;
-    let turn: TurnStartResponse = node_client
-        .client
-        .request_typed(ClientRequest::TurnStart {
-            request_id: next_request_id(&mut node_client.request_counter),
-            params: TurnStartParams {
-                thread_id: run.thread_id.clone(),
-                input: vec![text_input(prompt)],
-                cwd: Some(turn_cwd.clone()),
-                model,
-                approval_policy,
-                sandbox_policy: if dangerously_bypass_approvals_and_sandbox {
-                    Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess)
-                } else {
-                    None
-                },
-                ..TurnStartParams::default()
-            },
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
-    run.turn_id = turn.turn.id.clone();
-    run.completed = false;
-    run.failed = false;
-    run.standby_after_turn = false;
-    run.usage_category = usage_category_for_event(event_name).to_string();
-    run.retry_not_before = None;
-    run.last_activity_at = Instant::now();
-    run.last_activity_kind = "turn_started".to_string();
-    run.last_stale_notice_at = None;
-    run.side_context_ids = side_context_ids;
-    reset_member_live_message_for_new_turn(team_dir, member_name, &turn.turn.id)?;
-    set_member_status(team_dir, member_name, MemberStatus::Running)?;
-    mark_side_channel_contexts_injected(
-        team_dir,
-        member_name,
-        &run.side_context_ids,
-        &turn.turn.id,
-    )?;
-    append_event(
-        team_dir,
-        event_name,
-        serde_json::json!({
-            "member": member_name,
-            "node": run.node_id.clone(),
-            "thread": run.thread_id.clone(),
-            "turn": turn.turn.id,
-            "cwd": turn_cwd,
-        }),
-    )?;
-    record_turn_usage_index(
-        team_dir,
-        &run.member,
-        &run.node_id,
-        &run.thread_id,
-        &turn.turn.id,
-        &run.usage_category,
-        event_name,
-    )?;
-    Ok(true)
+    }
+    set_member_status(team_dir, member_name, MemberStatus::Standby)?;
+    Ok(())
 }
 
 async fn connect_team_app_server(url: &str) -> Result<RemoteAppServerClient> {
     connect_team_app_server_with_attempts(url, 50).await
+}
+
+async fn recover_app_server_node_client(
+    node_clients: &mut HashMap<String, TeamAppServerNodeClient>,
+    node_processes: &mut Vec<NodeAppServerProcess>,
+    nodes: &[TeamNode],
+    team_dir: &Path,
+    node_id: &str,
+    relay_port: u16,
+    reason: &str,
+) -> Result<()> {
+    if node_id == "local" {
+        bail!("local app-server node recovery is not supported inside the team runtime");
+    }
+    append_event(
+        team_dir,
+        "app_server_node_recovery_started",
+        serde_json::json!({
+            "node": node_id,
+            "reason": reason,
+        }),
+    )?;
+    if let Some(client) = node_clients.remove(node_id) {
+        let _ = client.client.shutdown().await;
+    }
+    let mut idx = 0;
+    while idx < node_processes.len() {
+        if node_processes[idx].node_id == node_id {
+            let process = node_processes.remove(idx);
+            process.stop();
+        } else {
+            idx += 1;
+        }
+    }
+    let node = nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .cloned()
+        .with_context(|| format!("node `{node_id}` is not registered"))?;
+    let (url, process) = resolve_or_spawn_node_app_server(team_dir, &node, relay_port)
+        .with_context(|| format!("recover app-server node `{node_id}`"))?;
+    if let Some(process) = process {
+        node_processes.push(process);
+    }
+    let connected_client = connect_team_app_server(&url)
+        .await
+        .with_context(|| format!("connect recovered app-server node `{node_id}` at `{url}`"))?;
+    append_event(
+        team_dir,
+        "app_server_node_recovered",
+        serde_json::json!({
+            "node": node_id,
+            "kind": node.kind,
+            "url": url,
+            "reason": reason,
+        }),
+    )?;
+    set_node_connection(team_dir, node_id, TeamNodeStatus::Online, Some(url.clone()))?;
+    node_clients.insert(
+        node_id.to_string(),
+        TeamAppServerNodeClient {
+            client: connected_client,
+            request_counter: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_member_thread_on_node(
+    node_clients: &mut HashMap<String, TeamAppServerNodeClient>,
+    node_processes: &mut Vec<NodeAppServerProcess>,
+    nodes: &[TeamNode],
+    team_dir: &Path,
+    active: &mut HashMap<String, AppServerMemberRun>,
+    thread_to_member: &mut HashMap<String, String>,
+    member_name: &str,
+    model: Option<String>,
+    sandbox: Option<SandboxMode>,
+    approval_policy: Option<AskForApproval>,
+    relay_port: u16,
+    language: TeamPromptLanguage,
+    reason: &str,
+) -> Result<()> {
+    let (node_id, old_thread, cwd, member) = {
+        let run = active
+            .get(member_name)
+            .with_context(|| format!("member `{member_name}` has no app-server thread"))?;
+        (
+            run.node_id.clone(),
+            run.thread_id.clone(),
+            run.cwd.clone(),
+            run.member.clone(),
+        )
+    };
+    recover_app_server_node_client(
+        node_clients,
+        node_processes,
+        nodes,
+        team_dir,
+        &node_id,
+        relay_port,
+        reason,
+    )
+    .await?;
+    let node_client = node_clients
+        .get_mut(&node_id)
+        .with_context(|| format!("recovered app-server client missing for node `{node_id}`"))?;
+    let thread: ThreadStartResponse = start_team_app_server_thread(
+        node_client,
+        team_dir,
+        &node_id,
+        member_name,
+        "node_recovery_thread",
+        ThreadStartParams {
+            model,
+            cwd: Some(cwd.display().to_string()),
+            sandbox,
+            approval_policy,
+            ephemeral: Some(false),
+            ..ThreadStartParams::default()
+        },
+        language,
+    )
+    .await?;
+    thread_to_member.remove(&thread_key(&node_id, &old_thread));
+    thread_to_member.insert(thread_key(&node_id, &thread.thread.id), member_name.to_string());
+    set_member_thread(team_dir, member_name, &thread.thread.id)?;
+    if let Some(run) = active.get_mut(member_name) {
+        run.thread_id = thread.thread.id.clone();
+        run.turn_id.clear();
+        run.completed = true;
+        run.failed = false;
+        run.standby_after_turn = false;
+        run.last_activity_at = Instant::now();
+        run.last_activity_kind = "node_recovered".to_string();
+        run.last_stale_notice_at = None;
+        run.retry_not_before = None;
+    }
+    append_event(
+        team_dir,
+        "app_server_member_thread_recovered",
+        serde_json::json!({
+            "member": member.name,
+            "node": node_id,
+            "old_thread": old_thread,
+            "new_thread": thread.thread.id,
+            "reason": reason,
+        }),
+    )?;
+    Ok(())
 }
 
 async fn connect_team_app_server_with_attempts(
@@ -1791,27 +2589,38 @@ fn strip_side_channel_completion_checklist(message: &str) -> String {
 }
 
 fn summarize_side_reply_messages(messages: &[MailMessage], language: TeamPromptLanguage) -> String {
+    let budget = reactive_prompt_message_budget(messages);
+    let omitted = messages.len().saturating_sub(budget.max_messages);
+    let mut lines = Vec::new();
+    if omitted > 0 {
+        lines.push(if language.is_ja() {
+            format!("(古い side-channel message {} 件を省略)", omitted)
+        } else {
+            format!("({} older side-channel message(s) omitted)", omitted)
+        });
+    }
     messages
         .iter()
+        .skip(omitted)
         .map(|message| {
             if language.is_ja() {
                 format!(
                     "- @{} から {}: {}",
                     message.from,
                     message.timestamp,
-                    compact_one_line(&message.message, 500)
+                    compact_prompt_message(&message.message, budget.max_chars.min(420))
                 )
             } else {
                 format!(
                     "- from @{} at {}: {}",
                     message.from,
                     message.timestamp,
-                    compact_one_line(&message.message, 500)
+                    compact_prompt_message(&message.message, budget.max_chars.min(420))
                 )
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .for_each(|line| lines.push(line));
+    lines.join("\n")
 }
 
 fn compact_one_line(value: &str, max_chars: usize) -> String {
@@ -1823,11 +2632,130 @@ fn compact_one_line(value: &str, max_chars: usize) -> String {
     compact
 }
 
-fn format_mail_messages_for_prompt(
+fn compact_prompt_message(value: &str, max_chars: usize) -> String {
+    let compact = compact_one_line(value, max_chars);
+    if !compact.ends_with("...") {
+        return compact;
+    }
+    let refs = extract_prompt_message_refs(value);
+    if refs.is_empty() {
+        return compact;
+    }
+    format!("{compact} refs: {}", refs.join(", "))
+}
+
+fn extract_prompt_message_refs(value: &str) -> Vec<String> {
+    let mut refs = Vec::<String>::new();
+    for raw in value.split_whitespace() {
+        let token = raw.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '<'
+                    | '>'
+                    | '`'
+            )
+        });
+        let lower = token.to_ascii_lowercase();
+        let keep = token.starts_with('/')
+            || lower.starts_with("wait-")
+            || lower.starts_with("job-")
+            || lower.starts_with("task-")
+            || lower.starts_with("task:")
+            || lower.starts_with("rc=")
+            || lower.starts_with("exit=")
+            || lower.ends_with(".md")
+            || lower.ends_with(".json")
+            || lower.ends_with(".jsonl")
+            || lower.ends_with(".log")
+            || lower.ends_with(".txt")
+            || lower.contains("manifest")
+            || lower.contains("evidence");
+        if keep && !refs.iter().any(|existing| existing == token) {
+            refs.push(token.to_string());
+        }
+        if refs.len() >= 8 {
+            break;
+        }
+    }
+    refs
+}
+
+#[derive(Clone, Copy)]
+struct ReactivePromptMessageBudget {
+    max_messages: usize,
+    max_chars: usize,
+}
+
+fn reactive_prompt_message_budget(messages: &[MailMessage]) -> ReactivePromptMessageBudget {
+    let category = usage_category_for_messages("team_message", messages);
+    match category.as_str() {
+        "team_review_request" | "team_review_response" | "team_audit_review" => {
+            ReactivePromptMessageBudget {
+                max_messages: 6,
+                max_chars: 520,
+            }
+        }
+        "team_failure_blocker" | "team_dependency_gate" | "team_blocker" => {
+            ReactivePromptMessageBudget {
+                max_messages: 6,
+                max_chars: 560,
+            }
+        }
+        "team_wait_status" | "team_job_status" | "team_noop_stay" | "team_status" => {
+            ReactivePromptMessageBudget {
+                max_messages: 5,
+                max_chars: 360,
+            }
+        }
+        "team_artifact_plan" => ReactivePromptMessageBudget {
+            max_messages: 5,
+            max_chars: 420,
+        },
+        "team_lead_proposal"
+        | "team_debate_request"
+        | "team_debate_response"
+        | "team_decision_record" => ReactivePromptMessageBudget {
+            max_messages: 8,
+            max_chars: 620,
+        },
+        "team_final_handoff" | "team_artifact_handoff" | "team_handoff" => {
+            ReactivePromptMessageBudget {
+                max_messages: 8,
+                max_chars: 640,
+            }
+        }
+        _ => ReactivePromptMessageBudget {
+            max_messages: MAX_REACTIVE_PROMPT_MESSAGES,
+            max_chars: MAX_REACTIVE_PROMPT_MESSAGE_CHARS,
+        },
+    }
+}
+
+fn format_mail_messages_for_reactive_prompt(
     messages: &[MailMessage],
     language: TeamPromptLanguage,
 ) -> String {
-    let omitted = messages.len().saturating_sub(MAX_REACTIVE_PROMPT_MESSAGES);
+    format_mail_messages_for_prompt_with_budget(
+        messages,
+        language,
+        reactive_prompt_message_budget(messages),
+    )
+}
+
+fn format_mail_messages_for_prompt_with_budget(
+    messages: &[MailMessage],
+    language: TeamPromptLanguage,
+    budget: ReactivePromptMessageBudget,
+) -> String {
+    let omitted = messages.len().saturating_sub(budget.max_messages);
     let selected = messages
         .iter()
         .skip(omitted)
@@ -1837,7 +2765,7 @@ fn format_mail_messages_for_prompt(
                 message.timestamp,
                 message.from,
                 message.to,
-                compact_one_line(&message.message, MAX_REACTIVE_PROMPT_MESSAGE_CHARS)
+                compact_prompt_message(&message.message, budget.max_chars)
             )
         })
         .collect::<Vec<_>>();
@@ -2638,7 +3566,7 @@ async fn sync_dynamic_app_server_members(
 ) -> Result<()> {
     let latest = load_config(team_dir)?;
     let tasks = load_tasks(team_dir)?;
-    for member in latest.members.iter().filter(|member| member.role != "lead") {
+    'member_loop: for member in latest.members.iter().filter(|member| member.role != "lead") {
         if !matches!(member.status, MemberStatus::Online | MemberStatus::Running) {
             continue;
         }
@@ -2757,57 +3685,180 @@ async fn sync_dynamic_app_server_members(
             );
         }
         let member_cwd = app_server_member_cwd(&node_id, nodes, cwd);
-        let node_client = node_clients
-            .get_mut(&node_id)
-            .with_context(|| format!("app-server client missing for node `{node_id}`"))?;
-        let thread: ThreadStartResponse = node_client
-            .client
-            .request_typed(ClientRequest::ThreadStart {
-                request_id: next_request_id(&mut node_client.request_counter),
-                params: ThreadStartParams {
-                    model: model.clone(),
-                    cwd: Some(member_cwd.display().to_string()),
-                    sandbox,
-                    approval_policy,
-                    ephemeral: Some(false),
-                    ..ThreadStartParams::default()
-                },
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
-        set_member_thread(team_dir, &member.name, &thread.thread.id)?;
-        set_member_workspace(team_dir, &member.name, &member_cwd)?;
-
-        let current_config = load_config(team_dir)?;
-        let current_tasks = load_tasks(team_dir)?;
-        let prompt = build_app_server_worker_prompt(
-            &current_config,
-            &current_tasks,
-            member,
-            codex_exe,
-            nodes,
-            language,
-        );
-        let turn: TurnStartResponse = node_client
-            .client
-            .request_typed(ClientRequest::TurnStart {
-                request_id: next_request_id(&mut node_client.request_counter),
-                params: TurnStartParams {
-                    thread_id: thread.thread.id.clone(),
-                    input: vec![text_input(prompt)],
-                    cwd: Some(member_cwd.clone()),
-                    model: model.clone(),
-                    approval_policy,
-                    sandbox_policy: if dangerously_bypass_approvals_and_sandbox {
-                        Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess)
-                    } else {
-                        None
+        let mut recovered_once = false;
+        let (thread, turn): (ThreadStartResponse, TurnStartResponse) = loop {
+            let thread_result = {
+                let node_client = node_clients
+                    .get_mut(&node_id)
+                    .with_context(|| format!("app-server client missing for node `{node_id}`"))?;
+                start_team_app_server_thread(
+                    node_client,
+                    team_dir,
+                    &node_id,
+                    &member.name,
+                    "dynamic_department_thread",
+                    ThreadStartParams {
+                        model: model.clone(),
+                        cwd: Some(member_cwd.display().to_string()),
+                        sandbox: sandbox.clone(),
+                        approval_policy: approval_policy.clone(),
+                        ephemeral: Some(false),
+                        ..ThreadStartParams::default()
                     },
-                    ..TurnStartParams::default()
-                },
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+                    language,
+                )
+                .await
+            };
+            let thread = match thread_result {
+                Ok(thread) => thread,
+                Err(err) if node_id != "local" && !recovered_once => {
+                    recovered_once = true;
+                    append_event(
+                        team_dir,
+                        "app_server_dynamic_member_thread_start_recovering",
+                        serde_json::json!({
+                            "member": member.name,
+                            "node": node_id,
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    if let Err(recovery_err) = recover_app_server_node_client(
+                        node_clients,
+                        node_processes,
+                        nodes,
+                        team_dir,
+                        &node_id,
+                        relay_port,
+                        &format!("dynamic member thread start failed: {err}"),
+                    )
+                    .await
+                    {
+                        append_event(
+                            team_dir,
+                            "app_server_dynamic_member_start_failed",
+                            serde_json::json!({
+                                "member": member.name,
+                                "node": node_id,
+                                "stage": "thread_start_recovery",
+                                "error": recovery_err.to_string(),
+                            }),
+                        )?;
+                        set_member_status(team_dir, &member.name, MemberStatus::Online)?;
+                        continue 'member_loop;
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    append_event(
+                        team_dir,
+                        "app_server_dynamic_member_start_failed",
+                        serde_json::json!({
+                            "member": member.name,
+                            "node": node_id,
+                            "stage": "thread_start",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    set_member_status(team_dir, &member.name, MemberStatus::Online)?;
+                    continue 'member_loop;
+                }
+            };
+            set_member_thread(team_dir, &member.name, &thread.thread.id)?;
+            set_member_workspace(team_dir, &member.name, &member_cwd)?;
+
+            let current_config = load_config(team_dir)?;
+            let current_tasks = load_tasks(team_dir)?;
+            let prompt = build_app_server_worker_prompt(
+                &current_config,
+                &current_tasks,
+                member,
+                codex_exe,
+                nodes,
+                language,
+            );
+            let turn_result = {
+                let node_client = node_clients.get_mut(&node_id).with_context(|| {
+                    format!("app-server client missing for node `{node_id}`")
+                })?;
+                node_client
+                    .client
+                    .request_typed(ClientRequest::TurnStart {
+                        request_id: next_request_id(&mut node_client.request_counter),
+                        params: TurnStartParams {
+                            thread_id: thread.thread.id.clone(),
+                            input: vec![text_input(prompt)],
+                            cwd: Some(member_cwd.clone()),
+                            model: model.clone(),
+                            approval_policy: approval_policy.clone(),
+                            sandbox_policy: if dangerously_bypass_approvals_and_sandbox {
+                                Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess)
+                            } else {
+                                None
+                            },
+                            ..TurnStartParams::default()
+                        },
+                    })
+                    .await
+            };
+            let turn = match turn_result {
+                Ok(turn) => turn,
+                Err(err) if node_id != "local" && !recovered_once => {
+                    let err = anyhow!(err);
+                    recovered_once = true;
+                    append_event(
+                        team_dir,
+                        "app_server_dynamic_member_turn_start_recovering",
+                        serde_json::json!({
+                            "member": member.name,
+                            "node": node_id,
+                            "thread": thread.thread.id,
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    if let Err(recovery_err) = recover_app_server_node_client(
+                        node_clients,
+                        node_processes,
+                        nodes,
+                        team_dir,
+                        &node_id,
+                        relay_port,
+                        &format!("dynamic member turn start failed: {err}"),
+                    )
+                    .await
+                    {
+                        append_event(
+                            team_dir,
+                            "app_server_dynamic_member_start_failed",
+                            serde_json::json!({
+                                "member": member.name,
+                                "node": node_id,
+                                "stage": "turn_start_recovery",
+                                "error": recovery_err.to_string(),
+                            }),
+                        )?;
+                        set_member_status(team_dir, &member.name, MemberStatus::Online)?;
+                        continue 'member_loop;
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    append_event(
+                        team_dir,
+                        "app_server_dynamic_member_start_failed",
+                        serde_json::json!({
+                            "member": member.name,
+                            "node": node_id,
+                            "thread": thread.thread.id,
+                            "stage": "turn_start",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    set_member_status(team_dir, &member.name, MemberStatus::Online)?;
+                    continue 'member_loop;
+                }
+            };
+            break (thread, turn);
+        };
 
         thread_to_member.insert(thread_key(&node_id, &thread.thread.id), member.name.clone());
         assistant_buffers.insert(member.name.clone(), String::new());
@@ -2875,6 +3926,7 @@ async fn sync_removed_app_server_nodes(
 ) -> Result<()> {
     let known = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
     let config = load_config(team_dir)?;
+    let tasks = load_tasks(team_dir).unwrap_or_default();
     let connected = node_clients.keys().cloned().collect::<Vec<_>>();
     for node_id in connected {
         if node_id == "local" || known.contains(&node_id) {
@@ -2895,6 +3947,15 @@ async fn sync_removed_app_server_nodes(
                                 | MemberStatus::Failed
                                 | MemberStatus::Offline
                         )
+                            && tasks.iter().any(|task| {
+                                task.owner.as_deref() == Some(member.name.as_str())
+                                    && !matches!(
+                                        task.status,
+                                        TaskStatus::Completed
+                                            | TaskStatus::Cancelled
+                                            | TaskStatus::Failed
+                                    )
+                            })
                     })
                     .unwrap_or(false)
         });
@@ -3223,11 +4284,11 @@ fn maybe_send_idle_department_outreach(
     let selected_targets = targets.into_iter().take(3).collect::<Vec<_>>();
     let message = if language.is_ja() {
         format!(
-            "@{helper} からの定期アイドル声かけ: 私はいま free/standby です。blocker、レビュー依頼、artifact 解釈、schema/runtime の懸念、handoff の整理など、手伝えることはありますか？役に立つなら直接返信してください。必要なら lead に、具体的な mission 付きで私を resume するよう依頼してください。問題なく進んでいるなら返信不要です。"
+            "REPLY_REQUEST: @{helper} からの定期アイドル声かけです。私はいま free/standby です。blocker、レビュー依頼、artifact 解釈、schema/runtime の懸念、handoff の整理など、手伝えることがあれば具体的に返してください。必要なら lead に、具体的な mission 付きで私を resume するよう依頼してください。不要なら `STAY:` で返してください。"
         )
     } else {
         format!(
-            "Periodic idle outreach from @{helper}: I am currently free/standby. Do you have a blocker, review need, artifact interpretation question, schema/runtime concern, or handoff cleanup I can help with? Reply directly if useful, or ask lead to resume me with a concrete mission. No reply needed if you are unblocked."
+            "REPLY_REQUEST: Periodic idle outreach from @{helper}. I am currently free/standby. If you have a blocker, review need, artifact interpretation question, schema/runtime concern, or handoff cleanup I can help with, reply with the concrete need. If useful, ask lead to resume me with a concrete mission. Reply with `STAY:` if no help is needed."
         )
     };
     for target in &selected_targets {
@@ -4385,17 +5446,11 @@ fn maybe_send_lead_autonomy_tick(
     } else {
         next_action_lines.join("\n")
     };
-    let continuation_policy = if team_goal_requests_autoresearch_loop(&config.goal) {
+    let continuation_policy = if goal_requests_continuation {
         if language.is_ja() {
-            "自動研究ループが有効です。初期 lead policy と autoresearch skill に従い、phase0/phase1、saitou Docker build、container runtime、評価/監査、reflection、次 bounded task を継続してください。ただし詳細ポリシーを mailbox に再掲せず、必要な artifact path / wait / job / owner だけを扱ってください。".to_string()
+            "この team の goal は継続・反復を明示しています。open task/open wait がなく、audit/evaluation/handoff に `NEXT_ACTION:` / `RECOMMENDED_NEXT_ACTION:` / `FOLLOW_UP:` がある場合、idle とみなさず、lead が次の許可済み task/owner/wait/job を作るか、ユーザー入力が必要な blocker を明示してください。domain 固有の cycle 粒度や監査条件は、goal・skill・外部仕様が明示した場合だけ使ってください。".to_string()
         } else {
-            "Autoresearch loop is active. Follow the initial lead policy and autoresearch skill for phase0/phase1, saitou Docker build, container runtime, evaluation/audit, reflection, and next bounded tasks. Do not repeat the full policy in mailbox messages; use artifact paths, waits, jobs, and owners.".to_string()
-        }
-    } else if goal_requests_continuation {
-        if language.is_ja() {
-            "この team の goal は継続・反復を明示しています。open task/open wait がなく、監査・評価・handoff に recommended next action / follow-up がある場合、idle とみなさず、lead が次の許可済み task/owner/wait/job を作るか、ユーザー入力が必要な blocker を明示してください。研究 skill が明示的に要求する場合だけ、研究サイクルとして扱ってください。".to_string()
-        } else {
-            "This team's goal explicitly requests continuation/iteration. If there are no open tasks or waits but audit/evaluation/handoff artifacts contain recommended next actions or follow-ups, do not treat the team as idle; lead must either create the next authorized tasks/owners/waits/jobs or record the concrete blocker requiring user input. Treat the work as a research cycle only when a domain skill explicitly requires it.".to_string()
+            "This team's goal explicitly requests continuation/iteration. If there are no open tasks or waits but audit/evaluation/handoff artifacts contain `NEXT_ACTION:`, `RECOMMENDED_NEXT_ACTION:`, or `FOLLOW_UP:`, do not treat the team as idle; lead must either create the next authorized tasks/owners/waits/jobs or record the concrete blocker requiring user input. Use domain-specific cycle size and audit gates only when the goal, skill, or external spec explicitly defines them.".to_string()
         }
     } else if language.is_ja() {
         "この team の goal は明示的な継続 loop を要求していません。next action signal は参考情報として扱い、勝手に新しい改善 loop を作らず、必要ならユーザー入力待ちを明示してください。".to_string()
@@ -4404,7 +5459,7 @@ fn maybe_send_lead_autonomy_tick(
     };
     let message = if language.is_ja() {
         format!(
-            "Lead autonomy tick: あなたがこの team の意思決定オーケストレーターです。runtime は状態を届けているだけです。\n\nAction checklist: open task/wait/mailbox/job/artifact を見て、必要な steer/resume/reassign/review/standby を1つ以上具体化してください。open wait がある task は完了扱いにせず、completed/failed/blocked wait は owner を resume して実結果を確認させてください。`LEAD_PROPOSAL:` は採用/却下を明示してください。{continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nActive turns:\n{}",
+            "Lead autonomy tick: あなたがこの team の意思決定オーケストレーターです。runtime は状態を届けているだけです。\n\nAction checklist: open task/wait/mailbox/job/artifact を見て、必要な steer/resume/reassign/review/standby を1つ以上具体化してください。open wait がある task は完了扱いにせず、completed/failed/blocked wait は owner を resume して実結果を確認させてください。`LEAD_PROPOSAL:` は採用/却下を明示してください。判断が分かれる未解決点、部署間 interface、runtime/環境選択、QA 境界、handoff 解釈、弱い evidence がある場合は、status 収集だけで終わらず、関係部署に具体的な質問を投げて短い対話を発生させてください。{continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nActive turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -4423,7 +5478,7 @@ fn maybe_send_lead_autonomy_tick(
         )
     } else {
         format!(
-            "Lead autonomy tick: you are the decision-making orchestrator for this team. The runtime is only delivering state.\n\nAction checklist: inspect open tasks/waits/mailboxes/jobs/artifacts, then make any concrete steer/resume/reassign/review/standby decision needed. Never complete a task with an open wait; when a wait is completed/failed/blocked, resume its owner to inspect the real result. Explicitly accept or reject each `LEAD_PROPOSAL:`. {continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nActive turns:\n{}",
+            "Lead autonomy tick: you are the decision-making orchestrator for this team. The runtime is only delivering state.\n\nAction checklist: inspect open tasks/waits/mailboxes/jobs/artifacts, then make any concrete steer/resume/reassign/review/standby decision needed. Never complete a task with an open wait; when a wait is completed/failed/blocked, resume its owner to inspect the real result. Explicitly accept or reject each `LEAD_PROPOSAL:`. If there is an unresolved judgment call, cross-department interface, runtime/environment choice, QA boundary, handoff interpretation, or weak evidence, do not stop at status collection; ask the relevant departments concrete questions and make a short discussion happen. {continuation_policy}\n\nOpen tasks:\n{}{omitted_line}\n\nOpen task owner cooldowns:\n{task_owner_cooldown_block}\n\nOpen waits:\n{}{omitted_waits_line}\n\nRecent LEAD_PROPOSAL signals:\n{proposal_block}\n\nRecent artifact next-action signals:\n{next_action_block}\n\nActive turns:\n{}",
             if open_task_lines.is_empty() {
                 "- none".to_string()
             } else {
@@ -4458,89 +5513,21 @@ fn maybe_send_lead_autonomy_tick(
 }
 
 fn team_goal_requests_continuation(goal: &str) -> bool {
-    if team_goal_requests_autoresearch_loop(goal) {
-        return true;
-    }
-    let lower = goal.to_ascii_lowercase();
-    [
-        "keep iterating",
-        "continue iterating",
-        "continue to iterate",
-        "continue until",
-        "continue the autoresearch loop",
-        "continue the actual autoresearch loop",
-        "iterate research",
-        "iterate:",
-        "keep cycling",
-        "next cycle",
-        "rerun",
-        "繰り返",
-        "継続",
-        "改善サイクル",
-        "次サイクル",
-        "永遠",
-        "ずっと",
-    ]
-    .iter()
-    .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+    explicit_team_control_marker(goal, "CODEX_TEAM_CONTINUATION")
 }
 
 fn team_goal_requests_autoresearch_loop(goal: &str) -> bool {
-    let lower = goal.to_lowercase();
-    if lower.contains("autoresearch")
-        || lower.contains("auto research")
-        || lower.contains("自動研究")
-        || lower.contains("自動実験")
-        || lower.contains("研究サイクル")
-    {
-        return true;
-    }
-    if lower.contains("phase0.md") && lower.contains("phase1.md") {
-        return true;
-    }
-    let mentions_deep_tool = lower.contains("deep_thinker")
-        || lower.contains("deepthinker")
-        || lower.contains("deep_research")
-        || lower.contains("deepresearch");
-    let mentions_runtime = lower.contains("docker")
-        || lower.contains("dockerfile")
-        || lower.contains("container")
-        || lower.contains("コンテナ")
-        || lower.contains("saitou")
-        || lower.contains("ssh");
-    let mentions_experiment_loop = lower.contains("実験し続け")
-        || lower.contains("繰り返")
-        || lower.contains("永遠")
-        || lower.contains("ずっと")
-        || lower.contains("満足するまで")
-        || lower.contains("experiment")
-        || lower.contains("iterate");
-    mentions_deep_tool && mentions_runtime && mentions_experiment_loop
+    explicit_team_control_marker(goal, "CODEX_TEAM_AUTORESEARCH_LOOP")
 }
 
-fn build_autoresearch_department_design_policy(goal: &str, language: TeamPromptLanguage) -> String {
-    if !team_goal_requests_autoresearch_loop(goal) {
-        return if language.is_ja() {
-            "- この goal は自動研究ループとしては検出されていません。通常の domain ownership で設計してください。".to_string()
-        } else {
-            "- This goal was not detected as an autoresearch loop. Use normal domain ownership."
-                .to_string()
-        };
-    }
-    if language.is_ja() {
-        return "- local research/planning 部署を必ず置き、phase0.md / phase1.md、deep_thinker/deep_researcher、先行研究・データセット・評価・次実験判断を担当させてください。\n- SSH host `saitou` が goal に現れる場合、host-side environment/build 部署を `saitou` node に置き、Dockerfile、image build、container 作成、container node 登録だけを担当させてください。\n- container 内 runtime 実験部署は初期 departments に捏造しないでください。実 container が作成・登録された後に自動追加/追加部署として作る前提にしてください。\n- evaluation と audit は独立 ownership として置いてください。実験成功 claim は runtime の自己申告だけではなく、evaluation/audit の manifest・可視化・claim boundary 確認後に限定してください。\n- workload balancing 目的で research を複数人に割らないでください。phase0 の Fixed-4 + Flexible-2 のような重い調査は research 部署が MCP/subagent/tools を内部利用して管理します。\n- active external wait が長く続いても、それだけを理由に同じ research ownership の永続 peer 部署を増やさないでください。どうしても進捗維持が必要な場合だけ、範囲を artifact recovery/helper に限定した一時部署にし、phase1/environment_handoff/build clearance には進ませないでください。".to_string();
-    }
-    "- Always include a local research/planning department that owns phase0.md / phase1.md, deep_thinker/deep_researcher calls, prior-work scans, dataset/model/evaluation scans, and next-experiment decisions.\n- If the goal mentions SSH host `saitou`, place a host-side environment/build department on the `saitou` node. It owns Dockerfile design, image builds, container creation, and container-node registration only.\n- Do not invent a container-internal runtime department in the initial department list. It should be added only after a real long-lived container exists and is registered as a Docker/ssh-docker node.\n- Keep evaluation and audit as independent ownership domains. Runtime success claims are limited until evaluation/audit verify manifests, visualizations, and claim boundaries.\n- Do not split research into duplicate peer departments just for load balancing. Heavy Fixed-4 + Flexible-2 scans should be managed inside the research department using MCP/subagents/tools.\n- Do not create a permanent peer department with the same research ownership merely because an active external wait is long. If progress truly needs help, create only a temporary artifact recovery/helper department with a narrow scope, and forbid it from phase1 synthesis, environment handoff, or build clearance.".to_string()
-}
-
-fn build_autoresearch_loop_policy_block(goal: &str, language: TeamPromptLanguage) -> String {
-    if !team_goal_requests_autoresearch_loop(goal) {
-        return String::new();
-    }
-    if language.is_ja() {
-        return "\nAutoresearch loop policy:\n- この team は one-shot 実装ではなく、自動研究ループです。user input が本当に必要な blocker でない限り、lead は audit/evaluation の recommended next action を次の bounded task に変換し続けてください。\n- 研究テーマが未提示なら最初にユーザーへ確認します。提示済みなら質問で止まらず、合理的仮定を artifact に明記して phase0 に進みます。\n- Phase 0: /home/yukimaru/research_prompt/phase0.md を contract として読み、Fixed-4 + Flexible-2 の各 scan を実際に実行します。各 scan は prompt artifact、result artifact、source/provenance、confidence labels、integration target、wait/job record を持つ必要があります。scan prompt の一覧だけでは完了ではありません。\n- Phase 1: すべての required scan が完了または明示的 blocker 化された後だけ、/home/yukimaru/research_prompt/phase1.md で統合し、最初の bounded experiment / killer experiment / next action を決めます。\n- Environment phase: SSH `saitou` 上で Dockerfile を作成・build します。CUDA、Python、torch、モデル、dataset、renderer、driver 条件が不明な場合は local research/lead 側の deep_thinker/deep_researcher で確認し、build は team job と logs/artifacts で追跡します。build 失敗は修復 task にし、成功 claim にしません。\n- Runtime phase: image/container ができたら必ず long-lived Docker/ssh-docker node を登録し、container-internal department を作ります。実験、install、render、debug、verification は container 部署が担当し、research/planning と相談しながら進めます。host/SSH 部署が `docker exec` で本実験を継続するのは不可です。\n- Experiment phase: 入力、config、commands、logs、outputs、metrics、visualizations、failed attempts、hash manifests、日本語レポートを保存します。結果が弱い場合でも捏造せず、allowed claims / blocked claims を分けます。\n- Reflection phase: 実験結果を deep_thinker/deep_researcher または local research の批判的統合へ戻し、container 再利用なら Runtime phase、環境作り直しなら Environment phase、研究設計変更なら Phase 0/1 repair へ戻します。\n- 完了扱いはしません。各 research iteration は final audit artifact と recommended next action を出し、lead は次 cycle を作るか、具体的な user-input blocker を記録します。\n- 長時間 MCP/API/wait 中の research_planning を「失敗」や「永続的停滞」と早合点しないでください。補助が必要なら、一時的な recovery/helper 部署だけを作り、既存 research ownership を置き換えず、6 scan artifact など非重複の限定成果物だけを担当させ、phase1/environment_handoff/build clearance は元の research_planning/lead の確認まで禁止してください。\n".to_string();
-    }
-    "\nAutoresearch loop policy:\n- This team is an autonomous research loop, not a one-shot implementation. Unless a real user-input blocker exists, lead must keep converting audit/evaluation recommended next actions into bounded tasks.\n- If the research theme is missing, ask the user first. If it is already provided, do not stop with questions; record reasonable assumptions and start phase0.\n- Phase 0: Treat /home/yukimaru/research_prompt/phase0.md as a contract and actually run Fixed-4 + Flexible-2 scans. Each scan needs a prompt artifact, result artifact, source/provenance, confidence labels, integration target, and wait/job record. A list of scan prompts is not completion.\n- Phase 1: Run /home/yukimaru/research_prompt/phase1.md synthesis only after required scans are completed or explicitly blocked. Choose the first bounded experiment / killer experiment / next action.\n- Environment phase: Build the Dockerfile on SSH `saitou`. If CUDA/Python/torch/model/dataset/renderer/driver choices are uncertain, ask local research/lead-side deep_thinker/deep_researcher first. Track builds with team jobs, logs, and artifacts. Failed builds become repair tasks, not success claims.\n- Runtime phase: After the image/container exists, register a long-lived Docker/ssh-docker node and create a container-internal department. Experiments, installs, rendering, debugging, and verification belong inside the container department, in conversation with research/planning. The host/SSH department must not continue the main experiment through docker exec after the container should be a node.\n- Experiment phase: Save inputs, configs, commands, logs, outputs, metrics, visualizations, failed attempts, hash manifests, and Japanese reports. Separate allowed claims from blocked claims.\n- Reflection phase: Feed experiment results back to deep_thinker/deep_researcher or local research synthesis. Reuse the container for the next runtime experiment, rebuild the environment if needed, or repair phase0/phase1 if the research framing changed.\n- Do not treat the loop as done. Each iteration ends with a final audit artifact and recommended next action; lead then creates the next cycle or records a concrete user-input blocker.\n- Do not misclassify a long MCP/API/wait in research_planning as failure or permanent staleness. If help is truly needed, create only a temporary recovery/helper department with a narrow non-overlapping artifact scope; it must not replace the original research owner or advance phase1 synthesis, environment handoff, or build clearance until the original research/lead gate accepts the package.\n".to_string()
+fn explicit_team_control_marker(text: &str, marker: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == marker
+            || trimmed == format!("{marker}=1")
+            || trimmed == format!("{marker}: true")
+            || trimmed == format!("{marker}: yes")
+    })
 }
 
 fn collect_recent_lead_proposals(team_dir: &Path, lead: &str, limit: usize) -> Result<Vec<String>> {
@@ -4635,20 +5622,12 @@ fn latest_lead_proposal_resolution_timestamp(
 }
 
 fn message_mentions_lead_proposal_resolution(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("lead_proposal")
-        && (normalized.contains("accepted")
-            || normalized.contains("addressed")
-            || normalized.contains("no separate action")
-            || normalized.contains("reject")
-            || normalized.contains("premature")
-            || normalized.contains("採用")
-            || normalized.contains("却下")
-            || normalized.contains("対応済")
-            || normalized.contains("対応しました")
-            || normalized.contains("別対応不要")
-            || normalized.contains("追加対応不要")
-            || normalized.contains("早すぎ"))
+    message.lines().any(|line| {
+        let upper = line.trim_start().to_ascii_uppercase();
+        upper.starts_with("LEAD_PROPOSAL_RESOLUTION:")
+            || upper.starts_with("LEAD_PROPOSAL_ACCEPTED:")
+            || upper.starts_with("LEAD_PROPOSAL_REJECTED:")
+    })
 }
 
 fn is_real_lead_proposal_message(message: &MailMessage) -> bool {
@@ -4824,22 +5803,11 @@ fn extract_next_action_lines(path: &Path) -> Result<Vec<String>> {
 }
 
 fn line_mentions_next_action(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    [
-        "recommended next action",
-        "recommended_next_action",
-        "next action",
-        "next_action",
-        "next cycle",
-        "next-cycle",
-        "follow-up",
-        "follow up",
-        "次に",
-        "次の",
-        "次アクション",
-    ]
-    .iter()
-    .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+    let upper = line.trim_start().to_ascii_uppercase();
+    upper.starts_with("NEXT_ACTION:")
+        || upper.starts_with("RECOMMENDED_NEXT_ACTION:")
+        || upper.starts_with("NEXT_CYCLE:")
+        || upper.starts_with("FOLLOW_UP:")
 }
 
 fn maybe_send_department_idle_wakeups(
@@ -5061,7 +6029,7 @@ fn maybe_send_department_idle_wakeups(
             "{}",
             if language.is_ja() {
                 format!(
-                    "Department idle wakeup for @{name}: {idle}s active turn がありません。自分宛て未読/担当task/明確なready gateだけ確認し、再開・誤割当・重複・支援提案がある時だけ `LEAD_PROPOSAL:` を evidence 付きで lead へ。不要なら `STAY:` 一行だけで終了してください。\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks snapshot:\n{team_tasks}",
+                    "Department idle wakeup for @{name}: {idle}s active turn がありません。自分宛て未読/担当task/明確なready gateだけ確認してください。再開・誤割当・重複・支援提案がある時は `LEAD_PROPOSAL:` を evidence 付きで lead へ。さらに、設計/実行/検証/引き継ぎで自分の判断が他部署の判断に依存する点を見つけたら、status ではなく具体的な質問をその部署へ送ってください。不要なら `STAY:` 一行だけで終了してください。\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks snapshot:\n{team_tasks}",
                     name = member.name,
                     idle = idle_for.as_secs(),
                     member_tasks = if member_tasks.is_empty() {
@@ -5077,7 +6045,7 @@ fn maybe_send_department_idle_wakeups(
                 )
             } else {
                 format!(
-                    "Department idle wakeup for @{name}: no active app-server turn for {idle}s. Check only direct unread mail, your open tasks, and obvious ready-gate/help proposals. Send lead `LEAD_PROPOSAL:` with evidence only if action is useful; otherwise send one-line `STAY:` and stop.\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks snapshot:\n{team_tasks}",
+                    "Department idle wakeup for @{name}: no active app-server turn for {idle}s. Check only direct unread mail, your open tasks, and obvious ready-gate/help proposals. Send lead `LEAD_PROPOSAL:` with evidence only if action is useful. Also, if you find a design/execution/verification/handoff decision where your judgment depends on another department, send that department a concrete question instead of a status update. Otherwise send one-line `STAY:` and stop.\n\nYour open tasks:\n{member_tasks}\n\nTeam open tasks snapshot:\n{team_tasks}",
                     name = member.name,
                     idle = idle_for.as_secs(),
                     member_tasks = if member_tasks.is_empty() {
@@ -5496,12 +6464,12 @@ fn maybe_send_department_heartbeats(
         };
         let message = if language.is_ja() {
             format!(
-                "Department heartbeat for @{name}: 未完了 mission/task がある場合だけ、lead と consumer に短い status を送ってください。artifact/log/job/wait/request path、blocker、next checkpoint、必要な `LEAD_PROPOSAL:` を含めます。重い処理は team job/wait 登録を確認してください。manifest/checksum package は最終追記後に再検証してください。完了なら TEAM_COMPLETION_CHECKLIST と具体 artifact を出してください。\n\nOwned open tasks:\n{owned_tasks}",
+                "Department heartbeat for @{name}: 未完了 mission/task がある場合だけ、lead と consumer に短い status を送ってください。artifact/log/job/wait/request path、blocker、next checkpoint、必要な `LEAD_PROPOSAL:` を含めます。ただし判断が分かれる設計・実行・検証・handoff・interface・環境選択が残っている場合は、status だけで終わらず、関係部署へ具体的な質問または選択肢付き相談を送ってください。重い処理は team job/wait 登録を確認してください。manifest/checksum package は最終追記後に再検証してください。完了なら TEAM_COMPLETION_CHECKLIST と具体 artifact を出してください。\n\nOwned open tasks:\n{owned_tasks}",
                 name = member.name
             )
         } else {
             format!(
-                "Department heartbeat for @{name}: if your mission/task is still incomplete, send lead/consumers a short status with artifact/log/job/wait/request paths, blocker, next checkpoint, and any needed `LEAD_PROPOSAL:`. Ensure heavy work is tracked as team job/wait. Recheck manifests/checksums after final writes. If complete, provide TEAM_COMPLETION_CHECKLIST with concrete artifacts.\n\nOwned open tasks:\n{owned_tasks}",
+                "Department heartbeat for @{name}: if your mission/task is still incomplete, send lead/consumers a short status with artifact/log/job/wait/request paths, blocker, next checkpoint, and any needed `LEAD_PROPOSAL:`. However, if an open design/execution/verification/handoff/interface/environment decision remains, do not stop at status; send the relevant department a concrete question or options-based consultation. Ensure heavy work is tracked as team job/wait. Recheck manifests/checksums after final writes. If complete, provide TEAM_COMPLETION_CHECKLIST with concrete artifacts.\n\nOwned open tasks:\n{owned_tasks}",
                 name = member.name
             )
         };
@@ -5625,6 +6593,220 @@ fn task_is_open(task: &TeamTask) -> bool {
         task.status,
         TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Failed
     )
+}
+
+fn detect_team_wait_idle_state(
+    team_dir: &Path,
+    active: &HashMap<String, AppServerMemberRun>,
+    quiet_active_threshold: Option<Duration>,
+) -> Result<Option<TeamWaitIdleState>> {
+    let tasks = load_tasks(team_dir)?;
+    let open_tasks = tasks
+        .iter()
+        .filter(|task| task_is_open(task))
+        .cloned()
+        .collect::<Vec<_>>();
+    let waits = load_waits(team_dir)?;
+    let jobs = load_jobs(team_dir)?;
+    let now_instant = Instant::now();
+
+    let mut non_waiting_active_members = Vec::new();
+    let mut long_active_members = Vec::new();
+    for run in active.values().filter(|run| !run.completed) {
+        let quiet_for = now_instant.duration_since(run.last_activity_at);
+        if quiet_active_threshold.is_some_and(|threshold| quiet_for >= threshold) {
+            long_active_members.push(run.member.name.clone());
+            continue;
+        }
+        non_waiting_active_members.push(run.member.name.clone());
+    }
+    if !non_waiting_active_members.is_empty() {
+        return Ok(None);
+    }
+
+    let mut wait_ids = waits
+        .iter()
+        .filter(|wait| wait_is_wait_idle_blocker(wait))
+        .map(|wait| wait.id.clone())
+        .collect::<Vec<_>>();
+    wait_ids.sort();
+    wait_ids.dedup();
+
+    let mut job_ids = jobs
+        .iter()
+        .filter(|job| matches!(job.status, TeamJobStatus::Running | TeamJobStatus::Unknown))
+        .map(|job| job.id.clone())
+        .collect::<Vec<_>>();
+    job_ids.sort();
+    job_ids.dedup();
+
+    let mut blocker_task_ids = waits
+        .iter()
+        .filter(|wait| wait_is_wait_idle_blocker(wait))
+        .filter_map(|wait| wait.task_id.clone())
+        .collect::<HashSet<_>>();
+    blocker_task_ids.extend(
+        jobs.iter()
+            .filter(|job| matches!(job.status, TeamJobStatus::Running | TeamJobStatus::Unknown))
+            .filter_map(|job| job.task_id.clone()),
+    );
+    blocker_task_ids.extend(open_tasks.iter().filter_map(|task| {
+        task.owner.as_deref().and_then(|owner| {
+            long_active_members
+                .iter()
+                .any(|member| member == owner)
+                .then(|| task.id.clone())
+        })
+    }));
+
+    if wait_ids.is_empty() && job_ids.is_empty() && long_active_members.is_empty() {
+        return Ok(None);
+    }
+    if open_tasks.is_empty() {
+        let mut state = TeamWaitIdleState {
+            wait_ids,
+            job_ids,
+            task_ids: Vec::new(),
+            active_members: long_active_members,
+        };
+        state.active_members.sort();
+        state.active_members.dedup();
+        return Ok((!state.is_empty()).then_some(state));
+    }
+    if blocker_task_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let task_by_id = open_tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task))
+        .collect::<HashMap<_, _>>();
+    let mut quiescent_task_ids = Vec::new();
+    for task in &open_tasks {
+        if task_waits_on_any_blocker(task, &task_by_id, &blocker_task_ids, &mut HashSet::new()) {
+            quiescent_task_ids.push(task.id.clone());
+        } else {
+            return Ok(None);
+        }
+    }
+    quiescent_task_ids.sort();
+    quiescent_task_ids.dedup();
+    long_active_members.sort();
+    long_active_members.dedup();
+
+    Ok(Some(TeamWaitIdleState {
+        wait_ids,
+        job_ids,
+        task_ids: quiescent_task_ids,
+        active_members: long_active_members,
+    }))
+}
+
+fn wait_is_wait_idle_blocker(wait: &TeamWait) -> bool {
+    if !matches!(
+        wait.status,
+        TeamWaitStatus::Waiting | TeamWaitStatus::Running | TeamWaitStatus::Polling
+    ) {
+        return false;
+    }
+    wait_looks_like_external_long_wait(wait) || !parse_wait_auto_checks(wait).is_empty()
+}
+
+fn task_waits_on_any_blocker(
+    task: &TeamTask,
+    task_by_id: &HashMap<&str, &TeamTask>,
+    blocker_task_ids: &HashSet<String>,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if blocker_task_ids.contains(&task.id) {
+        return true;
+    }
+    if !visiting.insert(task.id.clone()) {
+        return false;
+    }
+    for dep in &task.depends_on {
+        if blocker_task_ids.contains(dep) {
+            return true;
+        }
+        if let Some(dep_task) = task_by_id.get(dep.as_str())
+            && task_waits_on_any_blocker(dep_task, task_by_id, blocker_task_ids, visiting)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn team_wait_idle_event_active(team_dir: &Path) -> bool {
+    let Ok(events) = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")) else {
+        return false;
+    };
+    for event in events.into_iter().rev().take(80) {
+        match event.event.as_str() {
+            "team_wait_idle_entered" => return true,
+            "team_wait_idle_exited"
+            | "team_runtime_paused"
+            | "app_server_keep_alive_stopped"
+            | "app_server_keep_alive_idle_timeout" => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn suppress_wait_idle_mailbox_chatter(
+    team_dir: &Path,
+    members: &[TeamMember],
+    mailbox_counts: &mut HashMap<String, usize>,
+) -> Result<bool> {
+    let mut user_message_pending = false;
+    for member in members {
+        let messages = read_jsonl::<MailMessage>(&mailbox_path(team_dir, &member.name))?;
+        let seen = mailbox_counts
+            .get(&member.name)
+            .copied()
+            .unwrap_or_default()
+            .min(messages.len());
+        let new_messages = messages.iter().skip(seen).collect::<Vec<_>>();
+        if new_messages.is_empty() {
+            continue;
+        }
+        let user_messages = new_messages
+            .iter()
+            .filter(|message| message.from == "user")
+            .count();
+        if user_messages > 0 {
+            user_message_pending = true;
+            append_event(
+                team_dir,
+                "team_wait_idle_user_message_pending",
+                serde_json::json!({
+                    "member": member.name,
+                    "messages": new_messages.len(),
+                    "user_messages": user_messages,
+                    "reason": "explicit user input may override long-task wait idle",
+                }),
+            )?;
+            continue;
+        }
+        acknowledge_mailbox_delivery(
+            team_dir,
+            mailbox_counts,
+            &member.name,
+            seen,
+            new_messages.len(),
+        )?;
+        append_event(
+            team_dir,
+            "team_wait_idle_mailbox_suppressed",
+            serde_json::json!({
+                "member": member.name,
+                "messages": new_messages.len(),
+                "reason": "non-user mailbox chatter suppressed while all open work waits on long-running work",
+            }),
+        )?;
+    }
+    Ok(user_message_pending)
 }
 
 fn task_status_can_start_turn(status: TaskStatus) -> bool {
@@ -5795,6 +6977,8 @@ fn active_turn_recently_steered(
 
 async fn steer_new_team_messages(
     node_clients: &mut HashMap<String, TeamAppServerNodeClient>,
+    node_processes: &mut Vec<NodeAppServerProcess>,
+    nodes: &[TeamNode],
     team_dir: &Path,
     members: &[TeamMember],
     active: &mut HashMap<String, AppServerMemberRun>,
@@ -5808,6 +6992,7 @@ async fn steer_new_team_messages(
     dangerously_bypass_approvals_and_sandbox: bool,
     codex_exe: &Path,
     side_channel_replies: bool,
+    relay_port: u16,
     language: TeamPromptLanguage,
 ) -> Result<()> {
     let mut by_recipient = HashMap::<String, PendingMailboxDelivery>::new();
@@ -5838,6 +7023,26 @@ async fn steer_new_team_messages(
         let Some(run) = active.get(&member_name).cloned() else {
             continue;
         };
+        if repeated_artifact_plan_delivery(team_dir, &member_name, &messages) {
+            append_event(
+                team_dir,
+                "app_server_artifact_plan_delivery_suppressed",
+                serde_json::json!({
+                    "member": member_name,
+                    "messages": messages.len(),
+                    "reason": "same sender's artifact-plan context was already delivered; actionable updates must use decision/review/job/wait/blocker markers",
+                }),
+            )?;
+            acknowledge_mailbox_delivery(
+                team_dir,
+                mailbox_counts,
+                &member_name,
+                pending.seen,
+                messages.len(),
+            )?;
+            continue;
+        }
+        record_artifact_plan_delivery(team_dir, &member_name, &messages)?;
         if run.member.role == "lead" && interactive_lead_attached(team_dir)? {
             append_event(
                 team_dir,
@@ -5866,10 +7071,13 @@ async fn steer_new_team_messages(
                     &messages,
                     codex_exe,
                     &config.id,
+                    team_dir,
                     language,
                 );
                 let started = start_app_server_member_turn(
                     node_clients,
+                    node_processes,
+                    nodes,
                     team_dir,
                     active,
                     thread_to_member,
@@ -5880,6 +7088,7 @@ async fn steer_new_team_messages(
                     sandbox.clone(),
                     approval_policy,
                     dangerously_bypass_approvals_and_sandbox,
+                    relay_port,
                     "app_server_lead_reactive_started",
                 )
                 .await?;
@@ -5914,6 +7123,8 @@ async fn steer_new_team_messages(
                 );
                 let started = start_app_server_member_turn(
                     node_clients,
+                    node_processes,
+                    nodes,
                     team_dir,
                     active,
                     thread_to_member,
@@ -5924,6 +7135,7 @@ async fn steer_new_team_messages(
                     sandbox.clone(),
                     approval_policy,
                     dangerously_bypass_approvals_and_sandbox,
+                    relay_port,
                     "app_server_member_reactive_started",
                 )
                 .await?;
@@ -6431,52 +7643,92 @@ async fn start_app_server_side_channel_reply(
         return Ok(false);
     };
     let side_thread_id = if fork_source_thread {
-        let fork: ThreadForkResponse = node_client
-            .client
-            .request_typed(ClientRequest::ThreadFork {
-                request_id: next_request_id(&mut node_client.request_counter),
-                params: ThreadForkParams {
-                    thread_id: run.thread_id.clone(),
-                    model: model.clone(),
-                    cwd: Some(run.cwd.display().to_string()),
-                    approval_policy: approval_policy.clone(),
-                    sandbox: if dangerously_bypass_approvals_and_sandbox {
-                        Some(SandboxMode::DangerFullAccess)
-                    } else {
-                        None
-                    },
-                    ephemeral: true,
-                    exclude_turns: true,
-                    ..ThreadForkParams::default()
+        let fork: ThreadForkResponse = match fork_team_app_server_thread(
+            node_client,
+            team_dir,
+            &run.node_id,
+            &run.member.name,
+            "side_channel_reply_fork",
+            ThreadForkParams {
+                thread_id: run.thread_id.clone(),
+                model: model.clone(),
+                cwd: Some(run.cwd.display().to_string()),
+                approval_policy: approval_policy.clone(),
+                sandbox: if dangerously_bypass_approvals_and_sandbox {
+                    Some(SandboxMode::DangerFullAccess)
+                } else {
+                    None
                 },
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+                ephemeral: true,
+                exclude_turns: true,
+                ..ThreadForkParams::default()
+            },
+            language,
+        )
+        .await
+        {
+            Ok(fork) => fork,
+            Err(err) => {
+                append_event(
+                    team_dir,
+                    "app_server_side_channel_reply_skipped",
+                    serde_json::json!({
+                        "member": run.member.name,
+                        "node": run.node_id,
+                        "thread": run.thread_id,
+                        "reason": "fork failed",
+                        "messages": messages.len(),
+                        "error": err.to_string(),
+                    }),
+                )?;
+                return Ok(false);
+            }
+        };
         fork.thread.id.clone()
     } else {
-        let thread: ThreadStartResponse = node_client
-            .client
-            .request_typed(ClientRequest::ThreadStart {
-                request_id: next_request_id(&mut node_client.request_counter),
-                params: ThreadStartParams {
-                    model: model.clone(),
-                    cwd: Some(run.cwd.display().to_string()),
-                    sandbox: if dangerously_bypass_approvals_and_sandbox {
-                        Some(SandboxMode::DangerFullAccess)
-                    } else {
-                        None
-                    },
-                    approval_policy: approval_policy.clone(),
-                    ephemeral: Some(true),
-                    ..ThreadStartParams::default()
+        let thread: ThreadStartResponse = match start_team_app_server_thread(
+            node_client,
+            team_dir,
+            &run.node_id,
+            &run.member.name,
+            "side_channel_reply_thread",
+            ThreadStartParams {
+                model: model.clone(),
+                cwd: Some(run.cwd.display().to_string()),
+                sandbox: if dangerously_bypass_approvals_and_sandbox {
+                    Some(SandboxMode::DangerFullAccess)
+                } else {
+                    None
                 },
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+                approval_policy: approval_policy.clone(),
+                ephemeral: Some(true),
+                ..ThreadStartParams::default()
+            },
+            language,
+        )
+        .await
+        {
+            Ok(thread) => thread,
+            Err(err) => {
+                append_event(
+                    team_dir,
+                    "app_server_side_channel_reply_skipped",
+                    serde_json::json!({
+                        "member": run.member.name,
+                        "node": run.node_id,
+                        "thread": run.thread_id,
+                        "reason": "thread start failed",
+                        "messages": messages.len(),
+                        "error": err.to_string(),
+                    }),
+                )?;
+                return Ok(false);
+            }
+        };
         thread.thread.id.clone()
     };
     let prompt = build_side_channel_reply_prompt(&run.member, &messages, language);
-    let turn: TurnStartResponse = node_client
+    let turn: TurnStartResponse = match node_client
         .client
         .request_typed(ClientRequest::TurnStart {
             request_id: next_request_id(&mut node_client.request_counter),
@@ -6495,7 +7747,25 @@ async fn start_app_server_side_channel_reply(
             },
         })
         .await
-        .map_err(|err| anyhow!(err))?;
+    {
+        Ok(turn) => turn,
+        Err(err) => {
+            append_event(
+                team_dir,
+                "app_server_side_channel_reply_skipped",
+                serde_json::json!({
+                    "member": run.member.name,
+                    "node": run.node_id,
+                    "thread": run.thread_id,
+                    "side_thread": side_thread_id,
+                    "reason": "turn start failed",
+                    "messages": messages.len(),
+                    "error": err.to_string(),
+                }),
+            )?;
+            return Ok(false);
+        }
+    };
     side_replies.insert(
         thread_key(&run.node_id, &side_thread_id),
         AppServerSideReply {
@@ -6541,7 +7811,6 @@ fn side_channel_message_needs_fast_reply(member_name: &str, message: &MailMessag
     message.from != "system"
         && message.from != member_name
         && !is_side_channel_generated_message(&message.message)
-        && !message_is_status_or_handoff_update(&message.message)
         && message_requests_fast_reply(&message.from, &message.message)
 }
 
@@ -6556,92 +7825,22 @@ fn is_side_channel_generated_message(message: &str) -> bool {
 }
 
 fn message_requests_fast_reply(from: &str, message: &str) -> bool {
-    let lower = message.to_lowercase();
-    if lower.contains("no reply needed")
-        || lower.contains("no response needed")
-        || message.contains("返信不要")
-        || message.contains("返答不要")
-        || message.contains("回答不要")
-        || message.contains("返信は不要")
-        || message.contains("返答は不要")
-        || message.contains("回答は不要")
-    {
-        return false;
-    }
     if from == "user" {
         return true;
     }
     message_has_explicit_question_or_reply_request(message)
-        || lower.contains("can you")
-        || lower.contains("could you")
-        || lower.contains("should ")
-        || lower.contains("what ")
-        || lower.contains("which ")
-        || lower.contains("why ")
-        || lower.contains("how ")
 }
 
 fn message_has_explicit_question_or_reply_request(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    message.contains('?')
-        || message.contains('？')
-        || lower.contains("question")
-        || message.contains("相談")
-        || message.contains("質問")
-        || message.contains("教えて")
-        || message.contains("どう")
-        || message.contains("何")
-        || message.contains("なぜ")
-        || message.contains("どれ")
-        || message.contains("どちら")
-        || message.contains("返信してください")
-        || message.contains("返答してください")
-        || message.contains("回答してください")
-        || lower.contains("please reply")
-        || lower.contains("reply requested")
-        || lower.contains("please respond")
-}
-
-fn message_is_status_or_handoff_update(message: &str) -> bool {
-    if message_has_explicit_question_or_reply_request(message) {
-        return false;
-    }
-    let lower = message.to_lowercase();
-    let status_like = [
-        "current mode",
-        "status:",
-        "status update",
-        "heartbeat",
-        "next checkpoint",
-        "blocker は",
-        "blocker、",
-        "blocker なし",
-        "no blocker",
-        "no blockers",
-        "standby",
-        "completed / standby",
-        "task ",
-        "wait-",
-        "handoff",
-        "manifest hash",
-        "sha256sum",
-        "verification gate",
-        "受領しました",
-        "継続です",
-        "継続します",
-        "保持します",
-        "保持中",
-        "として扱います",
-        "確認済み",
-        "作成済み",
-        "未到着",
-        "到着まで",
-        "待ち",
-        "証跡",
-        "次 checkpoint",
-        "次チェックポイント",
-    ];
-    status_like.iter().any(|needle| lower.contains(needle))
+    message.lines().any(|line| {
+        let upper = line.trim_start().to_ascii_uppercase();
+        upper.starts_with("REPLY_REQUEST:")
+            || upper.starts_with("QUESTION:")
+            || upper.starts_with("DEBATE_REQUEST:")
+            || upper.starts_with("REVIEW_REQUEST:")
+            || upper.starts_with("BLOCKER:")
+            || upper.starts_with("LEAD_PROPOSAL:")
+    })
 }
 
 fn side_channel_reply_recipients(member_name: &str, messages: &[MailMessage]) -> Vec<String> {
@@ -6662,14 +7861,14 @@ fn build_side_channel_reply_prompt(
 ) -> String {
     if language.is_ja() {
         format!(
-            "あなたは Codex team における @{name} の fast side-channel responder です。\n\n部署 role: {role}\n\nmain @{name} turn はまだ実行中です。止めないでください。long job を始めないでください。この side channel で広範な実装作業をしないでください。必要なら軽い local state の確認は可能ですが、主目的は部署間の対話を滑らかに保つことです。\n\n以下の incoming team messages に対して、@{name} としてすぐに簡潔に返信してください。返信は requester に直接送られるため、「返信した」というメタ要約ではなく、実質的な答えそのものを書いてください。status を聞かれた場合は current mode、blocker 有無、request/job id、command/log path、next checkpoint、expected artifact filenames、verification gate を具体的に含めてください。main turn の作業変更が必要なら、main turn が取り込むべき commitment/constraint を明記してください。不明なら具体的な clarifying question を 1 つだけ聞くか blocker を述べてください。side-channel は task 完了・artifact handoff ではないため、TEAM_COMPLETION_CHECKLIST を絶対に書かないでください。必要がなければ markdown code fence は使わないでください。自然文は日本語で書いてください。\n\nIncoming messages:\n{}",
+            "あなたは Codex team における @{name} の fast side-channel responder です。\n\n部署 role: {role}\n\nmain @{name} turn はまだ実行中です。止めないでください。long job を始めないでください。この side channel で広範な実装作業をしないでください。必要なら軽い local state の確認は可能ですが、主目的は部署間の対話を滑らかに保つことです。\n\n以下の incoming team messages に対して、@{name} としてすぐに簡潔に返信してください。返信は requester に直接送られるため、「返信した」というメタ要約ではなく、実質的な答えそのものを書いてください。status を聞かれた場合は current mode、blocker 有無、request/job id、command/log path、next checkpoint、expected artifact filenames、verification gate を具体的に含めてください。質問・相談・レビュー依頼なら、判断、理由、推奨案、必要な次アクションを返してください。main turn の作業変更が必要なら、main turn が取り込むべき commitment/constraint を明記してください。不明なら具体的な clarifying question を 1 つだけ聞くか blocker を述べてください。side-channel は task 完了・artifact handoff ではないため、TEAM_COMPLETION_CHECKLIST を絶対に書かないでください。必要がなければ markdown code fence は使わないでください。自然文は日本語で書いてください。\n\nIncoming messages:\n{}",
             summarize_side_reply_messages(messages, language),
             name = member.name,
             role = member.role,
         )
     } else {
         format!(
-            "You are @{name}'s fast side-channel responder for a Codex team.\n\nYour department role: {role}\n\nThe main @{name} turn is still running. Do not stop it, do not start long jobs, and do not perform broad implementation work in this side channel. You may inspect lightweight local state if needed, but the primary purpose is to keep inter-department discussion fluid.\n\nReply immediately and concisely as @{name} to the incoming team messages below. Your reply is sent directly to the requester, so it must be the substantive answer itself, not a meta-summary of what you did. Do not write phrases like \"I replied\", \"handed back\", \"will tell lead\", or \"status was provided\" unless you also include the actual requested facts in the same message. If the incoming message asks for status, include concrete status fields directly: current mode, blocker or none, request/job id or none, command/log path if any, next checkpoint, expected artifact filenames, and any verification gate. If the request requires the main turn to change its work, state the exact commitment or constraint that the main turn must incorporate. If you are unsure, ask one concrete clarifying question or state the blocker. A side-channel reply is not task completion or artifact handoff, so never include TEAM_COMPLETION_CHECKLIST. Do not include markdown code fences unless necessary.\n\nIncoming messages:\n{}",
+            "You are @{name}'s fast side-channel responder for a Codex team.\n\nYour department role: {role}\n\nThe main @{name} turn is still running. Do not stop it, do not start long jobs, and do not perform broad implementation work in this side channel. You may inspect lightweight local state if needed, but the primary purpose is to keep inter-department discussion fluid.\n\nReply immediately and concisely as @{name} to the incoming team messages below. Your reply is sent directly to the requester, so it must be the substantive answer itself, not a meta-summary of what you did. Do not write phrases like \"I replied\", \"handed back\", \"will tell lead\", or \"status was provided\" unless you also include the actual requested facts in the same message. If the incoming message asks for status, include concrete status fields directly: current mode, blocker or none, request/job id or none, command/log path if any, next checkpoint, expected artifact filenames, and any verification gate. If the message is a question, consultation, or review request, provide judgment, reasoning, recommendation, and the needed next action. If the request requires the main turn to change its work, state the exact commitment or constraint that the main turn must incorporate. If you are unsure, ask one concrete clarifying question or state the blocker. A side-channel reply is not task completion or artifact handoff, so never include TEAM_COMPLETION_CHECKLIST. Do not include markdown code fences unless necessary.\n\nIncoming messages:\n{}",
             summarize_side_reply_messages(messages, language),
             name = member.name,
             role = member.role,

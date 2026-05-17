@@ -12,6 +12,7 @@ use chrono::TimeZone;
 use chrono::Timelike;
 use chrono::Utc;
 use clap::Args;
+use clap::ArgAction;
 use clap::Parser;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::RemoteAppServerClient;
@@ -163,7 +164,11 @@ enum TeamSubcommand {
     /// Track generic long-running waits, requests, gates, or external work.
     Wait(WaitCli),
 
-    /// Audit an autoresearch team against phase/research/runtime evidence gates.
+    /// Audit generic team health, evidence, handoffs, waits, jobs, and nodes.
+    Audit(AuditArgs),
+
+    /// Compatibility: audit a domain-specific autoresearch team.
+    #[clap(hide = true)]
     AutoresearchAudit(AutoresearchAuditArgs),
 
     /// Manage the dedicated local browser profile used for remote device auth.
@@ -296,8 +301,12 @@ struct RunArgs {
     #[arg(long, default_value_t = 300)]
     stale_active_turn_timeout_sec: u64,
 
-    /// Periodically write an external autoresearch audit snapshot without steering the team. Use 0 to disable.
-    #[arg(long, default_value_t = 600)]
+    /// Treat a quiet active turn as long-running wait-idle after this many seconds. Use 0 to ignore quiet active turns.
+    #[arg(long, default_value_t = 180)]
+    team_wait_idle_active_quiet_sec: u64,
+
+    /// Compatibility: periodically write a domain-specific autoresearch audit snapshot. Use 0 to disable.
+    #[arg(long, hide = true, default_value_t = 0)]
     autoresearch_audit_interval_sec: u64,
 
     /// Let active departments answer incoming non-system team mail through a quick forked side-channel turn.
@@ -406,8 +415,12 @@ struct RuntimeArgs {
     #[arg(long, default_value_t = 300)]
     stale_active_turn_timeout_sec: u64,
 
-    /// Periodically write an external autoresearch audit snapshot without steering the team. Use 0 to disable.
-    #[arg(long, default_value_t = 600)]
+    /// Treat a quiet active turn as long-running wait-idle after this many seconds. Use 0 to ignore quiet active turns.
+    #[arg(long, default_value_t = 180)]
+    team_wait_idle_active_quiet_sec: u64,
+
+    /// Compatibility: periodically write a domain-specific autoresearch audit snapshot. Use 0 to disable.
+    #[arg(long, hide = true, default_value_t = 0)]
     autoresearch_audit_interval_sec: u64,
 
     /// Let active departments answer incoming non-system team mail through a quick forked side-channel turn.
@@ -893,9 +906,13 @@ struct NodeSyncAssetsArgs {
     #[arg(long, default_value = "$HOME/.codex")]
     dest: String,
 
-    /// Also sync auth.json. Use only when this is acceptable for the target node.
-    #[arg(long, default_value_t = false)]
+    /// Also sync auth.json. This is the default; kept for backwards-compatible scripts.
+    #[arg(long = "include-auth", action = ArgAction::SetTrue, conflicts_with = "no_auth", hide = true)]
     include_auth: bool,
+
+    /// Do not sync auth.json; leave the node's existing Codex account unchanged.
+    #[arg(long = "no-auth", default_value_t = false)]
+    no_auth: bool,
 
     /// Print the generated command without running it.
     #[arg(long, default_value_t = false)]
@@ -1292,6 +1309,20 @@ struct StopArgs {
     /// Do not try to stop SSH/Docker node app-servers.
     #[arg(long, default_value_t = false)]
     no_remote_nodes: bool,
+}
+
+#[derive(Debug, Args)]
+struct AuditArgs {
+    #[command(flatten)]
+    selector: TeamSelector,
+
+    /// Write the audit report into the team state directory and print its path.
+    #[arg(long, default_value_t = false)]
+    write: bool,
+
+    /// Custom report output path. Implies --write.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1774,6 +1805,7 @@ impl TeamCli {
             Some(TeamSubcommand::Node(cli)) => run_node(&root, cli),
             Some(TeamSubcommand::Job(cli)) => run_job(&root, cli),
             Some(TeamSubcommand::Wait(cli)) => run_wait(&root, cli),
+            Some(TeamSubcommand::Audit(args)) => run_team_audit(&root, args),
             Some(TeamSubcommand::AutoresearchAudit(args)) => run_autoresearch_audit(&root, args),
             Some(TeamSubcommand::AuthBrowser(cli)) => run_auth_browser(&codex_home, cli),
             Some(TeamSubcommand::Message(args)) => send_message(&root, args),
@@ -1785,4 +1817,3 @@ impl TeamCli {
         }
     }
 }
-

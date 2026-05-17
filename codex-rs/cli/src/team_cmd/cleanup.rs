@@ -1,6 +1,7 @@
 #[derive(Clone, Copy)]
 enum UiTeamRunStatus {
     Running,
+    Waiting,
     Stop,
     Exiting,
     Unknown,
@@ -10,6 +11,7 @@ impl UiTeamRunStatus {
     fn label(self) -> &'static str {
         match self {
             UiTeamRunStatus::Running => "running",
+            UiTeamRunStatus::Waiting => "waiting(long-task)",
             UiTeamRunStatus::Stop => "stop(idle)",
             UiTeamRunStatus::Exiting => "exiting",
             UiTeamRunStatus::Unknown => "unknown",
@@ -19,6 +21,7 @@ impl UiTeamRunStatus {
     fn css_class(self) -> &'static str {
         match self {
             UiTeamRunStatus::Running => "run-running",
+            UiTeamRunStatus::Waiting => "run-waiting",
             UiTeamRunStatus::Stop => "run-stop",
             UiTeamRunStatus::Exiting => "run-stopped",
             UiTeamRunStatus::Unknown => "run-unknown",
@@ -259,7 +262,7 @@ fn stop_team_runtime(root: &Path, args: StopArgs) -> Result<()> {
             let team_dir = root.join(&config.id);
             if matches!(
                 team_run_status_for_dir(&team_dir, &config.id),
-                UiTeamRunStatus::Running | UiTeamRunStatus::Stop
+                UiTeamRunStatus::Running | UiTeamRunStatus::Waiting | UiTeamRunStatus::Stop
             ) {
                 stop_one_team_runtime(
                     root,
@@ -706,7 +709,9 @@ fn team_run_status_for_dir(team_dir: &Path, team_id: &str) -> UiTeamRunStatus {
     {
         saw_pid = true;
         if process_alive(pid) && process_looks_like_codex_team(pid) {
-            return if open_work {
+            return if open_work && team_wait_idle_event_active(&team_dir) {
+                UiTeamRunStatus::Waiting
+            } else if open_work {
                 UiTeamRunStatus::Running
             } else {
                 UiTeamRunStatus::Stop
@@ -794,7 +799,7 @@ fn cleanup_one_team(
     let runtime_status = team_run_status_for_dir(team_dir, &config.id);
     if matches!(
         runtime_status,
-        UiTeamRunStatus::Running | UiTeamRunStatus::Stop
+        UiTeamRunStatus::Running | UiTeamRunStatus::Waiting | UiTeamRunStatus::Stop
     ) {
         if args.dry_run {
             println!("  would pause live runtime before cleanup");

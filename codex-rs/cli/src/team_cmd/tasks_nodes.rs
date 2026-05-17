@@ -328,13 +328,8 @@ fn is_soft_dependency_wait(task: &TeamTask) -> bool {
         return false;
     }
     task.result.as_deref().is_none_or(|result| {
-        let normalized = result.trim().to_ascii_lowercase();
-        normalized.is_empty()
-            || normalized.contains("depend")
-            || normalized.contains("blocked on task")
-            || normalized.contains("waiting on task")
-            || normalized.contains("waiting for task")
-            || normalized.contains("deps:")
+        let trimmed = result.trim();
+        trimmed.is_empty() || result_has_marker(trimmed, "DEPENDENCY_WAIT:")
     })
 }
 
@@ -342,26 +337,7 @@ fn task_has_manual_dependency_hold(task: &TeamTask) -> bool {
     let Some(result) = task.result.as_deref() else {
         return false;
     };
-    let normalized = result.trim().to_ascii_lowercase();
-    [
-        "explicit reopen",
-        "explicitly reopen",
-        "explicit lead reopen",
-        "explicitly reopens",
-        "ignore ready_to_start",
-        "ignore ready-to-start",
-        "not execute from ready_to_start",
-        "do not execute from ready_to_start",
-        "must not execute from ready_to_start",
-        "not start from ready_to_start",
-        "do not start from ready_to_start",
-        "must not start from ready_to_start",
-        "lead sync/verification",
-        "lead sync and verification",
-        "lead sync + verification",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
+    result_has_marker(result, "MANUAL_DEPENDENCY_HOLD:")
 }
 
 fn task_dependencies_completed(task: &TeamTask, tasks: &[TeamTask]) -> bool {
@@ -390,16 +366,15 @@ fn task_has_positive_lead_clearance(task: &TeamTask) -> bool {
     let Some(result) = task.result.as_deref() else {
         return false;
     };
-    let normalized = result.to_ascii_lowercase();
-    [
-        "cleared by lead",
-        "lead cleared",
-        "lead clearance granted",
-        "explicit ready/cleared",
-        "explicitly cleared",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
+    result_has_marker(result, "LEAD_CLEARANCE:")
+}
+
+fn result_has_marker(result: &str, marker: &str) -> bool {
+    result.lines().any(|line| {
+        line.trim_start()
+            .to_ascii_uppercase()
+            .starts_with(marker)
+    })
 }
 
 fn task_requires_contract_input_clearance(
@@ -1000,12 +975,12 @@ fn add_team_member(team_dir: &Path, args: MemberAddArgs) -> Result<()> {
     }
     let mission = if args.mission.trim().is_empty() {
         format!(
-            "Department mission for {}: support the team goal where this department's role is useful.\n\nOperate as one department-level Codex session. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad or heavy, proactively use available helpers inside this department.",
+            "Department mission for {}: support the team goal where this department's role is useful.\n\nOperate as one department-level Codex session. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad, heavy, or nontrivial, default to using available helpers inside this department; if you do not, record why they were unnecessary.",
             member.name
         )
     } else {
         format!(
-            "Department mission for {}: {}\n\nOperate as one department-level Codex session. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad or heavy, proactively use available helpers inside this department.",
+            "Department mission for {}: {}\n\nOperate as one department-level Codex session. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad, heavy, or nontrivial, default to using available helpers inside this department; if you do not, record why they were unnecessary.",
             member.name, args.mission
         )
     };
@@ -1363,7 +1338,8 @@ fn sync_node_assets(team_dir: &Path, args: NodeSyncAssetsArgs) -> Result<()> {
         .into_iter()
         .find(|node| node.id == sanitize_id(&args.id))
         .with_context(|| format!("node `{}` not found", args.id))?;
-    let (command, existing) = build_asset_sync_command(&node, &args.dest, args.include_auth)?;
+    let include_auth = args.include_auth || !args.no_auth;
+    let (command, existing) = build_asset_sync_command(&node, &args.dest, include_auth)?;
     if args.dry_run {
         println!("{command}");
         return Ok(());
@@ -1375,7 +1351,7 @@ fn sync_node_assets(team_dir: &Path, args: NodeSyncAssetsArgs) -> Result<()> {
         serde_json::json!({
             "node": node.id,
             "dest": args.dest,
-            "include_auth": args.include_auth,
+            "include_auth": include_auth,
             "paths": existing,
         }),
     )?;
@@ -1985,7 +1961,7 @@ fn maybe_sync_remote_node_assets(
         {
             continue;
         }
-        match sync_codex_assets_to_node(node, "$HOME/.codex", false) {
+        match sync_codex_assets_to_node(node, "$HOME/.codex", true) {
             Ok(paths) => {
                 last_sync.insert(node.id.clone(), now_instant);
                 append_event(
@@ -1994,7 +1970,7 @@ fn maybe_sync_remote_node_assets(
                     serde_json::json!({
                         "node": node.id,
                         "paths": paths,
-                        "include_auth": false,
+                        "include_auth": true,
                     }),
                 )?;
             }
@@ -2136,4 +2112,3 @@ fn remote_path_dest_assignment(dest: &str) -> String {
         format!("dest={}", shell_quote(trimmed))
     }
 }
-

@@ -242,7 +242,7 @@ fn validate_wait_status_transition(
         bail!(
             "refusing to mark external wait `{}` as failed without terminal failure evidence. \
              Keep it running/polling/blocked while the external tool is still pending, or provide \
-             a real failure artifact/URL with --evidence, or include `terminal_failure:` in --progress.",
+             a real failure artifact/URL with --evidence, or include `TERMINAL_FAILURE:` in --progress.",
             wait.id
         );
     }
@@ -250,33 +250,21 @@ fn validate_wait_status_transition(
 }
 
 fn wait_looks_like_external_long_wait(wait: &TeamWait) -> bool {
-    let haystack =
-        format!("{}\n{}\n{}", wait.title, wait.condition, wait.progress).to_ascii_lowercase();
-    [
-        "deep_thinker",
-        "deep-researcher",
-        "deep_researcher",
-        "deep research",
-        "mcp",
-        "chatgpt",
-        "external tool",
-        "external api",
-        "api/tool",
-        "request id",
-        "service-side",
-        "polling",
-        "external queue",
-    ]
-    .iter()
-    .any(|needle| haystack.contains(needle))
+    format!("{}\n{}\n{}", wait.title, wait.condition, wait.progress)
+        .lines()
+        .any(|line| {
+            let upper = line.trim_start().to_ascii_uppercase();
+            upper.starts_with("LONG_WAIT:")
+                || upper.starts_with("EXTERNAL_WAIT:")
+                || upper.starts_with("WAIT_IDLE:")
+        })
 }
 
 fn wait_has_terminal_failure_evidence(team_dir: &Path, wait: &TeamWait) -> bool {
-    let progress = wait.progress.to_ascii_lowercase();
-    if progress.contains("terminal_failure:")
-        || progress.contains("confirmed terminal failure")
-        || progress.contains("final_error:")
-    {
+    if wait.progress.lines().any(|line| {
+        let upper = line.trim_start().to_ascii_uppercase();
+        upper.starts_with("TERMINAL_FAILURE:") || upper.starts_with("FINAL_ERROR:")
+    }) {
         return true;
     }
     let Some(evidence) = wait.evidence.as_deref().map(str::trim) else {
@@ -712,7 +700,7 @@ fn start_team_job(team_dir: &Path, args: JobStartArgs) -> Result<()> {
         .cwd
         .or_else(|| node.cwd.clone())
         .unwrap_or_else(|| ".".to_string());
-    let remote_base = format!("/tmp/codex-team-jobs/{id}");
+    let remote_base = remote_job_base(&config.id, &id);
     let remote_log = format!("{remote_base}/job.log");
     let remote_exit = format!("{remote_base}/exit.code");
     let created_at = now();
@@ -747,7 +735,7 @@ fn start_team_job(team_dir: &Path, args: JobStartArgs) -> Result<()> {
         }),
     )?;
     let start_script = format!(
-        "base={base}; exit_path={exit_path}; log_path={log}; mkdir -p \"$base\" && cd {cwd} && rm -f \"$exit_path\" && (trap 'code=$?; printf \"%s\" \"$code\" > \"$exit_path\"' EXIT; bash -lc {command} > \"$log_path\" 2>&1) & pid=$!; printf \"%s\" \"$pid\" > \"$base/pid\"; echo \"$pid\"",
+        "base={base}; exit_path={exit_path}; log_path={log}; rm -rf \"$base\" && mkdir -p \"$base\" && cd {cwd} && rm -f \"$exit_path\" \"$log_path\" && (trap 'code=$?; printf \"%s\" \"$code\" > \"$exit_path\"' EXIT; bash -lc {command} > \"$log_path\" 2>&1) & pid=$!; printf \"%s\" \"$pid\" > \"$base/pid\"; echo \"$pid\"",
         base = shell_quote(&remote_base),
         cwd = shell_quote(&cwd),
         exit_path = shell_quote(&remote_exit),
@@ -929,6 +917,14 @@ fn handle_job_artifact_handoff(team_dir: &Path, job: &TeamJob) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn remote_job_base(team_id: &str, job_id: &str) -> String {
+    format!(
+        "/tmp/codex-team-jobs/{}/{}",
+        sanitize_id(team_id),
+        sanitize_id(job_id)
+    )
 }
 
 fn refresh_job_status(team_dir: &Path, id: &str) -> Result<TeamJob> {
@@ -2469,4 +2465,3 @@ fn block_member_tasks_if_active(team_dir: &Path, member_name: &str, reason: &str
     }
     Ok(())
 }
-

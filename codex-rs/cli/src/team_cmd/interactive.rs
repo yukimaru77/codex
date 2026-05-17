@@ -35,6 +35,7 @@ fn runtime_args_to_run_args(args: RuntimeArgs, root: &Path) -> Result<RunArgs> {
         idle_wakeup_interval_sec: args.idle_wakeup_interval_sec,
         department_heartbeat_interval_sec: args.department_heartbeat_interval_sec,
         stale_active_turn_timeout_sec: args.stale_active_turn_timeout_sec,
+        team_wait_idle_active_quiet_sec: args.team_wait_idle_active_quiet_sec,
         autoresearch_audit_interval_sec: args.autoresearch_audit_interval_sec,
         side_channel_replies: args.side_channel_replies,
         interactive_lead: false,
@@ -485,4 +486,3 @@ fn remove_app_server_registry() -> Result<()> {
     let _ = fs::remove_file(path);
     Ok(())
 }
-

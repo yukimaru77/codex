@@ -75,6 +75,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_job_base_is_scoped_by_team_id() {
+        assert_eq!(
+            remote_job_base("team-chart/autoresearch retry", "job 1"),
+            "/tmp/codex-team-jobs/team-chart-autoresearch-retry/job-1"
+        );
+        assert_ne!(
+            remote_job_base("team-a", "job-1"),
+            remote_job_base("team-b", "job-1")
+        );
+    }
+
+    #[test]
     fn container_cleanup_recognizes_team_managed_runtime_names() {
         let script = container_team_cleanup_shell(
             "team-20260511115343",
@@ -340,6 +352,41 @@ mod tests {
     }
 
     #[test]
+    fn team_multi_agent_override_authorizes_department_subagents() {
+        let config = team_multi_agent_config_overrides(TeamPromptLanguage::En);
+        assert!(!config.contains_key("features.multi_agent_v2.enabled"));
+        assert_eq!(
+            config.get("features.multi_agent_v2.usage_hint_enabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let usage_hint = config
+            .get("features.multi_agent_v2.usage_hint_text")
+            .and_then(|value| value.as_str())
+            .expect("usage hint");
+        assert!(usage_hint.contains("team counts as authorization"));
+        assert!(usage_hint.contains("default to using subagents"));
+        assert!(!usage_hint.contains("if and only if"));
+
+        let root_hint = config
+            .get("features.multi_agent_v2.root_agent_usage_hint_text")
+            .and_then(|value| value.as_str())
+            .expect("root hint");
+        assert!(root_hint.contains("usual restriction"));
+
+        let ja_hint = team_multi_agent_root_usage_hint(TeamPromptLanguage::Ja);
+        assert!(ja_hint.contains("上書きされます"));
+
+        let combined = append_team_multi_agent_developer_instructions(
+            Some("Existing.".to_string()),
+            TeamPromptLanguage::En,
+        );
+        assert!(combined.contains("Existing."));
+        assert!(combined.contains("team request itself authorizes bounded subagent use"));
+        assert!(combined.contains("record why they were unnecessary"));
+    }
+
+    #[test]
     fn side_channel_ignores_status_handoff_updates() {
         let message = MailMessage {
             from: "evaluation".to_string(),
@@ -368,16 +415,217 @@ mod tests {
     }
 
     #[test]
-    fn side_channel_still_replies_to_real_questions() {
+    fn side_channel_replies_to_explicit_question_markers() {
         let message = MailMessage {
             from: "evaluation".to_string(),
             to: "runtime".to_string(),
-            message: "runtime package の正式 path はどれですか？".to_string(),
+            message: "QUESTION: runtime package の正式 path を確認してください。".to_string(),
             timestamp: now(),
             read: false,
         };
 
         assert!(side_channel_message_needs_fast_reply("runtime", &message));
+    }
+
+    #[test]
+    fn generic_team_audit_reports_state_without_research_assumptions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        let ts = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-generic-audit".to_string(),
+            goal: "Build a small Rails app with a remote smoke-test node.".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Running,
+                    joined_at: ts.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "qa".to_string(),
+                    role: "qa".to_string(),
+                    status: MemberStatus::Standby,
+                    joined_at: ts.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+            ],
+            language: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("config");
+        write_json_atomic(
+            &task_path(team_dir, "1"),
+            &TeamTask {
+                id: "1".to_string(),
+                subject: "Implement app".to_string(),
+                description: "Create and verify the app.".to_string(),
+                owner: Some("qa".to_string()),
+                status: TaskStatus::Completed,
+                depends_on: Vec::new(),
+                result: None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+            },
+        )
+        .expect("task");
+        write_json_atomic(
+            &job_path(team_dir, "job-1"),
+            &TeamJob {
+                id: "job-1".to_string(),
+                node: "local".to_string(),
+                command: "bin/rails test".to_string(),
+                cwd: "/tmp/app".to_string(),
+                owner: Some("qa".to_string()),
+                task_id: Some("1".to_string()),
+                status: TeamJobStatus::Failed,
+                pid: None,
+                log_path: "/tmp/app/test.log".to_string(),
+                exit_path: "/tmp/app/test.exit".to_string(),
+                exit_code: Some(1),
+                note: "unit test failure".to_string(),
+                artifacts: Vec::new(),
+                created_at: ts.clone(),
+                updated_at: ts,
+            },
+        )
+        .expect("job");
+
+        let report = build_team_audit_report(team_dir).expect("audit");
+        assert!(report.contains("# Team Audit: team-generic-audit"));
+        assert!(report.contains("| job_state | FAIL |"));
+        assert!(report.contains("This is a generic team audit"));
+        assert!(!report.contains("phase0"));
+        assert!(!report.contains("deep_thinker"));
+        assert!(!report.contains("saitou"));
+    }
+
+    #[test]
+    fn generic_team_audit_downgrades_recovered_failed_jobs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        let ts = now();
+        let config = TeamConfig {
+            version: 1,
+            id: "team-recovered-job-audit".to_string(),
+            goal: "Build a generic app and verify recovered command failures.".to_string(),
+            lead: "lead".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "lead".to_string(),
+                    role: "lead".to_string(),
+                    status: MemberStatus::Running,
+                    joined_at: ts.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+                TeamMember {
+                    name: "qa".to_string(),
+                    role: "qa".to_string(),
+                    status: MemberStatus::Completed,
+                    joined_at: ts.clone(),
+                    thread_id: None,
+                    workspace_path: None,
+                    node: None,
+                },
+            ],
+            language: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        };
+        write_json_atomic(&team_dir.join("config.json"), &config).expect("config");
+        write_json_atomic(
+            &task_path(team_dir, "1"),
+            &TeamTask {
+                id: "1".to_string(),
+                subject: "Verify app".to_string(),
+                description: "Run recovered verification jobs.".to_string(),
+                owner: Some("qa".to_string()),
+                status: TaskStatus::Completed,
+                depends_on: Vec::new(),
+                result: Some("Recovered failed probe with replacement job evidence.".to_string()),
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+            },
+        )
+        .expect("task");
+        write_json_atomic(
+            &job_path(team_dir, "job-1"),
+            &TeamJob {
+                id: "job-1".to_string(),
+                node: "local".to_string(),
+                command: "python -m unittest".to_string(),
+                cwd: "/tmp/app".to_string(),
+                owner: Some("qa".to_string()),
+                task_id: Some("1".to_string()),
+                status: TeamJobStatus::Failed,
+                pid: None,
+                log_path: "/tmp/app/python.log".to_string(),
+                exit_path: "/tmp/app/python.exit".to_string(),
+                exit_code: Some(127),
+                note: "host lacks python command".to_string(),
+                artifacts: vec![TeamArtifact {
+                    path: "evidence/recovered-python.md".to_string(),
+                    note: "failed probe recovery evidence".to_string(),
+                    created_at: ts.clone(),
+                }],
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+            },
+        )
+        .expect("failed job");
+        write_json_atomic(
+            &job_path(team_dir, "job-2"),
+            &TeamJob {
+                id: "job-2".to_string(),
+                node: "local".to_string(),
+                command: "python3 -m unittest".to_string(),
+                cwd: "/tmp/app".to_string(),
+                owner: Some("qa".to_string()),
+                task_id: Some("1".to_string()),
+                status: TeamJobStatus::Completed,
+                pid: None,
+                log_path: "/tmp/app/python3.log".to_string(),
+                exit_path: "/tmp/app/python3.exit".to_string(),
+                exit_code: Some(0),
+                note: "replacement verification succeeded".to_string(),
+                artifacts: Vec::new(),
+                created_at: ts.clone(),
+                updated_at: ts,
+            },
+        )
+        .expect("replacement job");
+        write_nodes(
+            team_dir,
+            &[TeamNode {
+                id: "finished-container".to_string(),
+                kind: TeamNodeKind::Docker,
+                url: None,
+                host: None,
+                container: Some("finished-container".to_string()),
+                cwd: Some("/app".to_string()),
+                status: TeamNodeStatus::Offline,
+                note: "offline after completed work".to_string(),
+                created_at: now(),
+                updated_at: now(),
+            }],
+        )
+        .expect("nodes");
+
+        let report = build_team_audit_report(team_dir).expect("audit");
+        assert!(report.contains("| job_state | WARN |"));
+        assert!(report.contains("| node_state | PASS |"));
+        assert!(report.contains("Recovered failed job(s) with structured evidence"));
+        assert!(!report.contains("| job_state | FAIL |"));
     }
 
     #[test]
@@ -389,7 +637,7 @@ mod tests {
         let config = TeamConfig {
             version: 1,
             id: "team-autoresearch-audit".to_string(),
-            goal: "Autoresearch loop for 操作可能デジタルツイン / laboratory instrument digital twin using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
+            goal: "CODEX_TEAM_AUTORESEARCH_LOOP=1\nAutoresearch loop for 操作可能デジタルツイン / laboratory instrument digital twin using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
                 .to_string(),
             lead: "lead".to_string(),
             members: vec![
@@ -633,7 +881,7 @@ mod tests {
         let config = TeamConfig {
             version: 1,
             id: "team-autoresearch-scan-records".to_string(),
-            goal: "Autoresearch loop for laboratory instrument digital twin / 実験装置デジタルツイン using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
+            goal: "CODEX_TEAM_AUTORESEARCH_LOOP=1\nAutoresearch loop for laboratory instrument digital twin / 実験装置デジタルツイン using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
                 .to_string(),
             lead: "lead".to_string(),
             members: vec![TeamMember {
@@ -748,7 +996,7 @@ mod tests {
         let config = TeamConfig {
             version: 1,
             id: "team-autoresearch-blocked".to_string(),
-            goal: "Autoresearch loop for laboratory instrument digital twin / 実験装置デジタルツイン using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
+            goal: "CODEX_TEAM_AUTORESEARCH_LOOP=1\nAutoresearch loop for laboratory instrument digital twin / 実験装置デジタルツイン using phase0.md phase1.md, deep_thinker, ssh saitou Docker, container runtime experiments, evaluation, audit, and next bounded experiment."
                 .to_string(),
             lead: "lead".to_string(),
             members: vec![TeamMember {
@@ -791,7 +1039,7 @@ mod tests {
         let config = TeamConfig {
             version: 1,
             id: "team-autoresearch-runtime-audit".to_string(),
-            goal: "自動研究として phase0.md と phase1.md を使い、deep_thinker/deep_researcher、ssh saitou Dockerfile build、container 実験、結果を見て次実験を永遠に繰り返す。実験装置デジタルツイン研究。".to_string(),
+            goal: "CODEX_TEAM_AUTORESEARCH_LOOP=1\n自動研究として phase0.md と phase1.md を使い、deep_thinker/deep_researcher、ssh saitou Dockerfile build、container 実験、結果を見て次実験を永遠に繰り返す。実験装置デジタルツイン研究。".to_string(),
             lead: "lead".to_string(),
             members: vec![TeamMember {
                 name: "lead".to_string(),
@@ -883,7 +1131,25 @@ mod tests {
         assert!(worker_prompt.contains("External prompt/template compliance policy"));
         assert!(worker_prompt.contains("planning document that lists the prompts is not the same"));
         assert!(worker_prompt.contains("compact checklist mapping each template requirement"));
-        assert!(worker_prompt.contains("URLs and remembered summaries are not enough"));
+        assert!(worker_prompt.contains("URL lists and remembered summaries are not enough"));
+        let discussion_prompt =
+            build_discussion_prompt(&config, std::slice::from_ref(&task), &config.members[1], 1, 1);
+        assert!(discussion_prompt.contains("Do not start long-running tools"));
+        assert!(discussion_prompt.contains("Discussion rounds are serial"));
+        assert!(discussion_prompt.contains("DEBATE_RESPONSE"));
+        assert!(
+            worker_prompt.contains("Do not let collaboration degrade into one-way status reports")
+        );
+        assert!(
+            worker_prompt
+                .contains("send a concrete question to the department whose judgment matters")
+        );
+        assert!(
+            worker_prompt.contains("Preserve explicit requirements and agreed design invariants")
+        );
+        assert!(worker_prompt.contains("Silent simplification of an agreed invariant"));
+        assert!(worker_prompt.contains("After a substantial producer handoff"));
+        assert!(worker_prompt.contains("Do not reduce post-implementation review"));
         assert!(
             worker_prompt.contains("do not work around that by switching the task to `review`")
         );
@@ -900,8 +1166,23 @@ mod tests {
         assert!(lead_prompt.contains("create a compliance matrix"));
         assert!(lead_prompt.contains("require more than a URL list"));
         assert!(lead_prompt.contains("Completion rejection policy"));
-        assert!(lead_prompt.contains("team autoresearch-audit --team"));
-        assert!(lead_prompt.contains("Treat WARN/FAIL rows as real repair inputs"));
+        assert!(lead_prompt.contains("team audit --team"));
+        assert!(!lead_prompt.contains("team autoresearch-audit --team"));
+        assert!(lead_prompt.contains("This generic audit checks task/job/wait/node/handoff health only"));
+        assert!(lead_prompt.contains("Lead is responsible for creating real discussion"));
+        assert!(lead_prompt.contains("DEBATE_REQUEST"));
+        assert!(lead_prompt.contains("DECISION_RECORD"));
+        assert!(lead_prompt.contains("Lead must protect explicit requirements"));
+        assert!(lead_prompt.contains("Passing tests are not enough"));
+        assert!(lead_prompt.contains("post-handoff review debate"));
+        assert!(
+            lead_prompt
+                .contains("accept-as-is versus targeted fix versus follow-up task")
+        );
+        assert!(
+            lead_prompt
+                .contains("If a department only reports status while a judgment is still open")
+        );
     }
 
     fn write_test_job(
@@ -962,6 +1243,64 @@ mod tests {
             },
         )
         .expect("write wait");
+    }
+
+    fn write_test_long_wait(
+        team_dir: &Path,
+        id: &str,
+        owner: Option<&str>,
+        task_id: Option<&str>,
+        status: TeamWaitStatus,
+    ) {
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        let now = now();
+        write_json_atomic(
+            &wait_path(team_dir, id),
+            &TeamWait {
+                id: id.to_string(),
+                title: format!("LONG_WAIT: training wait {id}"),
+                owner: owner.map(str::to_string),
+                task_id: task_id.map(str::to_string),
+                node: None,
+                condition: "long-running benchmark/training completes and writes evidence"
+                    .to_string(),
+                status,
+                progress: "training job still running; ETA unknown".to_string(),
+                evidence: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write long wait");
+    }
+
+    fn write_test_final_artifact_wait(
+        team_dir: &Path,
+        id: &str,
+        owner: Option<&str>,
+        task_id: Option<&str>,
+        status: TeamWaitStatus,
+    ) {
+        fs::create_dir_all(team_dir.join("waits")).expect("waits dir");
+        let now = now();
+        write_json_atomic(
+            &wait_path(team_dir, id),
+            &TeamWait {
+                id: id.to_string(),
+                title: "final artifact gate".to_string(),
+                owner: owner.map(str::to_string),
+                task_id: task_id.map(str::to_string),
+                node: None,
+                condition: "CYCLE1_REPORT.md and TEAM_COMPLETION_CHECKLIST.md exist"
+                    .to_string(),
+                status,
+                progress: "owner must write final audit artifact".to_string(),
+                evidence: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write final artifact wait");
     }
 
     #[test]
@@ -1287,6 +1626,262 @@ mod tests {
     }
 
     #[test]
+    fn team_wait_idle_detects_wait_blocking_all_open_work() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "1",
+            Some("engineering"),
+            TaskStatus::Waiting,
+            Vec::new(),
+            Some("long training job"),
+        );
+        write_test_task(
+            team_dir,
+            "2",
+            Some("quality"),
+            TaskStatus::Waiting,
+            vec!["1"],
+            Some("blocked until training evidence exists"),
+        );
+        write_test_long_wait(
+            team_dir,
+            "wait-1",
+            Some("engineering"),
+            Some("1"),
+            TeamWaitStatus::Polling,
+        );
+
+        let state = detect_team_wait_idle_state(
+            team_dir,
+            &HashMap::new(),
+            Some(Duration::from_secs(TEAM_WAIT_IDLE_ACTIVE_QUIET_THRESHOLD_SECS)),
+        )
+        .expect("detect wait idle");
+
+        let state = state.expect("team should enter wait idle");
+        assert_eq!(state.wait_ids, vec!["wait-1"]);
+        assert_eq!(state.task_ids, vec!["1", "2"]);
+        assert!(state.job_ids.is_empty());
+        assert!(state.active_members.is_empty());
+    }
+
+    #[test]
+    fn team_wait_idle_does_not_mask_independent_open_work() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "1",
+            Some("engineering"),
+            TaskStatus::Waiting,
+            Vec::new(),
+            Some("long training job"),
+        );
+        write_test_task(
+            team_dir,
+            "2",
+            Some("quality"),
+            TaskStatus::Pending,
+            Vec::new(),
+            Some("independent review can proceed"),
+        );
+        write_test_long_wait(
+            team_dir,
+            "wait-1",
+            Some("engineering"),
+            Some("1"),
+            TeamWaitStatus::Running,
+        );
+
+        let state = detect_team_wait_idle_state(
+            team_dir,
+            &HashMap::new(),
+            Some(Duration::from_secs(TEAM_WAIT_IDLE_ACTIVE_QUIET_THRESHOLD_SECS)),
+        )
+        .expect("detect wait idle");
+
+        assert_eq!(state, None);
+    }
+
+    #[test]
+    fn team_wait_idle_does_not_mask_final_artifact_gate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "1",
+            Some("audit"),
+            TaskStatus::Blocked,
+            Vec::new(),
+            Some("final audit artifact is not written yet"),
+        );
+        write_test_final_artifact_wait(
+            team_dir,
+            "wait-1",
+            Some("audit"),
+            Some("1"),
+            TeamWaitStatus::Running,
+        );
+
+        let state = detect_team_wait_idle_state(
+            team_dir,
+            &HashMap::new(),
+            Some(Duration::from_secs(TEAM_WAIT_IDLE_ACTIVE_QUIET_THRESHOLD_SECS)),
+        )
+        .expect("detect wait idle");
+
+        assert_eq!(state, None);
+    }
+
+    #[test]
+    fn team_wait_idle_detects_quiet_active_turn_blocking_dependents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "1",
+            Some("engineering"),
+            TaskStatus::InProgress,
+            Vec::new(),
+            Some("deep benchmark running inside active turn"),
+        );
+        write_test_task(
+            team_dir,
+            "2",
+            Some("quality"),
+            TaskStatus::Waiting,
+            vec!["1"],
+            Some("wait for benchmark result"),
+        );
+        let config = load_config(team_dir).expect("config");
+        let engineering = config
+            .members
+            .iter()
+            .find(|member| member.name == "engineering")
+            .expect("engineering")
+            .clone();
+        let mut active = HashMap::new();
+        active.insert(
+            "engineering".to_string(),
+            AppServerMemberRun {
+                member: engineering,
+                node_id: "local".to_string(),
+                cwd: team_dir.to_path_buf(),
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed: false,
+                failed: false,
+                standby_after_turn: false,
+                usage_category: "department_start".to_string(),
+                team_message_scan_offset: 0,
+                last_activity_at: Instant::now()
+                    - Duration::from_secs(TEAM_WAIT_IDLE_ACTIVE_QUIET_THRESHOLD_SECS + 5),
+                last_activity_kind: "tool_waiting".to_string(),
+                last_stale_notice_at: None,
+                retry_not_before: None,
+                side_context_ids: Vec::new(),
+            },
+        );
+
+        let state = detect_team_wait_idle_state(
+            team_dir,
+            &active,
+            Some(Duration::from_secs(TEAM_WAIT_IDLE_ACTIVE_QUIET_THRESHOLD_SECS)),
+        )
+        .expect("detect wait idle");
+
+        let state = state.expect("quiet active turn should enter wait idle");
+        assert_eq!(state.active_members, vec!["engineering"]);
+        assert_eq!(state.task_ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn team_wait_idle_suppresses_non_user_mailbox_chatter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        append_jsonl(
+            &mailbox_path(team_dir, "lead"),
+            &MailMessage {
+                from: "system".to_string(),
+                to: "lead".to_string(),
+                message: "heartbeat chatter".to_string(),
+                timestamp: now(),
+                read: false,
+            },
+        )
+        .expect("mail");
+        append_jsonl(
+            &mailbox_path(team_dir, "engineering"),
+            &MailMessage {
+                from: "quality".to_string(),
+                to: "engineering".to_string(),
+                message: "status chatter".to_string(),
+                timestamp: now(),
+                read: false,
+            },
+        )
+        .expect("mail");
+        let config = load_config(team_dir).expect("config");
+        let mut mailbox_counts = HashMap::new();
+
+        let user_pending =
+            suppress_wait_idle_mailbox_chatter(team_dir, &config.members, &mut mailbox_counts)
+                .expect("suppress");
+
+        assert!(!user_pending);
+        assert_eq!(mailbox_counts.get("lead").copied(), Some(1));
+        assert_eq!(mailbox_counts.get("engineering").copied(), Some(1));
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "team_wait_idle_mailbox_suppressed")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn team_wait_idle_leaves_user_messages_to_wake_runtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        append_jsonl(
+            &mailbox_path(team_dir, "lead"),
+            &MailMessage {
+                from: "user".to_string(),
+                to: "lead".to_string(),
+                message: "change priority".to_string(),
+                timestamp: now(),
+                read: false,
+            },
+        )
+        .expect("mail");
+        let config = load_config(team_dir).expect("config");
+        let mut mailbox_counts = HashMap::new();
+
+        let user_pending =
+            suppress_wait_idle_mailbox_chatter(team_dir, &config.members, &mut mailbox_counts)
+                .expect("suppress");
+
+        assert!(user_pending);
+        assert_eq!(mailbox_counts.get("lead").copied(), None);
+        let messages = read_jsonl::<MailMessage>(&mailbox_path(team_dir, "lead")).expect("mailbox");
+        assert!(!messages[0].read);
+        let events = read_jsonl::<TeamEventRecord>(&team_dir.join("events.jsonl")).expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.event == "team_wait_idle_user_message_pending"));
+    }
+
+    #[test]
     fn external_wait_cannot_fail_without_terminal_evidence() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let team_dir = tmp.path();
@@ -1305,7 +1900,7 @@ mod tests {
             &wait_path(team_dir, "wait-1"),
             &TeamWait {
                 id: "wait-1".to_string(),
-                title: "deep_thinker_strategy".to_string(),
+                title: "LONG_WAIT: deep_thinker_strategy".to_string(),
                 owner: Some("engineering".to_string()),
                 task_id: Some("9".to_string()),
                 node: None,
@@ -1358,7 +1953,7 @@ mod tests {
             &wait_path(team_dir, "wait-1"),
             &TeamWait {
                 id: "wait-1".to_string(),
-                title: "deep_thinker_strategy".to_string(),
+                title: "LONG_WAIT: deep_thinker_strategy".to_string(),
                 owner: Some("engineering".to_string()),
                 task_id: Some("9".to_string()),
                 node: None,
@@ -1377,7 +1972,7 @@ mod tests {
             WaitSetArgs {
                 id: "wait-1".to_string(),
                 status: Some(TeamWaitStatus::Failed),
-                progress: Some("terminal_failure: MCP returned a final error".to_string()),
+                progress: Some("TERMINAL_FAILURE: MCP returned a final error".to_string()),
                 evidence: None,
                 clear_evidence: false,
             },
@@ -2785,7 +3380,7 @@ method_package:
         fs::create_dir_all(&audit_dir).expect("audit dir");
         fs::write(
             audit_dir.join("cycle_final_audit.md"),
-            "Verdict: PASS_WITH_WARNINGS\n\nRecommended next action: fix the runtime dataset layout and rerun the smoke test.\n",
+            "Verdict: PASS_WITH_WARNINGS\n\nRECOMMENDED_NEXT_ACTION: fix the runtime dataset layout and rerun the smoke test.\n",
         )
         .expect("write audit");
         write_ownerships(
@@ -2824,7 +3419,7 @@ method_package:
         fs::create_dir_all(&audit_dir).expect("audit dir");
         fs::write(
             audit_dir.join("final_audit.md"),
-            "Recommended next action: evaluate the fresh runtime package.\n",
+            "RECOMMENDED_NEXT_ACTION: evaluate the fresh runtime package.\n",
         )
         .expect("write audit");
         write_ownerships(
@@ -5838,7 +6433,7 @@ authoritative_predecessor:
         for wait in [
             TeamWait {
                 id: "wait-deep".to_string(),
-                title: "deep_thinker strategy".to_string(),
+                title: "LONG_WAIT: deep_thinker strategy".to_string(),
                 owner: Some("research".to_string()),
                 task_id: Some("1".to_string()),
                 node: None,
@@ -7933,7 +8528,7 @@ authoritative_predecessor:
         fs::create_dir_all(&audit_dir).expect("audit dir");
         fs::write(
             audit_dir.join("cycle0_audit.md"),
-            "Verdict: PASS_WITH_WARNINGS\n\nRecommended next action: launch cycle1 with a public articulated-object sequence and frozen evaluation gates.\n",
+            "Verdict: PASS_WITH_WARNINGS\n\nRECOMMENDED_NEXT_ACTION: launch cycle1 with a public articulated-object sequence and frozen evaluation gates.\n",
         )
         .expect("audit");
         let created = now();
@@ -7994,21 +8589,33 @@ authoritative_predecessor:
     #[test]
     fn continuation_detection_accepts_continue_iterating_prompt() {
         assert!(team_goal_requests_continuation(
-            "Continue iterating: research/planning -> Docker/build -> container experiment -> evaluation/audit -> next action."
+            "CODEX_TEAM_CONTINUATION=1\nContinue iterating: research/planning -> Docker/build -> container experiment -> evaluation/audit -> next action."
         ));
-        assert!(team_goal_requests_continuation(
-            "Keep iterating until a real blocker requiring user input appears."
+        assert!(!team_goal_requests_continuation(
+            "CODEX_TEAM_AUTORESEARCH_LOOP=1\nDomain-specific extension marker alone must not enable generic continuation."
         ));
-        assert!(team_goal_requests_continuation(
+        assert!(!team_goal_requests_continuation(
             "自動研究として phase0.md と phase1.md を使い、deep_thinker の結果を待ってから ssh saitou 上で Dockerfile を作り、container 内で実験を繰り返す。"
         ));
         assert!(!team_goal_requests_continuation(
             "Run one bounded review and stop for user approval."
         ));
+        assert!(!team_goal_requests_continuation(
+            "既存プロダクトの改善を継続的に支援するが、この依頼では一回の評価レポートを出して止まる。"
+        ));
+        assert!(!team_goal_requests_continuation(
+            "これは自動研究サイクルではありません。Cycle 2 や次サイクルは開始しないでください。deep_thinker と Docker は一回の検証だけに使う。"
+        ));
+        assert!(!team_goal_requests_autoresearch_loop(
+            "これは自動研究サイクルではありません。deep_thinker の結果を待って ssh saitou の Docker で一回だけ検証する。"
+        ));
+        assert!(team_goal_requests_autoresearch_loop(
+            "CODEX_TEAM_AUTORESEARCH_LOOP=1\nphase0.md と phase1.md を使う。"
+        ));
     }
 
     #[test]
-    fn autoresearch_goal_gets_explicit_loop_policy_in_prompts() {
+    fn autoresearch_policy_is_not_injected_into_generic_team_prompts() {
         let now = now();
         let lead = TeamMember {
             name: "lead".to_string(),
@@ -8031,7 +8638,8 @@ authoritative_predecessor:
         let config = TeamConfig {
             version: 1,
             id: "team-autoresearch-policy".to_string(),
-            goal: "自動研究: /home/yukimaru/research_prompt/phase0.md と /home/yukimaru/research_prompt/phase1.md を使い、deep_thinker/deep_researcher、ssh saitou Dockerfile build、container 実験、結果を見て次実験を永遠に繰り返す。".to_string(),
+            goal: "CODEX_TEAM_AUTORESEARCH_LOOP=1\nDomain-specific extension marker only."
+                .to_string(),
             lead: "lead".to_string(),
             members: vec![lead.clone(), research.clone()],
             language: None,
@@ -8040,9 +8648,8 @@ authoritative_predecessor:
         };
         let task = TeamTask {
             id: "1".to_string(),
-            subject: "phase0 scans".to_string(),
-            description: "Run Fixed-4 + Flexible-2 scans and save prompt/result artifacts."
-                .to_string(),
+            subject: "domain extension work".to_string(),
+            description: "Run the domain-specific extension workflow.".to_string(),
             owner: Some("research_planning".to_string()),
             status: TaskStatus::InProgress,
             depends_on: Vec::new(),
@@ -8052,10 +8659,9 @@ authoritative_predecessor:
         };
 
         let worker_prompt = build_worker_prompt(&config, std::slice::from_ref(&task), &research);
-        assert!(worker_prompt.contains("Autoresearch loop policy"));
-        assert!(worker_prompt.contains("Fixed-4 + Flexible-2"));
-        assert!(worker_prompt.contains("container-internal department"));
-        assert!(worker_prompt.contains("Do not treat the loop as done"));
+        assert!(!worker_prompt.contains("Autoresearch loop policy"));
+        assert!(!worker_prompt.contains("Fixed-4 + Flexible-2"));
+        assert!(!worker_prompt.contains("/home/yukimaru/research_prompt"));
 
         let lead_prompt = build_app_server_lead_prompt(
             &config,
@@ -8064,16 +8670,15 @@ authoritative_predecessor:
             Path::new("/tmp/codex"),
             TeamPromptLanguage::En,
         );
-        assert!(lead_prompt.contains("Autoresearch loop policy"));
-        assert!(lead_prompt.contains("Environment phase"));
-        assert!(lead_prompt.contains("Runtime phase"));
-        assert!(lead_prompt.contains("Reflection phase"));
+        assert!(!lead_prompt.contains("Autoresearch loop policy"));
+        assert!(!lead_prompt.contains("Environment phase"));
+        assert!(!lead_prompt.contains("Reflection phase"));
 
         let design_prompt =
             build_lead_department_design_prompt(&config.goal, &[], TeamPromptLanguage::En);
-        assert!(design_prompt.contains("Additional constraints for autoresearch goals"));
-        assert!(design_prompt.contains("local research/planning department"));
-        assert!(design_prompt.contains("saitou"));
+        assert!(!design_prompt.contains("Additional constraints for autoresearch goals"));
+        assert!(!design_prompt.contains("local research/planning department"));
+        assert!(!design_prompt.contains("/home/yukimaru/research_prompt"));
         assert!(design_prompt.contains("Do not create local placeholder"));
         assert!(design_prompt.contains("Do not read or invoke ordinary user-facing team-launch"));
         assert!(!design_prompt.contains("codex-team-secretary"));
@@ -8545,6 +9150,8 @@ authoritative_predecessor:
         let html = render_token_usage_panel(team_dir);
         assert!(html.contains("lead_tick"));
         assert!(html.contains("research"));
+        assert!(html.contains("By Feature x Member"));
+        assert!(html.contains("lead_tick / research"));
         assert!(html.contains("Token Bottlenecks"));
         assert!(html.contains("Side-channel Context Pressure"));
         assert!(html.contains("capped at 8"));
@@ -8757,6 +9364,18 @@ authoritative_predecessor:
             "lead_tick"
         );
 
+        let wait_still_open = MailMessage {
+            from: "system".to_string(),
+            to: "lead".to_string(),
+            message: "WAIT_STILL_OPEN: task 3 has an open wait".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[wait_still_open]),
+            "team_wait_status"
+        );
+
         let user = MailMessage {
             from: "user".to_string(),
             to: "lead".to_string(),
@@ -8790,8 +9409,268 @@ authoritative_predecessor:
         };
         assert_eq!(
             usage_category_for_messages("member_reactive", &[handoff]),
-            "team_handoff"
+            "team_final_handoff"
         );
+
+        let review = MailMessage {
+            from: "audit".to_string(),
+            to: "runtime".to_string(),
+            message: "REVIEW_REQUEST: inspect /tmp/pkg/manifest.json for checklist item 3"
+                .to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[review]),
+            "team_review_request"
+        );
+
+        let review_handoff = MailMessage {
+            from: "implementation".to_string(),
+            to: "quality".to_string(),
+            message: "REVIEW_REQUEST / ARTIFACT_HANDOFF: artifacts=/tmp/app/main.py evidence=/tmp/job.log"
+                .to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[review_handoff]),
+            "team_review_request"
+        );
+
+        let review_response = MailMessage {
+            from: "quality".to_string(),
+            to: "implementation".to_string(),
+            message: "REVIEW_RESPONSE: PASS with note for /tmp/app/main.py".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[review_response]),
+            "team_review_response"
+        );
+
+        let audit = MailMessage {
+            from: "audit".to_string(),
+            to: "lead".to_string(),
+            message: "AUDIT_REVIEW: validation ledger has a polarity bug".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[audit]),
+            "team_audit_review"
+        );
+
+        let blocker = MailMessage {
+            from: "ops".to_string(),
+            to: "lead".to_string(),
+            message: "DEPENDENCY_GATE: 403 while fetching checkpoint".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[blocker]),
+            "team_dependency_gate"
+        );
+
+        let failure = MailMessage {
+            from: "runtime".to_string(),
+            to: "lead".to_string(),
+            message: "TERMINAL_FAILURE: command failed rc=2 at /tmp/run.log".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[failure]),
+            "team_failure_blocker"
+        );
+
+        let debate = MailMessage {
+            from: "lead".to_string(),
+            to: "all".to_string(),
+            message: "DEBATE_REQUEST: choose OCR backend".to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[debate]),
+            "team_debate_request"
+        );
+
+        let plan = MailMessage {
+            from: "implementation".to_string(),
+            to: "lead".to_string(),
+            message: "ARTIFACT_PLAN: app/main.py を実装し、pytest evidence と final handoff / artifact handoff を予定します。"
+                .to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert_eq!(
+            usage_category_for_messages("member_reactive", &[plan]),
+            "team_artifact_plan"
+        );
+    }
+
+    #[test]
+    fn repeated_artifact_plan_delivery_is_suppressed_by_sender() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        let plan = MailMessage {
+            from: "planner".to_string(),
+            to: "lead".to_string(),
+            message:
+                "ARTIFACT_PLAN: app/main.py を実装し、expected_evidence と artifact handoff 予定を共有します。"
+                    .to_string(),
+            timestamp: now(),
+            read: false,
+        };
+
+        assert!(!repeated_artifact_plan_delivery(
+            team_dir,
+            "lead",
+            std::slice::from_ref(&plan)
+        ));
+        record_artifact_plan_delivery(team_dir, "lead", std::slice::from_ref(&plan))
+            .expect("record first plan");
+        assert!(repeated_artifact_plan_delivery(
+            team_dir,
+            "lead",
+            std::slice::from_ref(&plan)
+        ));
+
+        let actionable = MailMessage {
+            from: "planner".to_string(),
+            to: "lead".to_string(),
+            message:
+                "DECISION_RECORD: plan changed; use python3 and cite /tmp/job.log evidence."
+                    .to_string(),
+            timestamp: now(),
+            read: false,
+        };
+        assert!(!repeated_artifact_plan_delivery(
+            team_dir,
+            "lead",
+            &[actionable]
+        ));
+    }
+
+    #[test]
+    fn reactive_prompt_compacts_review_context_but_keeps_refs() {
+        let member = TeamMember {
+            name: "quality".to_string(),
+            role: "quality".to_string(),
+            status: MemberStatus::Standby,
+            joined_at: now(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let mut messages = Vec::new();
+        for idx in 0..10 {
+            messages.push(MailMessage {
+                from: "lead".to_string(),
+                to: "quality".to_string(),
+                message: format!(
+                    "REVIEW_REQUEST: inspect /tmp/pkg-{idx}/manifest.json and /tmp/pkg-{idx}/evidence.log for checklist item {idx}. {}",
+                    "very long background ".repeat(120)
+                ),
+                timestamp: now(),
+                read: false,
+            });
+        }
+
+        let prompt = build_reactive_member_turn_prompt(
+            &member,
+            &messages,
+            Path::new("/bin/codex"),
+            "team-test",
+            false,
+            TeamPromptLanguage::En,
+        );
+
+        assert!(prompt.contains("older message(s) are omitted"));
+        assert!(prompt.contains("/tmp/pkg-9/manifest.json"));
+        assert!(prompt.contains("/tmp/pkg-9/evidence.log"));
+        assert!(prompt.contains("named target path"));
+        assert!(prompt.len() < 12_000);
+    }
+
+    #[test]
+    fn reactive_lead_prompt_includes_compact_state_summary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let team_dir = tmp.path();
+        write_test_config(team_dir);
+        write_test_task(
+            team_dir,
+            "1",
+            Some("runtime"),
+            TaskStatus::Blocked,
+            vec![],
+            Some("waiting for wait-1"),
+        );
+        let now_value = now();
+        write_json_atomic(
+            &wait_path(team_dir, "wait-1"),
+            &TeamWait {
+                id: "wait-1".to_string(),
+                title: "deep research wait".to_string(),
+                owner: Some("research".to_string()),
+                task_id: Some("1".to_string()),
+                node: Some("local".to_string()),
+                condition: "MCP request returns and writes /tmp/evidence.json".to_string(),
+                status: TeamWaitStatus::Running,
+                progress: "request id abc-123".to_string(),
+                evidence: None,
+                created_at: now_value.clone(),
+                updated_at: now_value,
+            },
+        )
+        .expect("write wait");
+        append_jsonl(
+            &mailbox_path(team_dir, "lead"),
+            &MailMessage {
+                from: "method".to_string(),
+                to: "lead".to_string(),
+                message: "DECISION_RECORD: use PaddleOCR first; evidence /tmp/decision.md"
+                    .to_string(),
+                timestamp: now(),
+                read: false,
+            },
+        )
+        .expect("write mailbox");
+        let lead = TeamMember {
+            name: "lead".to_string(),
+            role: "lead".to_string(),
+            status: MemberStatus::Online,
+            joined_at: now(),
+            thread_id: None,
+            workspace_path: None,
+            node: None,
+        };
+        let messages = vec![MailMessage {
+            from: "research".to_string(),
+            to: "lead".to_string(),
+            message: "LEAD_PROPOSAL: resume runtime after wait-1 completes".to_string(),
+            timestamp: now(),
+            read: false,
+        }];
+
+        let prompt = build_reactive_lead_turn_prompt(
+            &lead,
+            &messages,
+            Path::new("/bin/codex"),
+            "team-task-test",
+            team_dir,
+            TeamPromptLanguage::En,
+        );
+
+        assert!(prompt.contains("Current compact team state"));
+        assert!(prompt.contains("task 1 [blocked]"));
+        assert!(prompt.contains("wait-1 [running]"));
+        assert!(prompt.contains("DECISION_RECORD"));
+        assert!(prompt.contains("Use the compact state above first"));
     }
 
     #[test]

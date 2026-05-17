@@ -1,3 +1,551 @@
+fn run_team_audit(root: &Path, args: AuditArgs) -> Result<()> {
+    let team_dir = resolve_team_dir(root, args.selector.team.as_deref())?;
+    let report = build_team_audit_report(&team_dir)?;
+    print!("{report}");
+    if args.write || args.output.is_some() {
+        let output = args.output.unwrap_or_else(|| {
+            team_dir.join(format!(
+                "team_audit_{}.md",
+                sanitize_id(&now()).replace('-', "_")
+            ))
+        });
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&output, &report)
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        println!("\nWrote audit report: {}", output.display());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TeamAuditStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl TeamAuditStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            TeamAuditStatus::Pass => "PASS",
+            TeamAuditStatus::Warn => "WARN",
+            TeamAuditStatus::Fail => "FAIL",
+        }
+    }
+}
+
+struct TeamAuditItem {
+    id: &'static str,
+    check: &'static str,
+    status: TeamAuditStatus,
+    evidence: String,
+    gap: String,
+}
+
+fn build_team_audit_report(team_dir: &Path) -> Result<String> {
+    let config = load_config(team_dir)?;
+    let tasks = load_tasks(team_dir)?;
+    let waits = load_waits(team_dir)?;
+    let jobs = load_jobs(team_dir)?;
+    let mut nodes = load_nodes(team_dir)?;
+    ensure_local_node(&mut nodes);
+    let ownerships = load_ownerships(team_dir)?;
+    let mailboxes = load_team_mailboxes(team_dir, &config)?;
+
+    let open_tasks = tasks
+        .iter()
+        .filter(|task| !is_terminal_task_status(task.status))
+        .collect::<Vec<_>>();
+    let blocked_tasks = tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Blocked))
+        .collect::<Vec<_>>();
+    let failed_tasks = tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Failed))
+        .collect::<Vec<_>>();
+    let open_waits = waits
+        .iter()
+        .filter(|wait| wait.status.is_open())
+        .collect::<Vec<_>>();
+    let failed_waits = waits
+        .iter()
+        .filter(|wait| matches!(wait.status, TeamWaitStatus::Failed))
+        .collect::<Vec<_>>();
+    let running_jobs = jobs
+        .iter()
+        .filter(|job| matches!(job.status, TeamJobStatus::Running | TeamJobStatus::Unknown))
+        .collect::<Vec<_>>();
+    let failed_jobs = jobs
+        .iter()
+        .filter(|job| matches!(job.status, TeamJobStatus::Failed))
+        .collect::<Vec<_>>();
+    let unresolved_failed_jobs = failed_jobs
+        .iter()
+        .copied()
+        .filter(|job| !failed_job_has_recovery_evidence(job, &jobs, &tasks))
+        .collect::<Vec<_>>();
+    let recovered_failed_jobs = failed_jobs
+        .iter()
+        .copied()
+        .filter(|job| failed_job_has_recovery_evidence(job, &jobs, &tasks))
+        .collect::<Vec<_>>();
+    let has_open_work = !open_tasks.is_empty() || !open_waits.is_empty();
+    let non_local_failed_nodes = nodes
+        .iter()
+        .filter(|node| {
+            !matches!(node.kind, TeamNodeKind::Local)
+                && matches!(node.status, TeamNodeStatus::Failed)
+        })
+        .collect::<Vec<_>>();
+    let non_local_offline_nodes = nodes
+        .iter()
+        .filter(|node| {
+            !matches!(node.kind, TeamNodeKind::Local)
+                && matches!(node.status, TeamNodeStatus::Offline)
+        })
+        .collect::<Vec<_>>();
+    let completed_tasks_without_evidence = tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Completed))
+        .filter(|task| !task_has_completion_evidence(task, &jobs, &waits, &ownerships, &mailboxes))
+        .collect::<Vec<_>>();
+
+    let mut items = Vec::new();
+    items.push(TeamAuditItem {
+        id: "task_state",
+        check: "Open tasks are intentional and terminal task failures are absent.",
+        status: if failed_tasks.is_empty() {
+            if open_tasks.is_empty() {
+                TeamAuditStatus::Pass
+            } else {
+                TeamAuditStatus::Warn
+            }
+        } else {
+            TeamAuditStatus::Fail
+        },
+        evidence: format!(
+            "tasks={} open={} blocked={} failed={}",
+            tasks.len(),
+            open_tasks.len(),
+            blocked_tasks.len(),
+            failed_tasks.len()
+        ),
+        gap: if failed_tasks.is_empty() && open_tasks.is_empty() {
+            "-".to_string()
+        } else if !failed_tasks.is_empty() {
+            format!(
+                "Failed task(s): {}",
+                summarize_tasks_for_audit(&failed_tasks, 8)
+            )
+        } else {
+            format!(
+                "Open task(s) remain: {}",
+                summarize_tasks_for_audit(&open_tasks, 8)
+            )
+        },
+    });
+    items.push(TeamAuditItem {
+        id: "wait_state",
+        check: "Long-running waits have explicit current state and no terminal failures.",
+        status: if failed_waits.is_empty() {
+            if open_waits.is_empty() {
+                TeamAuditStatus::Pass
+            } else {
+                TeamAuditStatus::Warn
+            }
+        } else {
+            TeamAuditStatus::Fail
+        },
+        evidence: format!(
+            "waits={} open={} failed={}",
+            waits.len(),
+            open_waits.len(),
+            failed_waits.len()
+        ),
+        gap: if !failed_waits.is_empty() {
+            format!(
+                "Failed wait(s): {}",
+                summarize_waits_for_audit(&failed_waits, 8)
+            )
+        } else if !open_waits.is_empty() {
+            format!(
+                "Open wait(s): {}",
+                summarize_waits_for_audit(&open_waits, 8)
+            )
+        } else {
+            "-".to_string()
+        },
+    });
+    items.push(TeamAuditItem {
+        id: "job_state",
+        check: "Tracked jobs are completed or intentionally still running, with no failed job left unresolved.",
+        status: if unresolved_failed_jobs.is_empty() {
+            if running_jobs.is_empty() {
+                if recovered_failed_jobs.is_empty() {
+                    TeamAuditStatus::Pass
+                } else {
+                    TeamAuditStatus::Warn
+                }
+            } else {
+                TeamAuditStatus::Warn
+            }
+        } else {
+            TeamAuditStatus::Fail
+        },
+        evidence: format!(
+            "jobs={} running_or_unknown={} failed={}",
+            jobs.len(),
+            running_jobs.len(),
+            failed_jobs.len()
+        ),
+        gap: if !unresolved_failed_jobs.is_empty() {
+            format!(
+                "Unresolved failed job(s): {}",
+                summarize_jobs_for_audit(&unresolved_failed_jobs, 8)
+            )
+        } else if !recovered_failed_jobs.is_empty() {
+            format!(
+                "Recovered failed job(s) with structured evidence: {}",
+                summarize_jobs_for_audit(&recovered_failed_jobs, 8)
+            )
+        } else if !running_jobs.is_empty() {
+            format!(
+                "Running/unknown job(s): {}",
+                summarize_jobs_for_audit(&running_jobs, 8)
+            )
+        } else {
+            "-".to_string()
+        },
+    });
+    items.push(TeamAuditItem {
+        id: "completion_evidence",
+        check: "Completed tasks have structured evidence: task result, completed job artifact, wait evidence, ownership handoff, or TEAM_COMPLETION_CHECKLIST.",
+        status: if completed_tasks_without_evidence.is_empty() {
+            TeamAuditStatus::Pass
+        } else {
+            TeamAuditStatus::Warn
+        },
+        evidence: format!(
+            "completed_tasks={} missing_evidence={}",
+            tasks
+                .iter()
+                .filter(|task| matches!(task.status, TaskStatus::Completed))
+                .count(),
+            completed_tasks_without_evidence.len()
+        ),
+        gap: if completed_tasks_without_evidence.is_empty() {
+            "-".to_string()
+        } else {
+            format!(
+                "Completed task(s) missing structured evidence: {}",
+                summarize_tasks_for_audit(&completed_tasks_without_evidence, 8)
+            )
+        },
+    });
+    items.push(TeamAuditItem {
+        id: "node_state",
+        check: "Registered non-local nodes are available while work is open, and no node is failed.",
+        status: if non_local_failed_nodes.is_empty()
+            && (!has_open_work || non_local_offline_nodes.is_empty())
+        {
+            TeamAuditStatus::Pass
+        } else {
+            TeamAuditStatus::Warn
+        },
+        evidence: format!(
+            "nodes={} open_work={} non_local_failed={} non_local_offline={}",
+            nodes.len(),
+            has_open_work,
+            non_local_failed_nodes.len(),
+            non_local_offline_nodes.len()
+        ),
+        gap: if non_local_failed_nodes.is_empty()
+            && (!has_open_work || non_local_offline_nodes.is_empty())
+        {
+            "-".to_string()
+        } else {
+            let mut bad = Vec::new();
+            bad.extend(
+                non_local_failed_nodes
+                    .iter()
+                    .map(|node| format!("{}:{:?}", node.id, node.status)),
+            );
+            if has_open_work {
+                bad.extend(
+                    non_local_offline_nodes
+                        .iter()
+                        .map(|node| format!("{}:{:?}", node.id, node.status)),
+                );
+            }
+            format!(
+                "Bad node(s): {}",
+                bad.join(", ")
+            )
+        },
+    });
+    items.push(TeamAuditItem {
+        id: "handoff_surface",
+        check: "Team has an observable handoff surface through ownership records, artifacts, waits, jobs, or completion checklists.",
+        status: if ownerships.is_empty()
+            && !jobs.iter().any(|job| !job.artifacts.is_empty())
+            && !waits.iter().any(|wait| wait.evidence.is_some())
+            && !mailboxes_contain_marker(&mailboxes, "TEAM_COMPLETION_CHECKLIST")
+        {
+            TeamAuditStatus::Warn
+        } else {
+            TeamAuditStatus::Pass
+        },
+        evidence: format!(
+            "ownerships={} job_artifacts={} wait_evidence={} completion_checklists={}",
+            ownerships.len(),
+            jobs.iter().map(|job| job.artifacts.len()).sum::<usize>(),
+            waits.iter().filter(|wait| wait.evidence.is_some()).count(),
+            count_mailbox_marker(&mailboxes, "TEAM_COMPLETION_CHECKLIST")
+        ),
+        gap: if ownerships.is_empty()
+            && !jobs.iter().any(|job| !job.artifacts.is_empty())
+            && !waits.iter().any(|wait| wait.evidence.is_some())
+            && !mailboxes_contain_marker(&mailboxes, "TEAM_COMPLETION_CHECKLIST")
+        {
+            "No structured handoff/evidence surface is visible yet.".to_string()
+        } else {
+            "-".to_string()
+        },
+    });
+
+    Ok(format_team_audit_report(&config, team_dir, &items))
+}
+
+fn format_team_audit_report(
+    config: &TeamConfig,
+    team_dir: &Path,
+    items: &[TeamAuditItem],
+) -> String {
+    let pass_count = items
+        .iter()
+        .filter(|item| item.status == TeamAuditStatus::Pass)
+        .count();
+    let warn_count = items
+        .iter()
+        .filter(|item| item.status == TeamAuditStatus::Warn)
+        .count();
+    let fail_count = items
+        .iter()
+        .filter(|item| item.status == TeamAuditStatus::Fail)
+        .count();
+    let verdict = if fail_count > 0 {
+        "FAIL"
+    } else if warn_count > 0 {
+        "WARN"
+    } else {
+        "PASS"
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("# Team Audit: {}\n\n", config.id));
+    out.push_str(&format!("- generated_at: {}\n", now()));
+    out.push_str(&format!("- state_dir: {}\n", team_dir.display()));
+    out.push_str(&format!("- verdict: {verdict}\n"));
+    out.push_str(&format!(
+        "- summary: PASS={} WARN={} FAIL={}\n\n",
+        pass_count, warn_count, fail_count
+    ));
+    out.push_str("| id | status | check | evidence | gap |\n");
+    out.push_str("| --- | --- | --- | --- | --- |\n");
+    for item in items {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            item.id,
+            item.status.as_str(),
+            escape_md_table(item.check),
+            escape_md_table(&item.evidence),
+            escape_md_table(&item.gap)
+        ));
+    }
+    out.push_str("\nNotes:\n");
+    out.push_str("- This is a generic team audit. It checks structured team state only and does not assume a research cycle, a specific MCP, a specific remote host, or a domain-specific skill.\n");
+    out.push_str("- PASS means the generic state surface has no obvious unresolved gate. WARN means work may be legitimate but still needs an explicit handoff, evidence, or lead decision. FAIL means a terminal failure is visible.\n");
+    out
+}
+
+fn is_terminal_task_status(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+    )
+}
+
+fn load_team_mailboxes(
+    team_dir: &Path,
+    config: &TeamConfig,
+) -> Result<HashMap<String, Vec<MailMessage>>> {
+    let mut mailboxes = HashMap::new();
+    let mut names = config
+        .members
+        .iter()
+        .map(|member| member.name.clone())
+        .collect::<HashSet<_>>();
+    names.insert(config.lead.clone());
+    for name in names {
+        mailboxes.insert(name.clone(), read_jsonl(&mailbox_path(team_dir, &name))?);
+    }
+    Ok(mailboxes)
+}
+
+fn task_has_completion_evidence(
+    task: &TeamTask,
+    jobs: &[TeamJob],
+    waits: &[TeamWait],
+    ownerships: &[FileOwnership],
+    mailboxes: &HashMap<String, Vec<MailMessage>>,
+) -> bool {
+    task.result
+        .as_deref()
+        .is_some_and(|result| !result.trim().is_empty())
+        || jobs.iter().any(|job| {
+            job.task_id.as_deref() == Some(task.id.as_str())
+                && matches!(job.status, TeamJobStatus::Completed)
+                && (!job.artifacts.is_empty() || !job.log_path.trim().is_empty())
+        })
+        || waits.iter().any(|wait| {
+            wait.task_id.as_deref() == Some(task.id.as_str())
+                && matches!(wait.status, TeamWaitStatus::Completed)
+                && wait
+                    .evidence
+                    .as_deref()
+                    .is_some_and(|evidence| !evidence.trim().is_empty())
+        })
+        || ownerships.iter().any(|ownership| ownership.note.contains(&task.id))
+        || task_owner_mailbox_has_checklist(task, mailboxes)
+}
+
+fn failed_job_has_recovery_evidence(job: &TeamJob, jobs: &[TeamJob], tasks: &[TeamTask]) -> bool {
+    if !matches!(job.status, TeamJobStatus::Failed) || job.artifacts.is_empty() {
+        return false;
+    }
+    let same_task_completed = job.task_id.as_deref().is_some_and(|task_id| {
+        tasks
+            .iter()
+            .any(|task| task.id == task_id && matches!(task.status, TaskStatus::Completed))
+    });
+    let replacement_completed = jobs.iter().any(|other| {
+        other.id != job.id
+            && matches!(other.status, TeamJobStatus::Completed)
+            && other.task_id == job.task_id
+            && other.owner == job.owner
+    });
+    same_task_completed || replacement_completed
+}
+
+fn task_owner_mailbox_has_checklist(
+    task: &TeamTask,
+    mailboxes: &HashMap<String, Vec<MailMessage>>,
+) -> bool {
+    let owner = task.owner.as_deref().unwrap_or("lead");
+    ["lead", owner].iter().any(|name| {
+        mailboxes.get(*name).is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.message.contains("TEAM_COMPLETION_CHECKLIST")
+                    && (message.message.contains(&format!("task {}", task.id))
+                        || message.message.contains(&format!("task{}", task.id))
+                        || message.message.contains(&format!("Task{}", task.id))
+                        || message.message.contains(&format!("Task {}", task.id)))
+            })
+        })
+    })
+}
+
+fn mailboxes_contain_marker(
+    mailboxes: &HashMap<String, Vec<MailMessage>>,
+    marker: &str,
+) -> bool {
+    mailboxes.values().any(|messages| {
+        messages
+            .iter()
+            .any(|message| message.message.contains(marker))
+    })
+}
+
+fn count_mailbox_marker(mailboxes: &HashMap<String, Vec<MailMessage>>, marker: &str) -> usize {
+    mailboxes
+        .values()
+        .flat_map(|messages| messages.iter())
+        .filter(|message| message.message.contains(marker))
+        .count()
+}
+
+fn summarize_tasks_for_audit(tasks: &[&TeamTask], limit: usize) -> String {
+    if tasks.is_empty() {
+        return "-".to_string();
+    }
+    let mut values = tasks
+        .iter()
+        .take(limit)
+        .map(|task| format!("#{} {} owner={}", task.id, task.status, task.owner.as_deref().unwrap_or("-")))
+        .collect::<Vec<_>>();
+    if tasks.len() > limit {
+        values.push(format!("... +{}", tasks.len() - limit));
+    }
+    values.join("; ")
+}
+
+fn summarize_waits_for_audit(waits: &[&TeamWait], limit: usize) -> String {
+    if waits.is_empty() {
+        return "-".to_string();
+    }
+    let mut values = waits
+        .iter()
+        .take(limit)
+        .map(|wait| {
+            format!(
+                "{} {} owner={} task={}",
+                wait.id,
+                wait.status,
+                wait.owner.as_deref().unwrap_or("-"),
+                wait.task_id.as_deref().unwrap_or("-")
+            )
+        })
+        .collect::<Vec<_>>();
+    if waits.len() > limit {
+        values.push(format!("... +{}", waits.len() - limit));
+    }
+    values.join("; ")
+}
+
+fn summarize_jobs_for_audit(jobs: &[&TeamJob], limit: usize) -> String {
+    if jobs.is_empty() {
+        return "-".to_string();
+    }
+    let mut values = jobs
+        .iter()
+        .take(limit)
+        .map(|job| {
+            format!(
+                "{} {:?} owner={} task={} node={}",
+                job.id,
+                job.status,
+                job.owner.as_deref().unwrap_or("-"),
+                job.task_id.as_deref().unwrap_or("-"),
+                job.node
+            )
+        })
+        .collect::<Vec<_>>();
+    if jobs.len() > limit {
+        values.push(format!("... +{}", jobs.len() - limit));
+    }
+    values.join("; ")
+}
+
+fn escape_md_table(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
+}
+
 fn run_autoresearch_audit(root: &Path, args: AutoresearchAuditArgs) -> Result<()> {
     let team_dir = resolve_team_dir(root, args.selector.team.as_deref())?;
     let report = build_autoresearch_audit_report(&team_dir)?;
@@ -1057,6 +1605,11 @@ fn format_runtime_status_text(
             config.id
         ));
     }
+    if matches!(status, UiTeamRunStatus::Waiting) {
+        out.push_str(
+            "Runtime wait-idle: lead/member prompts, journals, node sync, and other automatic orchestration are suppressed until the tracked wait/job/quiet active turn clears; app-server event drain, job refresh, AUTO_CHECK polling, and explicit user input remain active.\n",
+        );
+    }
     out
 }
 
@@ -1396,4 +1949,3 @@ fn parse_wait_status(value: &str) -> Result<TeamWaitStatus> {
         other => bail!("unsupported wait status `{other}`"),
     }
 }
-

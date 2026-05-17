@@ -16,6 +16,7 @@ SSH ノード、Docker ノード、タスク、長時間ジョブ、待ち条件
 - team message / task / job / wait / node / journal で状態を共有する
 - 長時間処理を `team job`、外部完了待ちを `team wait` で追跡する
 - idle wakeup、heartbeat、lead tick、task watchdog で止まりっぱなしを検知する
+- 全 open work が長時間 job / wait / quiet active turn 待ちだけになったら `waiting(long-task)` に入り、自動発火を沈静化して完了検出まで待つ
 - side-channel reply で作業中 turn を止めずに短い返信を返す
 - member journal と AI digest journal で各部署の活動履歴を確認する
 - Web UI で team 一覧、lead chat、messages、tasks、jobs、waits、nodes、token 使用量、journal、flow を見る
@@ -221,6 +222,8 @@ codex team wait --team team-xxxxxxxxxxxxxx set wait-1 \
 ```
 
 機械判定できる wait では `AUTO_CHECK` を使うよう lead prompt で指示しています。
+
+全ての未完了 task が同じ長時間 `job` / `wait` / 静かな active turn に依存していて、他部署が進められる独立作業がない場合、runtime は `waiting(long-task)` として扱います。この long-task blocker として扱う `wait` は、`AUTO_CHECK` 付き、外部 API/MCP/queue 待ち、学習・benchmark・Docker build・download など長時間処理として識別できるものに限定します。通常の final artifact gate や audit gate は、待機ではなく owner/lead を起こすべき作業として扱います。この間は lead tick、task watchdog、idle wakeup、heartbeat、idle outreach、AI digest journal、node asset sync、dynamic member sync など自動オーケストレーションを止め、app-server event drain、`job` refresh、`AUTO_CHECK` polling、明示的なユーザー入力、実際の完了/失敗 evidence だけで再開します。内部 mailbox chatter は `team_wait_idle_mailbox_suppressed` として既読化し、ユーザー入力だけ `team_wait_idle_user_message_pending` として通常 steer へ戻します。
 
 ## Member Journal
 

@@ -523,21 +523,23 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let lead_client = node_clients
         .get_mut(&lead_node_id)
         .context("local app-server client missing for lead")?;
-    let lead_thread: ThreadStartResponse = lead_client
-        .client
-        .request_typed(ClientRequest::ThreadStart {
-            request_id: next_request_id(&mut lead_client.request_counter),
-            params: ThreadStartParams {
-                model: args.model.clone(),
-                cwd: Some(cwd.display().to_string()),
-                sandbox,
-                approval_policy,
-                ephemeral: Some(false),
-                ..ThreadStartParams::default()
-            },
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
+    let lead_thread: ThreadStartResponse = start_team_app_server_thread(
+        lead_client,
+        &team_dir,
+        &lead_node_id,
+        &lead_member.name,
+        "lead_initial_thread",
+        ThreadStartParams {
+            model: args.model.clone(),
+            cwd: Some(cwd.display().to_string()),
+            sandbox,
+            approval_policy,
+            ephemeral: Some(false),
+            ..ThreadStartParams::default()
+        },
+        prompt_language,
+    )
+    .await?;
     set_member_thread(&team_dir, &lead_member.name, &lead_thread.thread.id)?;
     set_member_workspace(&team_dir, &lead_member.name, &cwd)?;
     thread_to_member.insert(
@@ -628,21 +630,49 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
         let node_client = node_clients
             .get_mut(&node_id)
             .with_context(|| format!("app-server client missing for node `{node_id}`"))?;
-        let thread: ThreadStartResponse = node_client
-            .client
-            .request_typed(ClientRequest::ThreadStart {
-                request_id: next_request_id(&mut node_client.request_counter),
-                params: ThreadStartParams {
-                    model: args.model.clone(),
-                    cwd: Some(worker_cwd.display().to_string()),
-                    sandbox,
-                    approval_policy,
-                    ephemeral: Some(false),
-                    ..ThreadStartParams::default()
-                },
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let thread: ThreadStartResponse = match start_team_app_server_thread(
+            node_client,
+            &team_dir,
+            &node_id,
+            &member.name,
+            "department_initial_thread",
+            ThreadStartParams {
+                model: args.model.clone(),
+                cwd: Some(worker_cwd.display().to_string()),
+                sandbox,
+                approval_policy,
+                ephemeral: Some(false),
+                ..ThreadStartParams::default()
+            },
+            prompt_language,
+        )
+        .await
+        {
+            Ok(thread) => thread,
+            Err(err) => {
+                append_event(
+                    &team_dir,
+                    "app_server_member_start_failed",
+                    serde_json::json!({
+                        "member": member.name,
+                        "role": member.role,
+                        "node": node_id,
+                        "reason": "thread start failed",
+                        "error": err.to_string(),
+                    }),
+                )?;
+                if node_id != "local" {
+                    let _ = set_node_connection(&team_dir, &node_id, TeamNodeStatus::Failed, None);
+                }
+                block_member_tasks_if_active(
+                    &team_dir,
+                    &member.name,
+                    &format!("Member initial app-server thread could not start: {err}"),
+                )?;
+                set_member_status(&team_dir, &member.name, MemberStatus::Standby)?;
+                continue;
+            }
+        };
         set_member_thread(&team_dir, &member.name, &thread.thread.id)?;
         set_member_workspace(&team_dir, &member.name, &worker_cwd)?;
 
@@ -654,7 +684,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             &nodes,
             prompt_language,
         );
-        let turn: TurnStartResponse = node_client
+        let turn: TurnStartResponse = match node_client
             .client
             .request_typed(ClientRequest::TurnStart {
                 request_id: next_request_id(&mut node_client.request_counter),
@@ -673,7 +703,34 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                 },
             })
             .await
-            .map_err(|err| anyhow!(err))?;
+        {
+            Ok(turn) => turn,
+            Err(err) => {
+                let err = anyhow!(err);
+                append_event(
+                    &team_dir,
+                    "app_server_member_start_failed",
+                    serde_json::json!({
+                        "member": member.name,
+                        "role": member.role,
+                        "node": node_id,
+                        "thread": thread.thread.id,
+                        "reason": "turn start failed",
+                        "error": err.to_string(),
+                    }),
+                )?;
+                if node_id != "local" {
+                    let _ = set_node_connection(&team_dir, &node_id, TeamNodeStatus::Failed, None);
+                }
+                block_member_tasks_if_active(
+                    &team_dir,
+                    &member.name,
+                    &format!("Member initial app-server turn could not start: {err}"),
+                )?;
+                set_member_status(&team_dir, &member.name, MemberStatus::Standby)?;
+                continue;
+            }
+        };
 
         println!(
             "Started {} ({}) thread={} turn={}",
@@ -752,6 +809,8 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
         build_app_server_lead_prompt(&config, &tasks, &lead_member, &codex_exe, prompt_language);
     start_app_server_member_turn(
         &mut node_clients,
+        &mut node_processes,
+        &nodes,
         &team_dir,
         &mut active,
         &mut thread_to_member,
@@ -762,6 +821,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
         sandbox.clone(),
         approval_policy,
         args.dangerously_bypass_approvals_and_sandbox,
+        relay.port(),
         "app_server_lead_started",
     )
     .await?;
@@ -809,6 +869,13 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             args.stale_active_turn_timeout_sec.max(120),
         ))
     };
+    let team_wait_idle_active_quiet_threshold = if args.team_wait_idle_active_quiet_sec == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(
+            args.team_wait_idle_active_quiet_sec.max(30),
+        ))
+    };
     let autoresearch_audit_interval = if args.autoresearch_audit_interval_sec == 0 {
         None
     } else {
@@ -849,6 +916,8 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let mut keep_alive_idle_reported = false;
     let mut keep_alive_idle_since = None::<Instant>;
     let mut idle_exit_requested = false;
+    let mut team_wait_idle_key = team_wait_idle_event_active(&team_dir)
+        .then(|| "reattached-previous-wait-idle".to_string());
     #[cfg(unix)]
     let hangup_task = {
         let mut hangup_signal =
@@ -925,6 +994,96 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                     &thread_to_member,
                     &mut assistant_buffers,
                 ).await?;
+                if last_job_refresh.elapsed() >= Duration::from_secs(15) {
+                    last_job_refresh = Instant::now();
+                    if let Err(err) = refresh_running_team_jobs(&team_dir) {
+                        record_runtime_loop_error(&team_dir, "refresh_running_team_jobs", err)?;
+                    }
+                }
+                if let Err(err) = auto_complete_wait_checks(&team_dir) {
+                    record_runtime_loop_error(&team_dir, "auto_complete_wait_checks", err)?;
+                }
+                if let Err(err) = auto_promote_dependency_waits(&team_dir) {
+                    record_runtime_loop_error(&team_dir, "auto_promote_dependency_waits", err)?;
+                }
+                let team_wait_idle = detect_team_wait_idle_state(
+                    &team_dir,
+                    &active,
+                    team_wait_idle_active_quiet_threshold,
+                )?;
+                if let Some(state) = team_wait_idle {
+                    let key = state.key();
+                    if team_wait_idle_key.as_deref() != Some(key.as_str()) {
+                        println!(
+                            "Team {} is waiting on long-running work; suppressing automatic team prompts until the wait/job/active turn completes.",
+                            team_id
+                        );
+                        append_event(
+                            &team_dir,
+                            "team_wait_idle_entered",
+                            serde_json::json!({
+                                "message": "automatic team prompts suppressed while all open work is waiting on long-running work",
+                                "waits": state.wait_ids,
+                                "jobs": state.job_ids,
+                                "tasks": state.task_ids,
+                                "active_members": state.active_members,
+                                "suppressed": [
+                                    "lead_tick",
+                                    "task_watchdog",
+                                    "idle_wakeup",
+                                    "department_heartbeat",
+                                    "idle_outreach",
+                                    "member_digest_journal",
+                                    "autoresearch_audit",
+                                    "node_asset_sync",
+                                    "dynamic_member_sync",
+                                    "container_department_discovery",
+                                    "contract_input_sync",
+                                    "stale_active_turn_warning"
+                                ],
+                            }),
+                        )?;
+                        team_wait_idle_key = Some(key);
+                    }
+                    let user_message_pending = suppress_wait_idle_mailbox_chatter(
+                        &team_dir,
+                        &config.members,
+                        &mut mailbox_counts,
+                    )?;
+                    if user_message_pending {
+                        steer_new_team_messages(
+                            &mut node_clients,
+                            &mut node_processes,
+                            &nodes,
+                            &team_dir,
+                            &config.members,
+                            &mut active,
+                            &mut side_replies,
+                            &mut thread_to_member,
+                            &mut mailbox_counts,
+                            &cwd,
+                            args.model.clone(),
+                            sandbox.clone(),
+                            approval_policy.clone(),
+                            args.dangerously_bypass_approvals_and_sandbox,
+                            &codex_exe,
+                            args.side_channel_replies,
+                            relay.port(),
+                            prompt_language,
+                        )
+                        .await?;
+                    }
+                    continue;
+                } else if let Some(previous) = team_wait_idle_key.take() {
+                    append_event(
+                        &team_dir,
+                        "team_wait_idle_exited",
+                        serde_json::json!({
+                            "previous_key": previous,
+                            "message": "long-running wait idle condition cleared; automatic team prompts resumed",
+                        }),
+                    )?;
+                }
                 nodes = load_nodes(&team_dir)?;
                 ensure_local_node(&mut nodes);
                 ensure_container_node_departments(&team_dir)?;
@@ -958,18 +1117,6 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                     &team_dir,
                     &active,
                 ).await?;
-                if last_job_refresh.elapsed() >= Duration::from_secs(15) {
-                    last_job_refresh = Instant::now();
-                    if let Err(err) = refresh_running_team_jobs(&team_dir) {
-                        record_runtime_loop_error(&team_dir, "refresh_running_team_jobs", err)?;
-                    }
-                }
-                if let Err(err) = auto_complete_wait_checks(&team_dir) {
-                    record_runtime_loop_error(&team_dir, "auto_complete_wait_checks", err)?;
-                }
-                if let Err(err) = auto_promote_dependency_waits(&team_dir) {
-                    record_runtime_loop_error(&team_dir, "auto_promote_dependency_waits", err)?;
-                }
                 if last_member_journal_update.elapsed() >= Duration::from_secs(60) {
                     last_member_journal_update = Instant::now();
                     if let Err(err) = update_member_journals(&team_dir, &config) {
@@ -1027,6 +1174,8 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                 ).await?;
                 steer_new_team_messages(
                     &mut node_clients,
+                    &mut node_processes,
+                    &nodes,
                     &team_dir,
                     &config.members,
                     &mut active,
@@ -1040,6 +1189,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                     args.dangerously_bypass_approvals_and_sandbox,
                     &codex_exe,
                     args.side_channel_replies,
+                    relay.port(),
                     prompt_language,
                 ).await?;
                 if let Some(outreach_interval) = idle_outreach_interval {
@@ -1143,6 +1293,8 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
         let prompt = build_app_server_lead_final_prompt(&config, &team_dir, prompt_language)?;
         start_app_server_member_turn(
             &mut node_clients,
+            &mut node_processes,
+            &nodes,
             &team_dir,
             &mut active,
             &mut thread_to_member,
@@ -1153,6 +1305,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             sandbox.clone(),
             approval_policy,
             args.dangerously_bypass_approvals_and_sandbox,
+            relay.port(),
             "app_server_lead_synthesis_started",
         )
         .await?;
@@ -1216,4 +1369,3 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     }
     Ok(())
 }
-

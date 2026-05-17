@@ -167,7 +167,7 @@ fn fallback_department_design(goal: &str) -> LeadDepartmentDesign {
                 name: "engineering".to_string(),
                 role: "engineering".to_string(),
                 mission: format!(
-                    "Implement the primary technical deliverable, using internal subagents or tools when useful, for: {goal}"
+                    "Implement the primary technical deliverable, defaulting to internal subagents or tools for nontrivial slices, for: {goal}"
                 ),
                 node: None,
             },
@@ -240,7 +240,7 @@ fn apply_department_design(args: &mut StartArgs, design: LeadDepartmentDesign) {
         .iter()
         .map(|department| {
             format!(
-                "Department mission for {}: {}\n\nOperate as one department-level Codex session. Proactively coordinate with related departments: broadcast your initial plan, ask even small uncertainty questions before committing to a risky choice, report failures with proposed next steps, and hand off artifacts to their consumers. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad, research-heavy, implementation-heavy, or review-heavy, actively use those available helpers inside this department instead of doing all work in one main thread or asking the lead to create duplicate peer departments for load balancing.",
+                "Department mission for {}: {}\n\nOperate as one department-level Codex session. Proactively coordinate with related departments: broadcast your initial plan, ask even small uncertainty questions before committing to a risky choice, report failures with proposed next steps, and hand off artifacts to their consumers. The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If the mission is broad, research-heavy, implementation-heavy, review-heavy, remote/container, or otherwise nontrivial, default to using those available helpers inside this department instead of doing all work in one main thread or asking the lead to create duplicate peer departments for load balancing. If helpers are not used for substantial work, record why they were unnecessary.",
                 sanitize_id(&department.name),
                 department.mission
             )
@@ -249,18 +249,17 @@ fn apply_department_design(args: &mut StartArgs, design: LeadDepartmentDesign) {
 }
 
 fn goal_expects_future_container_work(goal: &str) -> bool {
-    let lower = goal.to_ascii_lowercase();
-    lower.contains("docker image")
-        || lower.contains("dockerfile")
-        || lower.contains("docker file")
-        || lower.contains("docker build")
-        || lower.contains("create a container")
-        || lower.contains("build a container")
-        || lower.contains("container を作")
-        || lower.contains("コンテナを作")
-        || lower.contains("コンテナ作成")
-        || lower.contains("image を作")
-        || lower.contains("イメージを作")
+    explicit_goal_control_marker(goal, "CODEX_TEAM_EXPECTS_CONTAINER_WORK")
+}
+
+fn explicit_goal_control_marker(text: &str, marker: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == marker
+            || trimmed == format!("{marker}=1")
+            || trimmed == format!("{marker}: true")
+            || trimmed == format!("{marker}: yes")
+    })
 }
 
 fn is_future_container_local_placeholder(department: &LeadDepartment) -> bool {
@@ -428,7 +427,6 @@ fn build_lead_department_design_prompt(
     placement_candidates: &[LeadNodeDesign],
     language: TeamPromptLanguage,
 ) -> String {
-    let autoresearch_policy = build_autoresearch_department_design_policy(goal, language);
     let prompt_goal = sanitize_goal_for_internal_team_prompt(goal);
     let candidates = if placement_candidates.is_empty() {
         "(none explicitly provided by CLI/UI advanced options)".to_string()
@@ -475,12 +473,10 @@ CLI/UI の advanced option から明示された配置候補だけ:
 - 各部署は、明確な ownership domain を持つ peer Codex session です。
 - `lead` 部署は含めないでください。live lead は部署一覧の外に既に存在します。
 - workload balancing だけを目的に重複部署を作らないでください。
-- ユーザーは、重い部署作業で subagent/agent tools、parallel delegation、skills、MCP servers、または内部分解を使うことを明示的に許可しています。部署の作業が重い場合、その部署は利用可能な helper を積極的に使うべきです。
+- ユーザーは、重い部署作業で subagent/agent tools、parallel delegation、skills、MCP servers、または内部分解を使うことを明示的に許可しています。部署の作業が重い/広い/非自明な場合、その部署は利用可能な helper を使うことをデフォルトにし、使わない場合は理由を記録すべきです。
 - 部署は、自分の execution site で必要な task tool や library を install できます。環境セットアップだけを理由に peer department を増やさないでください。
 - goal が public/open-source model、dataset、package、API、service に依存する場合、research/ops は transitive runtime artifact や model dependency が現在の環境で実際に access 可能か確認してください。未提供の gated credential が必要な新しい選択肢より、少し新規性が低くても end-to-end で動く選択肢を優先してください。
 - product、engineering、design、quality、research、docs、ops、security、data などの domain ownership を優先してください。
-- 自動研究 goal の追加制約:
-{autoresearch_policy}
 - department name と role は lowercase ASCII identifier にしてください。
 - 配置も department design の一部として決めてください。local department は `"node": "local"` または省略を使ってください。ユーザー要求が到達可能な SSH site を明確に呼ぶ場合は SSH node を使ってください。
 - ユーザー goal が到達可能な SSH host または既存 Docker/container execution site を名指しする場合、`nodes` に含めてください。
@@ -490,9 +486,9 @@ CLI/UI の advanced option から明示された配置候補だけ:
 {{
   "nodes": [
     {{
-      "id": "saitou",
+      "id": "remote1",
       "kind": "ssh",
-      "host": "saitou",
+      "host": "remote1",
       "container": null,
       "cwd": null,
       "note": "ユーザーが要求した remote SSH site。"
@@ -510,7 +506,6 @@ CLI/UI の advanced option から明示された配置候補だけ:
 "#,
             goal = prompt_goal,
             candidates = candidates,
-            autoresearch_policy = autoresearch_policy,
         );
     }
 
@@ -539,12 +534,10 @@ Design a small department structure:
 - Each department is one peer Codex session with a clear ownership domain.
 - Do not include a `lead` department. The live lead already exists outside your department list.
 - Do not create duplicate departments just to balance workload.
-- The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If a department's work is heavy, that department should proactively use available helpers.
+- The user explicitly authorizes departments to use subagents, agent tools, parallel delegation, skills, MCP servers, and internal decomposition for substantial work. If a department's work is heavy, broad, or nontrivial, that department should default to using available helpers and record why if it does not.
 - Departments are allowed to install missing task tools and libraries in their own execution site when that is the best way to complete or verify the work. Do not create extra peer departments just because an environment needs setup.
 - If the goal depends on a public external model, dataset, package, or service, research/ops must verify that all required runtime artifacts and transitive model dependencies are actually accessible in the current environment. Prefer a slightly less novel option that can run end-to-end over a newer option that requires unprovided gated credentials.
 - Prefer domain ownership such as product, engineering, design, quality, research, docs, ops, security, data, etc.
-- Additional constraints for autoresearch goals:
-{autoresearch_policy}
 - Use lowercase ASCII identifiers for department names and roles.
 - Decide placement as part of the department design. Use `"node": "local"` or omit `node` for local departments. Use an SSH node when the user's request clearly calls for a reachable SSH site.
 - Include nodes in `nodes` when the user goal names a reachable SSH host or an already-existing Docker/container execution site.
@@ -554,9 +547,9 @@ Return only valid JSON, no Markdown, no commentary:
 {{
   "nodes": [
     {{
-      "id": "saitou",
+      "id": "remote1",
       "kind": "ssh",
-      "host": "saitou",
+      "host": "remote1",
       "container": null,
       "cwd": null,
       "note": "Remote SSH site requested by the user."
@@ -574,7 +567,6 @@ Return only valid JSON, no Markdown, no commentary:
 "#,
         goal = prompt_goal,
         candidates = candidates,
-        autoresearch_policy = autoresearch_policy,
     )
 }
 
@@ -748,4 +740,3 @@ fn extract_json_object(raw: &str) -> Option<&str> {
     }
     Some(&raw[start..=end])
 }
-
