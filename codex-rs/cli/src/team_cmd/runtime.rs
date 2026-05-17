@@ -186,6 +186,38 @@ fn run_team(root: &Path, mut args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+fn write_interactive_lead_runtime_marker(
+    team_dir: &Path,
+    thread_id: &str,
+    nodes: &[TeamNode],
+    cwd: &Path,
+) -> Result<()> {
+    let app_server_url = nodes
+        .iter()
+        .find(|node| node.id == "local")
+        .and_then(|node| node.url.as_deref())
+        .unwrap_or("");
+    let marker = serde_json::json!({
+        "pid": std::process::id(),
+        "thread": thread_id,
+        "app_server_url": app_server_url,
+        "cwd": cwd.display().to_string(),
+        "attached_at": now(),
+    });
+    let path = team_dir.join("interactive-lead-attached.json");
+    write_json_atomic(&path, &marker).with_context(|| format!("write {}", path.display()))?;
+    append_event(
+        team_dir,
+        "interactive_lead_runtime_marker_written",
+        serde_json::json!({
+            "thread": thread_id,
+            "app_server_url": app_server_url,
+            "reason": "suppress hidden lead runtime turns until the visible TUI attaches",
+        }),
+    )?;
+    Ok(())
+}
+
 async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let resume_team = args.resume_team.clone();
     let use_lead_department_design = resume_team.is_none()
@@ -523,27 +555,59 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     let lead_client = node_clients
         .get_mut(&lead_node_id)
         .context("local app-server client missing for lead")?;
-    let lead_thread: ThreadStartResponse = start_team_app_server_thread(
-        lead_client,
-        &team_dir,
-        &lead_node_id,
-        &lead_member.name,
-        "lead_initial_thread",
-        ThreadStartParams {
-            model: args.model.clone(),
-            cwd: Some(cwd.display().to_string()),
-            sandbox,
-            approval_policy,
-            ephemeral: Some(false),
-            ..ThreadStartParams::default()
-        },
-        prompt_language,
-    )
-    .await?;
-    set_member_thread(&team_dir, &lead_member.name, &lead_thread.thread.id)?;
+    let lead_prompt =
+        build_app_server_lead_prompt(&config, &tasks, &lead_member, &codex_exe, prompt_language);
+    let lead_thread_id = if args.interactive_lead
+        && let Some(thread_id) = lead_member
+            .thread_id
+            .as_deref()
+            .filter(|thread| !thread.trim().is_empty())
+    {
+        append_event(
+            &team_dir,
+            "app_server_interactive_lead_thread_reused",
+            serde_json::json!({
+                "member": lead_member.name,
+                "thread": thread_id,
+                "cwd": cwd,
+            }),
+        )?;
+        thread_id.to_string()
+    } else {
+        let lead_thread: ThreadStartResponse = start_team_app_server_thread(
+            lead_client,
+            &team_dir,
+            &lead_node_id,
+            &lead_member.name,
+            "lead_initial_thread",
+            ThreadStartParams {
+                model: args.model.clone(),
+                cwd: Some(cwd.display().to_string()),
+                sandbox,
+                approval_policy,
+                developer_instructions: args.interactive_lead.then_some(lead_prompt.clone()),
+                ephemeral: Some(false),
+                ..ThreadStartParams::default()
+            },
+            prompt_language,
+        )
+        .await?;
+        set_member_thread(&team_dir, &lead_member.name, &lead_thread.thread.id)?;
+        println!("Started lead thread={}", lead_thread.thread.id);
+        append_event(
+            &team_dir,
+            "app_server_lead_thread_started",
+            serde_json::json!({
+                "member": lead_member.name,
+                "thread": lead_thread.thread.id,
+                "cwd": cwd,
+            }),
+        )?;
+        lead_thread.thread.id
+    };
     set_member_workspace(&team_dir, &lead_member.name, &cwd)?;
     thread_to_member.insert(
-        thread_key(&lead_node_id, &lead_thread.thread.id),
+        thread_key(&lead_node_id, &lead_thread_id),
         lead_member.name.clone(),
     );
     assistant_buffers.insert(lead_member.name.clone(), String::new());
@@ -553,7 +617,7 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             member: lead_member.clone(),
             node_id: lead_node_id.clone(),
             cwd: cwd.clone(),
-            thread_id: lead_thread.thread.id.clone(),
+            thread_id: lead_thread_id.clone(),
             turn_id: String::new(),
             completed: true,
             failed: false,
@@ -567,16 +631,6 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
             side_context_ids: Vec::new(),
         },
     );
-    println!("Started lead thread={}", lead_thread.thread.id);
-    append_event(
-        &team_dir,
-        "app_server_lead_thread_started",
-        serde_json::json!({
-            "member": lead_member.name,
-            "thread": lead_thread.thread.id,
-            "cwd": cwd,
-        }),
-    )?;
 
     let mut started_workers = 0usize;
     for member in &workers {
@@ -806,18 +860,17 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
     }
 
     if args.interactive_lead {
+        write_interactive_lead_runtime_marker(&team_dir, &lead_thread_id, &nodes, &cwd)?;
         append_event(
             &team_dir,
             "app_server_interactive_lead_thread_ready",
             serde_json::json!({
                 "member": lead_member.name,
-                "thread": lead_thread.thread.id,
+                "thread": lead_thread_id,
                 "message": "interactive lead thread is idle; the TUI owns the next turn",
             }),
         )?;
     } else {
-        let lead_prompt =
-            build_app_server_lead_prompt(&config, &tasks, &lead_member, &codex_exe, prompt_language);
         start_app_server_member_turn(
             &mut node_clients,
             &mut node_processes,
@@ -1231,7 +1284,9 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
                     }
                 }
                 config = load_config(&team_dir)?;
-                if let Some(tick_interval) = lead_tick_interval {
+                if !args.interactive_lead
+                    && let Some(tick_interval) = lead_tick_interval
+                {
                     if let Err(err) = maybe_send_lead_autonomy_tick(
                         &team_dir,
                         &config,

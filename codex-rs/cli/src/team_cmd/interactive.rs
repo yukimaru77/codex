@@ -293,12 +293,29 @@ fn launch_existing_interactive_lead_team(
     let old_lead_thread_id = read_team_lead_thread_id(&team_dir)?;
     let runtime_refresh_required =
         interactive_runtime_refresh_required(shared, language, idle_exit_after_sec);
-    let runtime_alive = read_team_run_pid(&team_dir)
+    let runtime_process_alive = read_team_run_pid(&team_dir)
         .map(|pid| process_alive(pid) && process_looks_like_codex_team(pid))
-        .unwrap_or(false)
-        && !runtime_refresh_required;
+        .unwrap_or(false);
+    let runtime_alive = runtime_process_alive;
 
     let mut child = if runtime_alive {
+        if runtime_refresh_required {
+            append_event(
+                &team_dir,
+                "interactive_lead_runtime_refresh_deferred",
+                serde_json::json!({
+                    "reason": "existing live runtime is preserved for direct lead attach",
+                    "dangerously_bypass_approvals_and_sandbox": shared.dangerously_bypass_approvals_and_sandbox,
+                    "sandbox": shared
+                        .sandbox_mode
+                        .map(sandbox_mode_cli_arg_name),
+                    "model": shared.model.as_deref(),
+                    "profile": shared.config_profile.as_deref(),
+                    "language": language.map(|language| language.cli_value()),
+                    "idle_exit_after_sec": idle_exit_after_sec,
+                }),
+            )?;
+        }
         None
     } else {
         if runtime_refresh_required {
@@ -317,6 +334,7 @@ fn launch_existing_interactive_lead_team(
                 }),
             )?;
         }
+        let _ = fs::remove_file(interactive_lead_attachment_path(&team_dir));
         let mut command = Command::new(std::env::current_exe()?);
         command
             .arg("team")
@@ -371,7 +389,9 @@ fn launch_existing_interactive_lead_team(
     let started_at = Instant::now();
     loop {
         if let Some(lead_thread_id) = read_team_lead_thread_id(&team_dir)?
-            && (runtime_alive || old_lead_thread_id.as_deref() != Some(lead_thread_id.as_str()))
+            && (runtime_alive
+                || old_lead_thread_id.as_deref() != Some(lead_thread_id.as_str())
+                || interactive_lead_runtime_ready(&team_dir, &lead_thread_id)?)
         {
             let active_app_server_url =
                 read_local_node_app_server_url(&team_dir)?.unwrap_or_else(|| app_server_url.to_string());
@@ -414,6 +434,23 @@ fn launch_existing_interactive_lead_team(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn interactive_lead_runtime_ready(team_dir: &Path, thread_id: &str) -> Result<bool> {
+    let path = interactive_lead_attachment_path(team_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let attachment = match serde_json::from_str::<InteractiveLeadAttachment>(&raw) {
+        Ok(attachment) => attachment,
+        Err(_) => return Ok(false),
+    };
+    if attachment.thread != thread_id {
+        return Ok(false);
+    }
+    Ok(process_alive(attachment.pid) && process_looks_like_codex_team(attachment.pid))
 }
 
 fn read_local_node_app_server_url(team_dir: &Path) -> Result<Option<String>> {
