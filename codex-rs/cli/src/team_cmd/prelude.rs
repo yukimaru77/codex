@@ -430,6 +430,10 @@ struct RuntimeArgs {
     /// Language for generated team runtime prompts and system messages. Defaults to the team's saved language.
     #[arg(long, value_enum)]
     language: Option<TeamPromptLanguage>,
+
+    /// Internal: reattach only the live lead so a Codex TUI can attach directly to it.
+    #[arg(long, hide = true, default_value_t = false)]
+    interactive_lead: bool,
 }
 
 #[derive(Debug, Args)]

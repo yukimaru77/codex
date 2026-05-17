@@ -805,26 +805,38 @@ async fn run_team_app_server(root: &Path, mut args: RunArgs) -> Result<()> {
         }
     }
 
-    let lead_prompt =
-        build_app_server_lead_prompt(&config, &tasks, &lead_member, &codex_exe, prompt_language);
-    start_app_server_member_turn(
-        &mut node_clients,
-        &mut node_processes,
-        &nodes,
-        &team_dir,
-        &mut active,
-        &mut thread_to_member,
-        &lead_member.name,
-        lead_prompt,
-        &cwd,
-        args.model.clone(),
-        sandbox.clone(),
-        approval_policy,
-        args.dangerously_bypass_approvals_and_sandbox,
-        relay.port(),
-        "app_server_lead_started",
-    )
-    .await?;
+    if args.interactive_lead {
+        append_event(
+            &team_dir,
+            "app_server_interactive_lead_thread_ready",
+            serde_json::json!({
+                "member": lead_member.name,
+                "thread": lead_thread.thread.id,
+                "message": "interactive lead thread is idle; the TUI owns the next turn",
+            }),
+        )?;
+    } else {
+        let lead_prompt =
+            build_app_server_lead_prompt(&config, &tasks, &lead_member, &codex_exe, prompt_language);
+        start_app_server_member_turn(
+            &mut node_clients,
+            &mut node_processes,
+            &nodes,
+            &team_dir,
+            &mut active,
+            &mut thread_to_member,
+            &lead_member.name,
+            lead_prompt,
+            &cwd,
+            args.model.clone(),
+            sandbox.clone(),
+            approval_policy,
+            args.dangerously_bypass_approvals_and_sandbox,
+            relay.port(),
+            "app_server_lead_started",
+        )
+        .await?;
+    }
     normalize_stale_running_members_without_active_turns(&team_dir, &active)?;
     config = load_config(&team_dir)?;
 

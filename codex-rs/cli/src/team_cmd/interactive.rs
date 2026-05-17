@@ -38,7 +38,7 @@ fn runtime_args_to_run_args(args: RuntimeArgs, root: &Path) -> Result<RunArgs> {
         team_wait_idle_active_quiet_sec: args.team_wait_idle_active_quiet_sec,
         autoresearch_audit_interval_sec: args.autoresearch_audit_interval_sec,
         side_channel_replies: args.side_channel_replies,
-        interactive_lead: false,
+        interactive_lead: args.interactive_lead,
         no_keep_alive: args.no_keep_alive,
         idle_exit_after_sec: args.idle_exit_after_sec,
         app_server_url: args.app_server_url,
@@ -328,6 +328,7 @@ fn launch_existing_interactive_lead_team(
         if !runtime_refresh_required {
             command.arg("--app-server-url").arg(app_server_url);
         }
+        command.arg("--interactive-lead");
         if idle_exit_after_sec > 0 {
             command
                 .arg("--idle-exit-after-sec")

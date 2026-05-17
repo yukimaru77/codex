@@ -2638,41 +2638,56 @@ impl ThreadRequestProcessor {
                         active_path.display()
                     )));
                 }
-                Some((existing_thread_id, existing_thread, source_thread))
+                Some((existing_thread_id, existing_thread, Some(source_thread)))
             } else {
                 None
             }
         } else if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
             && let Ok(existing_thread) = self.thread_manager.get_thread(existing_thread_id).await
         {
-            let source_thread = self
-                .read_stored_thread_for_resume(
-                    &params.thread_id,
-                    /*path*/ None,
-                    /*include_history*/ true,
-                )
-                .await?;
-            if source_thread.thread_id != existing_thread_id {
-                return Err(invalid_request(format!(
-                    "cannot resume running thread {existing_thread_id} from source thread {}",
-                    source_thread.thread_id
-                )));
-            }
+            let source_thread = match self
+                .thread_store
+                .read_thread(StoreReadThreadParams {
+                    thread_id: existing_thread_id,
+                    include_archived: true,
+                    include_history: true,
+                })
+                .await
+            {
+                Ok(source_thread) => {
+                    if source_thread.thread_id != existing_thread_id {
+                        return Err(invalid_request(format!(
+                            "cannot resume running thread {existing_thread_id} from source thread {}",
+                            source_thread.thread_id
+                        )));
+                    }
+                    Some(source_thread)
+                }
+                Err(err)
+                    if running_thread_resume_can_use_live_snapshot(existing_thread_id, &err) =>
+                {
+                    None
+                }
+                Err(err) => return Err(thread_store_resume_read_error(err)),
+            };
             Some((existing_thread_id, existing_thread, source_thread))
         } else {
             None
         };
 
         if let Some((existing_thread_id, existing_thread, source_thread)) = running_thread {
-            let history_items = source_thread
-                .history
-                .as_ref()
-                .map(|history| history.items.clone())
-                .ok_or_else(|| {
-                    internal_error(format!(
-                        "thread {existing_thread_id} did not include persisted history"
-                    ))
-                })?;
+            let history_items = match source_thread.as_ref() {
+                Some(source_thread) => source_thread
+                    .history
+                    .as_ref()
+                    .map(|history| history.items.clone())
+                    .ok_or_else(|| {
+                        internal_error(format!(
+                            "thread {existing_thread_id} did not include persisted history"
+                        ))
+                    })?,
+                None => Vec::new(),
+            };
 
             let thread_state = self
                 .thread_state_manager
@@ -2700,13 +2715,23 @@ impl ThreadRequestProcessor {
                     mismatch_details.join("; ")
                 );
             }
-            let mut summary_source_thread = source_thread;
-            summary_source_thread.history = None;
-            let mut thread_summary = self.stored_thread_to_api_thread(
-                summary_source_thread,
-                config_snapshot.model_provider_id.as_str(),
-                /*include_turns*/ false,
-            );
+            let mut thread_summary = if let Some(mut source_thread) = source_thread {
+                source_thread.history = None;
+                self.stored_thread_to_api_thread(
+                    source_thread,
+                    config_snapshot.model_provider_id.as_str(),
+                    /*include_turns*/ false,
+                )
+            } else {
+                let mut thread_summary = build_thread_from_loaded_snapshot(
+                    existing_thread_id,
+                    &config_snapshot,
+                    existing_thread.as_ref(),
+                );
+                self.attach_thread_name(existing_thread_id, &mut thread_summary)
+                    .await;
+                thread_summary
+            };
             thread_summary.session_id = existing_thread.session_configured().session_id.to_string();
             let mut config_for_instruction_sources = self.config.as_ref().clone();
             config_for_instruction_sources.cwd = config_snapshot.cwd.clone();
@@ -3638,6 +3663,28 @@ fn thread_read_history_load_error(
         err => ThreadReadViewError::Internal(format!(
             "failed to load thread history for thread {thread_id}: {err}"
         )),
+    }
+}
+
+fn running_thread_resume_can_use_live_snapshot(
+    thread_id: ThreadId,
+    err: &ThreadStoreError,
+) -> bool {
+    match err {
+        ThreadStoreError::InvalidRequest { message }
+            if message == &format!("no rollout found for thread id {thread_id}") =>
+        {
+            true
+        }
+        ThreadStoreError::InvalidRequest { message }
+            if message.starts_with("failed to resolve rollout path `") =>
+        {
+            true
+        }
+        ThreadStoreError::ThreadNotFound {
+            thread_id: missing_thread_id,
+        } if *missing_thread_id == thread_id => true,
+        _ => false,
     }
 }
 
