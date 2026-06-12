@@ -1046,6 +1046,7 @@ impl Session {
                 ),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(),
                 environment_manager,
+                dynamic_environment_cwds: Mutex::new(HashMap::new()),
             };
             services
                 .model_client
