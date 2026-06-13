@@ -1,7 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::shell::Shell;
+use crate::shell::get_shell_by_model_provided_path;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -150,9 +153,22 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
         let process_id = manager.allocate_process_id().await;
         let shell_mode =
             shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
+        // Prefer the resolved environment's shell (detected by the remote probe,
+        // e.g. `/bin/sh` in a container that has no zsh) over the host login
+        // shell, so a remote command is not wrapped in a shell that does not
+        // exist there. An explicit `shell` argument from the model still wins
+        // (handled inside `get_command`).
+        let default_shell: Arc<Shell> = match turn_environment.shell.as_deref() {
+            Some(shell_path) => {
+                let mut shell = get_shell_by_model_provided_path(&PathBuf::from(shell_path));
+                shell.shell_snapshot = crate::shell::empty_shell_snapshot_receiver();
+                Arc::new(shell)
+            }
+            None => session.user_shell(),
+        };
         let resolved_command = get_command(
             &args,
-            session.user_shell(),
+            default_shell,
             &shell_mode,
             turn.config.permissions.allow_login_shell,
         )
