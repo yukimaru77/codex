@@ -310,7 +310,6 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
                     &hook_command,
                     RemoteCommandAdvisoryOptions {
                         env_switch_enabled: turn.features.enabled(Feature::EnvSwitch),
-                        explicit_environment_id: environment_args.environment_id.as_deref(),
                     },
                 )
                 .map(str::to_string);

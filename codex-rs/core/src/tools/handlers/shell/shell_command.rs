@@ -211,7 +211,6 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
             &params.command,
             RemoteCommandAdvisoryOptions {
                 env_switch_enabled: turn.features.enabled(Feature::EnvSwitch),
-                explicit_environment_id: None,
             },
         )
         .map(str::to_string);
