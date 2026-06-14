@@ -6,10 +6,9 @@ use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
-use crate::transport::RemoteControlHandle;
 use codex_analytics::AnalyticsEventsClient;
-use codex_app_server_protocol::AppListUpdatedNotification;
 use codex_app_server_protocol::ClientResponsePayload;
+use codex_app_server_protocol::ComputerUseRequirements;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigReadResponse;
@@ -29,8 +28,7 @@ use codex_app_server_protocol::NetworkDomainPermission;
 use codex_app_server_protocol::NetworkRequirements;
 use codex_app_server_protocol::NetworkUnixSocketPermission;
 use codex_app_server_protocol::SandboxMode;
-use codex_app_server_protocol::ServerNotification;
-use codex_chatgpt::connectors;
+use codex_app_server_protocol::WindowsSandboxSetupMode;
 use codex_config::ConfigRequirementsToml;
 use codex_config::HookEventsToml;
 use codex_config::HookHandlerConfig as CoreHookHandlerConfig;
@@ -39,53 +37,43 @@ use codex_config::MatcherGroup as CoreMatcherGroup;
 use codex_config::ResidencyRequirement as CoreResidencyRequirement;
 use codex_config::SandboxModeRequirement as CoreSandboxModeRequirement;
 use codex_core::ThreadManager;
-use codex_features::Feature;
 use codex_features::canonical_feature_for_key;
 use codex_features::feature_for_key;
-use codex_login::AuthManager;
 use codex_model_provider::create_model_provider;
 use codex_plugin::PluginId;
 use codex_protocol::config_types::WebSearchMode;
-use codex_protocol::protocol::Op;
 use serde_json::json;
 use std::path::PathBuf;
 
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
-    "apps",
+    "auth_elicitation",
     "memories",
-    "plugins",
+    "mentions_v2",
     "remote_control",
-    "tool_search",
+    "remote_plugin",
     "tool_suggest",
-    "tool_call_mcp_elicitation",
 ];
 
 #[derive(Clone)]
 pub(crate) struct ConfigRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
-    auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
     analytics_events_client: AnalyticsEventsClient,
-    remote_control_handle: Option<RemoteControlHandle>,
 }
 
 impl ConfigRequestProcessor {
     pub(crate) fn new(
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
-        auth_manager: Arc<AuthManager>,
         thread_manager: Arc<ThreadManager>,
         analytics_events_client: AnalyticsEventsClient,
-        remote_control_handle: Option<RemoteControlHandle>,
     ) -> Self {
         Self {
             outgoing,
             config_manager,
-            auth_manager,
             thread_manager,
             analytics_events_client,
-            remote_control_handle,
         }
     }
 
@@ -154,7 +142,6 @@ impl ConfigRequestProcessor {
         request_id: ConnectionRequestId,
         params: ExperimentalFeatureEnablementSetParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let should_refresh_apps_list = params.enablement.get("apps").copied() == Some(true);
         let response = self
             .handle_config_mutation_result(self.set_experimental_feature_enablement(params).await)
             .await?;
@@ -164,10 +151,6 @@ impl ConfigRequestProcessor {
                 ClientResponsePayload::ExperimentalFeatureEnablementSet(response),
             )
             .await;
-        if should_refresh_apps_list {
-            self.refresh_apps_list_after_experimental_feature_enablement_set()
-                .await;
-        }
         Ok(None)
     }
 
@@ -187,21 +170,6 @@ impl ConfigRequestProcessor {
     pub(crate) async fn handle_config_mutation(&self) {
         self.thread_manager.plugins_manager().clear_cache();
         self.thread_manager.skills_manager().clear_cache();
-        let Some(remote_control_handle) = &self.remote_control_handle else {
-            return;
-        };
-
-        match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(config) => {
-                remote_control_handle.set_enabled(config.features.enabled(Feature::RemoteControl));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "failed to load config for remote control enablement refresh after config mutation: {}",
-                    error.message
-                );
-            }
-        }
     }
 
     async fn handle_config_mutation_result<T>(
@@ -211,71 +179,6 @@ impl ConfigRequestProcessor {
         let response = result?;
         self.handle_config_mutation().await;
         Ok(response)
-    }
-
-    async fn refresh_apps_list_after_experimental_feature_enablement_set(&self) {
-        let config = match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(config) => config,
-            Err(error) => {
-                tracing::warn!(
-                    "failed to load config for apps list refresh after experimental feature enablement: {}",
-                    error.message
-                );
-                return;
-            }
-        };
-        let auth = self.auth_manager.auth().await;
-        if !config.features.apps_enabled_for_auth(
-            auth.as_ref()
-                .is_some_and(codex_login::CodexAuth::uses_codex_backend),
-        ) {
-            return;
-        }
-
-        let outgoing = Arc::clone(&self.outgoing);
-        let environment_manager = self.thread_manager.environment_manager();
-        tokio::spawn(async move {
-            let (all_connectors_result, accessible_connectors_result) = tokio::join!(
-                connectors::list_all_connectors_with_options(&config, /*force_refetch*/ true),
-                connectors::list_accessible_connectors_from_mcp_tools_with_environment_manager(
-                    &config,
-                    /*force_refetch*/ true,
-                    &environment_manager,
-                ),
-            );
-            let all_connectors = match all_connectors_result {
-                Ok(connectors) => connectors,
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to force-refresh directory apps after experimental feature enablement: {err:#}"
-                    );
-                    return;
-                }
-            };
-            let accessible_connectors = match accessible_connectors_result {
-                Ok(status) => status.connectors,
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to force-refresh accessible apps after experimental feature enablement: {err:#}"
-                    );
-                    return;
-                }
-            };
-
-            let data = connectors::with_app_enabled_state(
-                connectors::merge_connectors_with_accessible(
-                    all_connectors,
-                    accessible_connectors,
-                    /*all_connectors_loaded*/ true,
-                ),
-                &config,
-            );
-            outgoing
-                .send_server_notification(ServerNotification::AppListUpdated(
-                    AppListUpdatedNotification { data },
-                ))
-                .await;
-        });
     }
 
     async fn load_latest_config(
@@ -335,28 +238,19 @@ impl ConfigRequestProcessor {
         &self,
         params: ExperimentalFeatureEnablementSetParams,
     ) -> Result<ExperimentalFeatureEnablementSetResponse, JSONRPCErrorError> {
-        let ExperimentalFeatureEnablementSetParams { enablement } = params;
-        for key in enablement.keys() {
-            if canonical_feature_for_key(key).is_some() {
-                if SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT.contains(&key.as_str()) {
-                    continue;
-                }
-
-                return Err(invalid_request(format!(
-                    "unsupported feature enablement `{key}`: currently supported features are {}",
-                    SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT.join(", ")
-                )));
+        let ExperimentalFeatureEnablementSetParams { mut enablement } = params;
+        let mut invalid_keys = Vec::new();
+        enablement.retain(|key, _| {
+            let valid = canonical_feature_for_key(key).is_some()
+                && SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT.contains(&key.as_str());
+            if !valid {
+                invalid_keys.push(key.clone());
             }
-
-            let message = if let Some(feature) = feature_for_key(key) {
-                format!(
-                    "invalid feature enablement `{key}`: use canonical feature key `{}`",
-                    feature.key()
-                )
-            } else {
-                format!("invalid feature enablement `{key}`")
-            };
-            return Err(invalid_request(message));
+            valid
+        });
+        if !invalid_keys.is_empty() {
+            let invalid_keys = invalid_keys.join(", ");
+            tracing::warn!("ignoring invalid experimental feature enablement keys: {invalid_keys}");
         }
 
         if enablement.is_empty() {
@@ -378,14 +272,22 @@ impl ConfigRequestProcessor {
     }
 
     async fn reload_user_config(&self) {
+        let next_config = match self.load_latest_config(/*fallback_cwd*/ None).await {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to rebuild user config for runtime refresh: {}",
+                    err.message
+                );
+                return;
+            }
+        };
         let thread_ids = self.thread_manager.list_thread_ids().await;
         for thread_id in thread_ids {
             let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
                 continue;
             };
-            if let Err(err) = thread.submit(Op::ReloadUserConfig).await {
-                tracing::warn!("failed to request user config reload: {err}");
-            }
+            thread.refresh_runtime_config(next_config.clone()).await;
         }
     }
 
@@ -431,6 +333,25 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
                 .filter_map(map_sandbox_mode_requirement_to_api)
                 .collect()
         }),
+        allowed_windows_sandbox_implementations: requirements.windows.and_then(|windows| {
+            windows
+                .allowed_sandbox_implementations
+                .map(|implementations| {
+                    implementations
+                        .into_iter()
+                        .map(|implementation| match implementation {
+                            codex_config::types::WindowsSandboxModeToml::Elevated => {
+                                WindowsSandboxSetupMode::Elevated
+                            }
+                            codex_config::types::WindowsSandboxModeToml::Unelevated => {
+                                WindowsSandboxSetupMode::Unelevated
+                            }
+                        })
+                        .collect()
+                })
+        }),
+        allowed_permission_profiles: requirements.allowed_permission_profiles,
+        default_permissions: requirements.default_permissions,
         allowed_web_search_modes: requirements.allowed_web_search_modes.map(|modes| {
             let mut normalized = modes
                 .into_iter()
@@ -441,6 +362,11 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
             }
             normalized
         }),
+        allow_managed_hooks_only: requirements.allow_managed_hooks_only,
+        allow_appshots: requirements.allow_appshots,
+        computer_use: requirements
+            .computer_use
+            .map(map_computer_use_requirements_to_api),
         feature_requirements: requirements
             .feature_requirements
             .map(|requirements| requirements.entries),
@@ -449,6 +375,14 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
             .enforce_residency
             .map(map_residency_requirement_to_api),
         network: requirements.network.map(map_network_requirements_to_api),
+    }
+}
+
+fn map_computer_use_requirements_to_api(
+    computer_use: codex_config::ComputerUseRequirementsToml,
+) -> ComputerUseRequirements {
+    ComputerUseRequirements {
+        allow_locked_computer_use: computer_use.allow_locked_computer_use,
     }
 }
 
@@ -462,8 +396,12 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         pre_tool_use,
         permission_request,
         post_tool_use,
+        pre_compact,
+        post_compact,
         session_start,
         user_prompt_submit,
+        subagent_start,
+        subagent_stop,
         stop,
     } = hooks;
 
@@ -473,8 +411,12 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         pre_tool_use: map_hook_matcher_groups_to_api(pre_tool_use),
         permission_request: map_hook_matcher_groups_to_api(permission_request),
         post_tool_use: map_hook_matcher_groups_to_api(post_tool_use),
+        pre_compact: map_hook_matcher_groups_to_api(pre_compact),
+        post_compact: map_hook_matcher_groups_to_api(post_compact),
         session_start: map_hook_matcher_groups_to_api(session_start),
         user_prompt_submit: map_hook_matcher_groups_to_api(user_prompt_submit),
+        subagent_start: map_hook_matcher_groups_to_api(subagent_start),
+        subagent_stop: map_hook_matcher_groups_to_api(subagent_stop),
         stop: map_hook_matcher_groups_to_api(stop),
     }
 }
@@ -503,11 +445,13 @@ fn map_hook_handler_to_api(handler: CoreHookHandlerConfig) -> ConfiguredHookHand
     match handler {
         CoreHookHandlerConfig::Command {
             command,
+            command_windows,
             timeout_sec,
             r#async,
             status_message,
         } => ConfiguredHookHandler::Command {
             command,
+            command_windows,
             timeout_sec,
             r#async,
             status_message,
@@ -598,7 +542,7 @@ fn map_network_unix_socket_permission_to_api(
 ) -> NetworkUnixSocketPermission {
     match permission {
         codex_config::NetworkUnixSocketPermissionToml::Allow => NetworkUnixSocketPermission::Allow,
-        codex_config::NetworkUnixSocketPermissionToml::None => NetworkUnixSocketPermission::None,
+        codex_config::NetworkUnixSocketPermissionToml::Deny => NetworkUnixSocketPermission::Deny,
     }
 }
 
@@ -616,4 +560,99 @@ fn config_write_error(code: ConfigWriteErrorCode, message: impl Into<String>) ->
         "config_write_error_code": code,
     }));
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_requirements_toml_to_api;
+    use codex_app_server_protocol::WindowsSandboxSetupMode;
+    use codex_config::ComputerUseRequirementsToml;
+    use codex_config::ConfigRequirementsToml;
+    use codex_config::WindowsRequirementsToml;
+    use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn requirements_api_includes_allow_managed_hooks_only() {
+        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+            allow_managed_hooks_only: Some(true),
+            ..ConfigRequirementsToml::default()
+        });
+
+        assert_eq!(mapped.allow_managed_hooks_only, Some(true));
+        assert_eq!(mapped.hooks, None);
+    }
+
+    #[test]
+    fn requirements_api_includes_permission_default_and_allowlist() {
+        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+            allowed_permission_profiles: Some(BTreeMap::from([
+                ("managed-build".to_string(), false),
+                ("managed-standard".to_string(), true),
+            ])),
+            default_permissions: Some("managed-standard".to_string()),
+            ..ConfigRequirementsToml::default()
+        });
+
+        assert_eq!(
+            mapped.allowed_permission_profiles,
+            Some(BTreeMap::from([
+                ("managed-build".to_string(), false),
+                ("managed-standard".to_string(), true),
+            ]))
+        );
+        assert_eq!(
+            mapped.default_permissions,
+            Some("managed-standard".to_string())
+        );
+    }
+
+    #[test]
+    fn requirements_api_includes_allow_appshots() {
+        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+            allow_appshots: Some(false),
+            ..ConfigRequirementsToml::default()
+        });
+
+        assert_eq!(mapped.allow_appshots, Some(false));
+        assert_eq!(mapped.hooks, None);
+    }
+
+    #[test]
+    fn requirements_api_includes_computer_use_requirements() {
+        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+            computer_use: Some(ComputerUseRequirementsToml {
+                allow_locked_computer_use: Some(false),
+            }),
+            ..ConfigRequirementsToml::default()
+        });
+
+        assert_eq!(
+            mapped
+                .computer_use
+                .and_then(|requirements| requirements.allow_locked_computer_use),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn requirements_api_includes_allowed_windows_sandbox_implementations() {
+        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+            windows: Some(WindowsRequirementsToml {
+                allowed_sandbox_implementations: Some(vec![
+                    codex_config::types::WindowsSandboxModeToml::Elevated,
+                    codex_config::types::WindowsSandboxModeToml::Unelevated,
+                ]),
+            }),
+            ..ConfigRequirementsToml::default()
+        });
+
+        assert_eq!(
+            mapped.allowed_windows_sandbox_implementations,
+            Some(vec![
+                WindowsSandboxSetupMode::Elevated,
+                WindowsSandboxSetupMode::Unelevated,
+            ])
+        );
+    }
 }

@@ -31,11 +31,20 @@ pub(super) struct FeedbackThreadEvent {
     pub(super) result: Result<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ThreadEventAttachment {
+    Live,
+    ReplayOnly,
+}
+
 #[derive(Debug)]
 pub(super) struct ThreadEventStore {
     pub(super) session: Option<ThreadSessionState>,
     pub(super) turns: Vec<Turn>,
     pub(super) buffer: VecDeque<ThreadBufferedEvent>,
+    // Replaying a thread snapshot should restore live-only settings such as the env-switch badge
+    // even after a session refresh has rebased transient buffered events.
+    pub(super) latest_thread_settings_notification: Option<ServerNotification>,
     pub(super) pending_interactive_replay: PendingInteractiveReplayState,
     pub(super) active_turn_id: Option<String>,
     pub(super) input_state: Option<ThreadInputState>,
@@ -50,6 +59,8 @@ impl ThreadEventStore {
             ThreadBufferedEvent::Request(_)
                 | ThreadBufferedEvent::Notification(ServerNotification::HookStarted(_))
                 | ThreadBufferedEvent::Notification(ServerNotification::HookCompleted(_))
+                | ThreadBufferedEvent::Notification(ServerNotification::McpServerStatusUpdated(_))
+                | ThreadBufferedEvent::Notification(ServerNotification::ThreadSettingsUpdated(_))
                 | ThreadBufferedEvent::FeedbackSubmission(_)
         )
     }
@@ -59,6 +70,7 @@ impl ThreadEventStore {
             session: None,
             turns: Vec::new(),
             buffer: VecDeque::new(),
+            latest_thread_settings_notification: None,
             pending_interactive_replay: PendingInteractiveReplayState::default(),
             active_turn_id: None,
             input_state: None,
@@ -100,14 +112,17 @@ impl ThreadEventStore {
     pub(super) fn push_notification(&mut self, notification: ServerNotification) {
         self.pending_interactive_replay
             .note_server_notification(&notification);
+        if matches!(notification, ServerNotification::ThreadSettingsUpdated(_)) {
+            self.latest_thread_settings_notification = Some(notification.clone());
+        }
         match &notification {
             ServerNotification::TurnStarted(turn) => {
                 self.active_turn_id = Some(turn.turn.id.clone());
             }
-            ServerNotification::TurnCompleted(turn) => {
-                if self.active_turn_id.as_deref() == Some(turn.turn.id.as_str()) {
-                    self.active_turn_id = None;
-                }
+            ServerNotification::TurnCompleted(turn)
+                if self.active_turn_id.as_deref() == Some(turn.turn.id.as_str()) =>
+            {
+                self.active_turn_id = None;
             }
             ServerNotification::ThreadClosed(_) => {
                 self.active_turn_id = None;
@@ -199,24 +214,32 @@ impl ThreadEventStore {
     }
 
     pub(super) fn snapshot(&self) -> ThreadEventSnapshot {
+        let mut events: Vec<_> = self
+            .buffer
+            .iter()
+            .filter(|event| match event {
+                ThreadBufferedEvent::Request(request) => self
+                    .pending_interactive_replay
+                    .should_replay_snapshot_request(request),
+                ThreadBufferedEvent::Notification(ServerNotification::ThreadSettingsUpdated(_)) => {
+                    false
+                }
+                ThreadBufferedEvent::Notification(_)
+                | ThreadBufferedEvent::HistoryEntryResponse(_)
+                | ThreadBufferedEvent::FeedbackSubmission(_) => true,
+            })
+            .cloned()
+            .collect();
+        if let Some(notification) = &self.latest_thread_settings_notification {
+            events.insert(0, ThreadBufferedEvent::Notification(notification.clone()));
+        }
         ThreadEventSnapshot {
             session: self.session.clone(),
             turns: self.turns.clone(),
-            // Thread switches replay buffered events into a rebuilt ChatWidget. Only replay
-            // interactive prompts that are still pending, or answered approvals/input will reappear.
-            events: self
-                .buffer
-                .iter()
-                .filter(|event| match event {
-                    ThreadBufferedEvent::Request(request) => self
-                        .pending_interactive_replay
-                        .should_replay_snapshot_request(request),
-                    ThreadBufferedEvent::Notification(_)
-                    | ThreadBufferedEvent::HistoryEntryResponse(_)
-                    | ThreadBufferedEvent::FeedbackSubmission(_) => true,
-                })
-                .cloned()
-                .collect(),
+            // Thread switches replay buffered events into a rebuilt ChatWidget. Request replay is
+            // limited to prompts that are still pending; thread settings are normalized to the
+            // latest full notification so stale buffered settings cannot win during replay.
+            events,
             input_state: self.input_state.clone(),
         }
     }
@@ -284,6 +307,7 @@ pub(super) struct ThreadEventChannel {
     pub(super) sender: mpsc::Sender<ThreadBufferedEvent>,
     pub(super) receiver: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     pub(super) store: Arc<Mutex<ThreadEventStore>>,
+    attachment: ThreadEventAttachment,
 }
 
 impl ThreadEventChannel {
@@ -293,7 +317,16 @@ impl ThreadEventChannel {
             sender,
             receiver: Some(receiver),
             store: Arc::new(Mutex::new(ThreadEventStore::new(capacity))),
+            attachment: ThreadEventAttachment::Live,
         }
+    }
+
+    pub(super) fn mark_replay_only(&mut self) {
+        self.attachment = ThreadEventAttachment::ReplayOnly;
+    }
+
+    pub(super) fn attachment(&self) -> ThreadEventAttachment {
+        self.attachment
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -309,6 +342,7 @@ impl ThreadEventChannel {
             store: Arc::new(Mutex::new(ThreadEventStore::new_with_session(
                 capacity, session, turns,
             ))),
+            attachment: ThreadEventAttachment::Live,
         }
     }
 }
@@ -352,10 +386,12 @@ mod tests {
             permission_profile: PermissionProfile::read_only(),
             active_permission_profile: None,
             cwd: cwd.abs(),
+            runtime_workspace_roots: Vec::new(),
             instruction_source_paths: Vec::new(),
             reasoning_effort: None,
-            history_log_id: 0,
-            history_entry_count: 0,
+            collaboration_mode: None,
+            personality: None,
+            message_history: None,
             network_proxy: None,
             rollout_path: Some(PathBuf::new()),
         }
@@ -466,6 +502,7 @@ mod tests {
                 thread_id: thread_id.to_string(),
                 turn_id: turn_id.to_string(),
                 item_id: item_id.to_string(),
+                started_at_ms: 0,
                 approval_id: approval_id.map(str::to_string),
                 reason: Some("needs approval".to_string()),
                 network_approval_context: None,
@@ -585,6 +622,33 @@ mod tests {
                 serde_json::to_value(hook_completed_notification(thread_id, "turn-hook"))
                     .expect("hook notification should serialize"),
             ]
+        );
+    }
+
+    #[test]
+    fn thread_event_store_rebase_preserves_mcp_startup_notifications() {
+        let thread_id = ThreadId::new();
+        let notification = ServerNotification::McpServerStatusUpdated(
+            codex_app_server_protocol::McpServerStatusUpdatedNotification {
+                thread_id: Some(thread_id.to_string()),
+                name: "sentry".to_string(),
+                status: codex_app_server_protocol::McpServerStartupState::Failed,
+                error: Some("sentry is not logged in".to_string()),
+            },
+        );
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.push_notification(notification.clone());
+
+        store.rebase_buffer_after_session_refresh();
+
+        let snapshot = store.snapshot();
+        let actual = match snapshot.events.as_slice() {
+            [ThreadBufferedEvent::Notification(actual)] => actual,
+            other => panic!("expected one buffered MCP notification, saw: {other:?}"),
+        };
+        assert_eq!(
+            serde_json::to_value(actual).expect("MCP notification should serialize"),
+            serde_json::to_value(notification).expect("MCP notification should serialize"),
         );
     }
 }

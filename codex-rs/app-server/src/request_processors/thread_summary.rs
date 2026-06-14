@@ -1,6 +1,11 @@
 use super::*;
 
 #[cfg(test)]
+use chrono::DateTime;
+#[cfg(test)]
+use chrono::Utc;
+
+#[cfg(test)]
 pub(crate) async fn read_summary_from_rollout(
     path: &Path,
     fallback_provider: &str,
@@ -164,45 +169,92 @@ pub(super) fn with_thread_spawn_agent_metadata(
     }
 }
 
-pub(super) fn thread_response_active_permission_profile(
+pub(crate) fn thread_response_active_permission_profile(
     active_permission_profile: Option<codex_protocol::models::ActivePermissionProfile>,
 ) -> Option<codex_app_server_protocol::ActivePermissionProfile> {
     active_permission_profile.map(Into::into)
 }
 
-pub(super) fn apply_permission_profile_selection_to_config_overrides(
-    overrides: &mut ConfigOverrides,
-    permissions: Option<PermissionProfileSelectionParams>,
-) {
-    let Some(PermissionProfileSelectionParams::Profile { id, modifications }) = permissions else {
-        return;
-    };
-    overrides.default_permissions = Some(id);
-    overrides
-        .additional_writable_roots
-        .extend(modifications.unwrap_or_default().into_iter().map(
-            |modification| match modification {
-                PermissionProfileModificationParams::AdditionalWritableRoot { path } => {
-                    path.to_path_buf()
-                }
-            },
-        ));
-}
-
-pub(super) fn thread_response_sandbox_policy(
+pub(crate) fn thread_response_sandbox_policy(
     permission_profile: &codex_protocol::models::PermissionProfile,
     cwd: &Path,
 ) -> codex_app_server_protocol::SandboxPolicy {
-    let file_system_policy = permission_profile.file_system_sandbox_policy();
     let sandbox_policy = codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
         permission_profile,
-        &file_system_policy,
-        permission_profile.network_sandbox_policy(),
         cwd,
     );
     sandbox_policy.into()
 }
 
+pub(crate) fn thread_settings_from_config_snapshot(
+    config_snapshot: &ThreadConfigSnapshot,
+) -> ThreadSettings {
+    let active_environment_id = config_snapshot
+        .environment_selections()
+        .first()
+        .map(|sel| sel.environment_id.clone())
+        .filter(|id| id != codex_exec_server::LOCAL_ENVIRONMENT_ID);
+    ThreadSettings {
+        cwd: config_snapshot.cwd().clone(),
+        approval_policy: config_snapshot.approval_policy.into(),
+        approvals_reviewer: config_snapshot.approvals_reviewer.into(),
+        sandbox_policy: thread_response_sandbox_policy(
+            &config_snapshot.permission_profile,
+            config_snapshot.cwd().as_path(),
+        ),
+        active_permission_profile: thread_response_active_permission_profile(
+            config_snapshot.active_permission_profile.clone(),
+        ),
+        model: config_snapshot.model.clone(),
+        model_provider: config_snapshot.model_provider_id.clone(),
+        service_tier: config_snapshot.service_tier.clone(),
+        effort: config_snapshot.reasoning_effort.clone(),
+        summary: config_snapshot.reasoning_summary,
+        collaboration_mode: config_snapshot.collaboration_mode.clone(),
+        personality: config_snapshot.personality,
+        active_environment_id,
+    }
+}
+
+pub(crate) fn thread_settings_from_core_snapshot(
+    snapshot: codex_protocol::protocol::ThreadSettingsSnapshot,
+) -> ThreadSettings {
+    let codex_protocol::protocol::ThreadSettingsSnapshot {
+        model,
+        model_provider_id,
+        service_tier,
+        approval_policy,
+        approvals_reviewer,
+        permission_profile,
+        active_permission_profile,
+        cwd,
+        active_environment_id,
+        reasoning_effort,
+        reasoning_summary,
+        personality,
+        collaboration_mode,
+    } = snapshot;
+    let sandbox_policy = thread_response_sandbox_policy(&permission_profile, cwd.as_path());
+    ThreadSettings {
+        sandbox_policy,
+        cwd,
+        approval_policy: approval_policy.into(),
+        approvals_reviewer: approvals_reviewer.into(),
+        active_permission_profile: thread_response_active_permission_profile(
+            active_permission_profile,
+        ),
+        model,
+        model_provider: model_provider_id,
+        service_tier,
+        effort: reasoning_effort,
+        summary: reasoning_summary,
+        collaboration_mode,
+        personality,
+        active_environment_id,
+    }
+}
+
+#[cfg(test)]
 fn parse_datetime(timestamp: Option<&str>) -> Option<DateTime<Utc>> {
     timestamp.and_then(|ts| {
         chrono::DateTime::parse_from_rfc3339(ts)
@@ -229,6 +281,7 @@ pub(super) fn thread_started_notification(mut thread: Thread) -> ThreadStartedNo
     ThreadStartedNotification { thread }
 }
 
+#[cfg(test)]
 pub(crate) fn summary_to_thread(
     summary: ConversationSummary,
     fallback_cwd: &AbsolutePathBuf,
@@ -257,22 +310,26 @@ pub(crate) fn summary_to_thread(
         AbsolutePathBuf::relative_to_current_dir(path_utils::normalize_for_native_workdir(cwd))
             .unwrap_or_else(|err| {
                 warn!(
+                    conversation_id = %conversation_id,
                     path = %path.display(),
                     "failed to normalize thread cwd while summarizing thread: {err}"
                 );
                 fallback_cwd.clone()
             });
 
+    let thread_id = conversation_id.to_string();
     Thread {
-        id: conversation_id.to_string(),
+        id: thread_id.clone(),
+        session_id: thread_id,
         forked_from_id: None,
+        parent_thread_id: None,
         preview,
         ephemeral: false,
         model_provider,
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
         status: ThreadStatus::NotLoaded,
-        path: Some(path),
+        path: (!path.as_os_str().is_empty()).then_some(path),
         cwd,
         cli_version,
         agent_nickname: source.get_nickname(),

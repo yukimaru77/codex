@@ -51,6 +51,7 @@ impl SkillsLoadInput {
 pub struct SkillsManager {
     codex_home: AbsolutePathBuf,
     restriction_product: Option<Product>,
+    extra_roots: RwLock<Vec<AbsolutePathBuf>>,
     cache_by_cwd: RwLock<HashMap<AbsolutePathBuf, SkillLoadOutcome>>,
     cache_by_config: RwLock<HashMap<ConfigSkillsCacheKey, SkillLoadOutcome>>,
 }
@@ -68,6 +69,7 @@ impl SkillsManager {
         let manager = Self {
             codex_home,
             restriction_product,
+            extra_roots: RwLock::new(Vec::new()),
             cache_by_cwd: RwLock::new(HashMap::new()),
             cache_by_config: RwLock::new(HashMap::new()),
         };
@@ -79,6 +81,17 @@ impl SkillsManager {
             tracing::error!("failed to install system skills: {err}");
         }
         manager
+    }
+
+    pub fn set_extra_roots(&self, extra_roots: Vec<AbsolutePathBuf>) {
+        {
+            let mut roots = self
+                .extra_roots
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *roots = extra_roots;
+        }
+        self.clear_cache();
     }
 
     /// Load skills for an already-constructed [`Config`], avoiding any additional config-layer
@@ -118,6 +131,7 @@ impl SkillsManager {
             &input.config_layer_stack,
             &input.cwd,
             input.effective_skill_roots.clone(),
+            self.extra_roots(),
         )
         .await;
         if !input.bundled_skills_enabled {
@@ -130,17 +144,6 @@ impl SkillsManager {
         &self,
         input: &SkillsLoadInput,
         force_reload: bool,
-        fs: Option<Arc<dyn ExecutorFileSystem>>,
-    ) -> SkillLoadOutcome {
-        self.skills_for_cwd_with_extra_user_roots(input, force_reload, &[], fs)
-            .await
-    }
-
-    pub async fn skills_for_cwd_with_extra_user_roots(
-        &self,
-        input: &SkillsLoadInput,
-        force_reload: bool,
-        extra_user_roots: &[AbsolutePathBuf],
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> SkillLoadOutcome {
         let use_cwd_cache = fs.is_some();
@@ -156,22 +159,11 @@ impl SkillsManager {
             &input.config_layer_stack,
             &input.cwd,
             input.effective_skill_roots.clone(),
+            self.extra_roots(),
         )
         .await;
         if !bundled_skills_enabled_from_stack(&input.config_layer_stack) {
             roots.retain(|root| root.scope != SkillScope::System);
-        }
-        if let Some(fs) = fs {
-            roots.extend(
-                normalize_extra_user_roots(extra_user_roots)
-                    .into_iter()
-                    .map(|path| SkillRoot {
-                        path,
-                        scope: SkillScope::User,
-                        file_system: Arc::clone(&fs),
-                        plugin_id: None,
-                    }),
-            );
         }
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
         let outcome = self.build_skill_outcome(roots, &skill_config_rules).await;
@@ -237,6 +229,13 @@ impl SkillsManager {
             Err(err) => err.into_inner().get(cache_key).cloned(),
         }
     }
+
+    fn extra_roots(&self) -> Vec<AbsolutePathBuf> {
+        match self.extra_roots.read() {
+            Ok(roots) => roots.clone(),
+            Err(err) => err.into_inner().clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -298,16 +297,6 @@ fn finalize_skill_outcome(
     outcome.implicit_skills_by_scripts_dir = Arc::new(by_scripts_dir);
     outcome.implicit_skills_by_doc_path = Arc::new(by_doc_path);
     outcome
-}
-
-fn normalize_extra_user_roots(extra_user_roots: &[AbsolutePathBuf]) -> Vec<AbsolutePathBuf> {
-    let mut normalized: Vec<AbsolutePathBuf> = extra_user_roots
-        .iter()
-        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
-        .collect();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
 }
 
 #[cfg(test)]

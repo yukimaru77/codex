@@ -1,5 +1,6 @@
 use super::*;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+use codex_protocol::models::SearchToolCallParams;
 use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -61,10 +62,8 @@ fn mcp_code_mode_result_serializes_full_call_tool_result() {
         })),
     };
 
-    let result = output.code_mode_result(&ToolPayload::Mcp {
-        server: "server".to_string(),
-        tool: "tool".to_string(),
-        raw_arguments: "{}".to_string(),
+    let result = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
     });
 
     assert_eq!(
@@ -106,10 +105,8 @@ fn mcp_tool_output_response_item_includes_wall_time() {
 
     let response = output.to_response_item(
         "mcp-call-1",
-        &ToolPayload::Mcp {
-            server: "server".to_string(),
-            tool: "tool".to_string(),
-            raw_arguments: "{}".to_string(),
+        &ToolPayload::Function {
+            arguments: "{}".to_string(),
         },
     );
 
@@ -160,10 +157,8 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
 
     let response = output.to_response_item(
         "mcp-call-large",
-        &ToolPayload::Mcp {
-            server: "server".to_string(),
-            tool: "tool".to_string(),
-            raw_arguments: "{}".to_string(),
+        &ToolPayload::Function {
+            arguments: "{}".to_string(),
         },
     );
 
@@ -205,10 +200,8 @@ fn mcp_tool_output_response_item_preserves_content_items() {
 
     let response = output.to_response_item(
         "mcp-call-2",
-        &ToolPayload::Mcp {
-            server: "server".to_string(),
-            tool: "tool".to_string(),
-            raw_arguments: "{}".to_string(),
+        &ToolPayload::Function {
+            arguments: "{}".to_string(),
         },
     );
 
@@ -259,10 +252,8 @@ fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result() {
         truncation_policy: TruncationPolicy::Bytes(64),
     };
 
-    let result = output.code_mode_result(&ToolPayload::Mcp {
-        server: "server".to_string(),
-        tool: "tool".to_string(),
-        raw_arguments: "{}".to_string(),
+    let result = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
     });
 
     assert_eq!(
@@ -438,11 +429,13 @@ fn exec_command_tool_output_formats_truncated_response() {
         chunk_id: "abc123".to_string(),
         wall_time: std::time::Duration::from_millis(1250),
         raw_output: b"token one token two token three token four token five".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(4),
         process_id: None,
         exit_code: Some(0),
         original_token_count: Some(10),
         hook_command: None,
+        advisory: None,
     }
     .to_response_item("call-42", &payload);
 
@@ -464,6 +457,41 @@ fn exec_command_tool_output_formats_truncated_response() {
                     \n.*tokens\ truncated.*
                     $"#,
                 &text,
+            );
+        }
+        other => panic!("expected FunctionCallOutput, got {other:?}"),
+    }
+}
+
+#[test]
+fn exec_command_tool_output_appends_advisory_after_output() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let response = ExecCommandToolOutput {
+        event_call_id: "call-43".to_string(),
+        chunk_id: "abc124".to_string(),
+        wall_time: std::time::Duration::from_millis(1250),
+        raw_output: b"remote output\n".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: Some(0),
+        original_token_count: Some(2),
+        hook_command: None,
+        advisory: Some("Advisory: use env_switch for continued work.".to_string()),
+    }
+    .to_response_item("call-43", &payload);
+
+    match response {
+        ResponseInputItem::FunctionCallOutput { output, .. } => {
+            let text = output
+                .body
+                .to_text()
+                .expect("exec output should serialize as text");
+            assert!(
+                text.ends_with("remote output\n\nAdvisory: use env_switch for continued work."),
+                "{text}"
             );
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
