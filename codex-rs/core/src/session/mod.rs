@@ -52,7 +52,6 @@ use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
-use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::PromptSlot;
 use codex_features::FEATURES;
 use codex_features::Feature;
