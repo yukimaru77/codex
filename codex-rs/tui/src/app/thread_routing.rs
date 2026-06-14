@@ -1430,6 +1430,7 @@ impl App {
             &event,
             ThreadBufferedEvent::Notification(ServerNotification::TurnStarted(_))
                 | ThreadBufferedEvent::Notification(ServerNotification::ThreadTokenUsageUpdated(_))
+                | ThreadBufferedEvent::Notification(ServerNotification::ThreadSettingsUpdated(_))
         );
         match event {
             ThreadBufferedEvent::Notification(notification) => {

@@ -79,11 +79,14 @@ pub(crate) fn resolve_environment_selections(
             .ok_or_else(|| {
                 CodexErr::InvalidRequest(format!("unknown turn environment id `{environment_id}`"))
             })?;
+        let shell = environment_manager
+            .get_environment_metadata(&environment_id)
+            .and_then(|metadata| metadata.shell);
         turn_environments.push(TurnEnvironment {
             environment_id,
             environment,
             cwd: selected_environment.cwd.clone(),
-            shell: None,
+            shell,
         });
     }
 
@@ -217,6 +220,41 @@ url = "ws://127.0.0.1:8765"
             "local"
         );
         assert_eq!(resolved.primary().expect("primary environment").shell, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_environment_selections_restores_shell_metadata() {
+        let cwd = AbsolutePathBuf::current_dir().expect("cwd");
+        let manager = EnvironmentManager::create_for_tests(
+            Some("ws://127.0.0.1:8765".to_string()),
+            Some(test_runtime_paths()),
+        )
+        .await;
+        manager.set_environment_metadata(
+            REMOTE_ENVIRONMENT_ID.to_string(),
+            codex_exec_server::EnvironmentMetadata {
+                cwd: "/remote".to_string(),
+                shell: Some("/bin/sh".to_string()),
+            },
+        );
+
+        let resolved = resolve_environment_selections(
+            &manager,
+            &[TurnEnvironmentSelection {
+                environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+                cwd,
+            }],
+        )
+        .expect("remote environment should resolve");
+
+        assert_eq!(
+            resolved
+                .primary()
+                .expect("primary environment")
+                .shell
+                .as_deref(),
+            Some("/bin/sh")
+        );
     }
 
     #[tokio::test]
