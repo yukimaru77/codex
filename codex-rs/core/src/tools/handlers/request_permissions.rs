@@ -66,7 +66,7 @@ impl ToolExecutor<ToolInvocation> for RequestPermissionsHandler {
         .await?
         else {
             return Err(FunctionCallError::RespondToModel(
-                "request_permissions requires a primary environment".to_string(),
+                "request_permissions requires a default execution environment".to_string(),
             ));
         };
         let mut args: RequestPermissionsArgs =
