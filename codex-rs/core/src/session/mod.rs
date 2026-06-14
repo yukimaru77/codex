@@ -508,15 +508,15 @@ impl Codex {
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
-        let primary_environment = environment_selections.primary_environment();
         let mut user_instruction_warnings = Vec::new();
-        let user_instructions = if let Some(primary_environment) = primary_environment {
-            AgentsMdManager::new(&config)
-                .user_instructions(primary_environment.as_ref(), &mut user_instruction_warnings)
-                .await
-        } else {
-            None
-        };
+        let user_instructions =
+            if let Some(local_environment) = environment_manager.try_local_environment() {
+                AgentsMdManager::new(&config)
+                    .user_instructions(local_environment.as_ref(), &mut user_instruction_warnings)
+                    .await
+            } else {
+                None
+            };
         config.startup_warnings.extend(user_instruction_warnings);
 
         let exec_policy = if crate::guardian::is_guardian_reviewer_source(&session_source) {
