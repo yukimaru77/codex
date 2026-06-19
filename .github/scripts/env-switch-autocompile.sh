@@ -20,6 +20,7 @@ HEARTBEAT_SECONDS="${ENV_SWITCH_HEARTBEAT_SECONDS:-60}"
 HEARTBEAT_PID=""
 CMUX_POLL_SECS="${ENV_SWITCH_CMUX_POLL_SECS:-30}"
 CMUX_TIMEOUT_SECS="${ENV_SWITCH_CMUX_TIMEOUT_SECS:-21600}"
+CMUX_MODEL_LOADING_TIMEOUT_SECS="${ENV_SWITCH_CMUX_MODEL_LOADING_TIMEOUT_SECS:-180}"
 CMUX_CREATE_ATTEMPTS="${ENV_SWITCH_CMUX_CREATE_ATTEMPTS:-3}"
 CMUX_CODEX_READY_ATTEMPTS="${ENV_SWITCH_CMUX_CODEX_READY_ATTEMPTS:-120}"
 CMUX_KEEP_WORKSPACE="${ENV_SWITCH_KEEP_CMUX_WORKSPACE:-false}"
@@ -272,11 +273,49 @@ resolve_cmux_surface() {
   local workspace="$1"
   local surface=""
   for _ in $(seq 1 60); do
-    surface="$(CMUX_QUIET=1 cmux_cli list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" 2>/dev/null | rg -o 'surface:[0-9]+' | head -1 || true)"
+    surface="$(CMUX_QUIET=1 cmux_cli list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" --id-format both 2>/dev/null |
+      awk '
+        match($0, /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/) {
+          print substr($0, RSTART, RLENGTH)
+          exit
+        }
+        match($0, /surface:[0-9]+/) {
+          print substr($0, RSTART, RLENGTH)
+          exit
+        }
+      ' || true)"
     [ -n "$surface" ] && break
     sleep 1
   done
   printf '%s\n' "$surface"
+}
+
+resolve_cmux_workspace() {
+  local workspace="$1"
+  local workspace_name="$2"
+  local line=""
+
+  line="$(CMUX_QUIET=1 cmux_cli workspace list "${CMUX_WINDOW_ARGS[@]}" --id-format both 2>/dev/null |
+    awk -v workspace="$workspace" '$0 ~ workspace { print; exit }' || true)"
+  if [ -z "$line" ]; then
+    line="$(CMUX_QUIET=1 cmux_cli workspace list "${CMUX_WINDOW_ARGS[@]}" --id-format both 2>/dev/null |
+      awk -v workspace_name="$workspace_name" 'index($0, workspace_name) { print; exit }' || true)"
+  fi
+
+  local workspace_uuid=""
+  workspace_uuid="$(printf '%s\n' "$line" |
+    rg -o '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' |
+    head -1 || true)"
+  if [ -n "$workspace_uuid" ]; then
+    printf '%s\n' "$workspace_uuid"
+  else
+    printf '%s\n' "$workspace"
+  fi
+}
+
+cmux_workspace_exists() {
+  local workspace="$1"
+  CMUX_QUIET=1 cmux_cli list-panes --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" >/dev/null 2>&1
 }
 
 prime_codex_surface() {
@@ -302,13 +341,29 @@ collect_cmux_transcripts() {
   local workspace="$1"
   local prefix="$2"
   local surfaces_file="$ARTIFACT_DIR/$prefix-surfaces.txt"
-  CMUX_QUIET=1 cmux_cli list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" > "$surfaces_file" 2>/dev/null || true
+  CMUX_QUIET=1 cmux_cli list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" --id-format both > "$surfaces_file" 2>/dev/null || true
   while IFS= read -r surface; do
     [ -n "$surface" ] || continue
     local surface_file="${surface//:/-}"
     CMUX_QUIET=1 cmux_cli read-screen --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" --scrollback --lines 5000 \
       > "$ARTIFACT_DIR/$prefix-$surface_file.txt" 2>/dev/null || true
-  done < <(rg -o 'surface:[0-9]+' "$surfaces_file" || true)
+  done < <(
+    awk '
+      match($0, /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/) {
+        print substr($0, RSTART, RLENGTH)
+        next
+      }
+      match($0, /surface:[0-9]+/) {
+        print substr($0, RSTART, RLENGTH)
+      }
+    ' "$surfaces_file" || true
+  )
+}
+
+cmux_transcripts_match() {
+  local prefix="$1"
+  local pattern="$2"
+  rg -qi "$pattern" "$ARTIFACT_DIR"/"$prefix"-*.txt 2>/dev/null
 }
 
 send_file_to_cmux() {
@@ -401,6 +456,8 @@ run_codex_prompt() {
     return 1
   fi
   printf '%s\n' "$workspace" > "$workspace_file"
+  workspace="$(resolve_cmux_workspace "$workspace" "$workspace_name")"
+  printf '%s\n' "$workspace" > "$workspace_file"
 
   local surface
   surface="$(resolve_cmux_surface "$workspace")"
@@ -438,16 +495,38 @@ run_codex_prompt() {
   send_file_to_cmux "$workspace" "$surface" "$send_prompt_file"
 
   local deadline=$((SECONDS + CMUX_TIMEOUT_SECS))
+  local model_loading_since=""
   local result=""
   while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! cmux_workspace_exists "$workspace"; then
+      echo "cmux workspace disappeared: $workspace" | tee -a "$output_file"
+      result="workspace_missing"
+      break
+    fi
     collect_cmux_transcripts "$workspace" "$transcript_prefix"
-    if rg -q '^ENV_SWITCH_PORT_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface-*.txt 2>/dev/null; then
-      if [ "${RUN_ENV_SWITCH_E2E:-true}" != "true" ] || rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface-*.txt 2>/dev/null; then
+    if cmux_transcripts_match "$transcript_prefix" "You've hit your usage limit|Goal hit usage limits|5h limit:.*0% left"; then
+      echo "cmux /goal autocompile hit Codex usage limits" | tee -a "$output_file"
+      result="usage_limited"
+      break
+    fi
+    if cmux_transcripts_match "$transcript_prefix" 'model:[[:space:]]+loading'; then
+      if [ -z "$model_loading_since" ]; then
+        model_loading_since="$SECONDS"
+      elif [ $((SECONDS - model_loading_since)) -ge "$CMUX_MODEL_LOADING_TIMEOUT_SECS" ]; then
+        echo "cmux /goal autocompile stayed at model loading for ${CMUX_MODEL_LOADING_TIMEOUT_SECS}s" | tee -a "$output_file"
+        result="model_loading_timeout"
+        break
+      fi
+    else
+      model_loading_since=""
+    fi
+    if rg -q '^ENV_SWITCH_PORT_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-*.txt 2>/dev/null; then
+      if [ "${RUN_ENV_SWITCH_E2E:-true}" != "true" ] || rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-*.txt 2>/dev/null; then
         result="pass"
         break
       fi
     fi
-    if rg -q '^ENV_SWITCH_PORT_FAIL$|^ENV_SWITCH_E2E_FAIL$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface-*.txt 2>/dev/null; then
+    if rg -q '^ENV_SWITCH_PORT_FAIL$|^ENV_SWITCH_E2E_FAIL$' "$ARTIFACT_DIR"/"$transcript_prefix"-*.txt 2>/dev/null; then
       result="fail"
       break
     fi
@@ -463,6 +542,18 @@ run_codex_prompt() {
       ;;
     fail)
       echo "cmux /goal autocompile reported failure" | tee -a "$output_file"
+      status=1
+      ;;
+    usage_limited)
+      echo "cmux /goal autocompile stopped because Codex usage limits were reached" | tee -a "$output_file"
+      status=75
+      ;;
+    model_loading_timeout)
+      echo "cmux /goal autocompile stopped because model loading did not complete" | tee -a "$output_file"
+      status=124
+      ;;
+    workspace_missing)
+      echo "cmux /goal autocompile stopped because the cmux workspace disappeared" | tee -a "$output_file"
       status=1
       ;;
     *)
@@ -500,7 +591,7 @@ validate_worktree() {
   fi
 
   if [ "${RUN_ENV_SWITCH_E2E:-true}" = "true" ]; then
-    if ! rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"attempt-$attempt-cmux"-surface-*.txt 2>/dev/null; then
+    if ! rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"attempt-$attempt-cmux"-*.txt 2>/dev/null; then
       echo "missing ENV_SWITCH_E2E_PASS in cmux transcripts" | tee "$LOG_DIR/attempt-$attempt-e2e-marker.log"
       return 1
     fi
