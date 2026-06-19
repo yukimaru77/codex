@@ -16,14 +16,13 @@ ARTIFACT_BASE="${RUNNER_TEMP:-$REPO_ROOT/artifacts}"
 ARTIFACT_DIR="${ENV_SWITCH_ARTIFACT_DIR:-$ARTIFACT_BASE/env-switch-autocompile}"
 LOG_DIR="$ARTIFACT_DIR/logs"
 MAX_ATTEMPTS="${ENV_SWITCH_CODEX_ATTEMPTS:-3}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-E2E_SCRIPT="$ARTIFACT_DIR/env-switch-e2e.sh"
 HEARTBEAT_SECONDS="${ENV_SWITCH_HEARTBEAT_SECONDS:-60}"
 HEARTBEAT_PID=""
+CMUX_POLL_SECS="${ENV_SWITCH_CMUX_POLL_SECS:-30}"
+CMUX_TIMEOUT_SECS="${ENV_SWITCH_CMUX_TIMEOUT_SECS:-21600}"
+CMUX_KEEP_WORKSPACE="${ENV_SWITCH_KEEP_CMUX_WORKSPACE:-false}"
 
 mkdir -p "$LOG_DIR"
-cp "$SCRIPT_DIR/env-switch-e2e.sh" "$E2E_SCRIPT"
-chmod +x "$E2E_SCRIPT"
 
 cd "$REPO_ROOT"
 
@@ -95,7 +94,7 @@ write_port_prompt() {
   local attempt="$1"
   local prompt_file="$ARTIFACT_DIR/port-prompt-$attempt.md"
   cat > "$prompt_file" <<EOF
-You are porting the env_switch runtime execution-target prototype to a new upstream Codex Rust release.
+/goal Port the env_switch runtime execution-target prototype to a new upstream Codex Rust release.
 
 Target upstream tag: $TARGET_TAG
 New branch: $NEW_BRANCH
@@ -108,7 +107,12 @@ Context files in this run:
 - $ARTIFACT_DIR/latest-failure-context.md, if present
 
 Goal:
-Port the env_switch implementation from the previous env-switch branch onto $TARGET_TAG with the smallest coherent change.
+Create/complete the $NEW_BRANCH implementation starting from $TARGET_TAG.
+$PREVIOUS_BRANCH compared with $PREVIOUS_TAG is the working, production-like
+reference implementation. It has been tested manually and should be treated as
+the canonical feature behavior. Use that diff and commit list as the primary
+reference, but adapt the code to the current upstream APIs instead of blindly
+copying old code.
 
 Feature intent:
 - Runtime execution targets for local, SSH, Docker, and nested SSH > Docker environments.
@@ -129,6 +133,29 @@ Required local verification:
 - Do not run cargo test directly.
 - Follow AGENTS.md instructions in this repository.
 
+RUN_ENV_SWITCH_E2E: ${RUN_ENV_SWITCH_E2E:-true}
+
+Required manual E2E as part of this same goal when RUN_ENV_SWITCH_E2E is true:
+- If RUN_ENV_SWITCH_E2E is false, skip this E2E section and do not emit
+  ENV_SWITCH_E2E_PASS.
+- After the implementation builds, build the interactive Codex binary from this
+  worktree with:
+  cargo build --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex
+- In cmux, open a new tab/surface in this same workspace. Do not create a new
+  workspace for the E2E tab.
+  Use cmux's tab/surface commands such as \`cmux new-surface --type terminal\`
+  in the current workspace; do not use \`cmux new-workspace\` for this E2E.
+- In that new tab/surface, run the built binary:
+  $REPO_ROOT/codex-rs/target/debug/codex --sandbox danger-full-access --ask-for-approval never --enable env_switch --no-alt-screen
+- If Codex startup asks for a harmless confirmation or first-run prompt, answer
+  it appropriately and continue.
+- Send this E2E prompt to that built Codex:
+
+  /goal Validate env_switch end to end with subagents only. This E2E exists to prove that the goal command works, that subagents keep working after only the subagents switch environments, that SSH and Docker nesting work, and that the run is not merely passing by using raw shell ssh/docker wrappers. The main agent should coordinate and summarize but must not run remote SSH, Docker, or benchmark commands directly. Use exactly two subagents: Agent A targets ssh saitou, Agent B targets ssh saitou-h200. Each subagent must start by switching to its SSH target with env_switch; create or reuse a uniquely named GPU-capable Docker container on that SSH host; switch into the nested target with env_switch so subsequent commands run in an environment id shaped like ssh:<host>>docker:<container>; run a PyTorch CPU vs GPU matrix multiplication benchmark inside the nested Docker target; use the same matrix size, warmups, and repetitions for CPU and GPU on both hosts; and report transcript evidence including environment_id, container name/id, GPU model, PyTorch version, CUDA availability, benchmark parameters, CPU timing, and GPU timing. The pass condition is that /goal behavior, subagent delegation, SSH env_switch, nested Docker env_switch, remote provisioning, and environment-aware exec all work together through real work. If env_switch cannot register a target, report the exact fallback reason and fail instead of silently continuing with repeated raw ssh/docker wrappers. If raw ssh/docker shell wrappers are used to bypass env_switch, this E2E fails. When validation passes, finish with a line containing exactly ENV_SWITCH_E2E_PASS. If validation cannot pass, finish with a line containing exactly ENV_SWITCH_E2E_FAIL.
+
+- The overall port is not complete until the E2E tab transcript contains
+  ENV_SWITCH_E2E_PASS.
+
 Compatibility notes from the rust-v0.141 port path:
 - ToolExecutor implementations use boxed futures rather than async_trait.
 - TurnEnvironment fields are private on newer upstreams; use constructors and
@@ -140,6 +167,12 @@ Compatibility notes from the rust-v0.141 port path:
 
 If the repository is in the middle of a rebase or has conflicts, resolve them and continue the port.
 Keep changes focused on env_switch and compatibility with the new upstream tag.
+
+When everything is complete, finish your final answer with a line containing exactly:
+ENV_SWITCH_PORT_PASS
+
+If you cannot complete the port, finish with a line containing exactly:
+ENV_SWITCH_PORT_FAIL
 EOF
 
   if [ -f "$ARTIFACT_DIR/latest-failure-context.md" ]; then
@@ -151,6 +184,59 @@ EOF
     } >> "$prompt_file"
   fi
   printf '%s\n' "$prompt_file"
+}
+
+resolve_cmux_surface() {
+  local workspace="$1"
+  local surface=""
+  for _ in $(seq 1 60); do
+    surface="$(CMUX_QUIET=1 cmux list-pane-surfaces --workspace "$workspace" 2>/dev/null | rg -o 'surface:[0-9]+' | head -1 || true)"
+    [ -n "$surface" ] && break
+    sleep 1
+  done
+  printf '%s\n' "$surface"
+}
+
+prime_codex_surface() {
+  local workspace="$1"
+  local surface="$2"
+  local screen=""
+  for _ in $(seq 1 8); do
+    screen="$(CMUX_QUIET=1 cmux read-screen --workspace "$workspace" --surface "$surface" --scrollback --lines 80 2>/dev/null || true)"
+    if printf '%s\n' "$screen" | rg -qi 'press enter|continue|confirm|trust|first run|welcome'; then
+      CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "\n" >/dev/null 2>&1 || true
+    fi
+    if printf '%s\n' "$screen" | rg -q 'Codex|codex|Type|ask|model|›|>'; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 0
+}
+
+collect_cmux_transcripts() {
+  local workspace="$1"
+  local prefix="$2"
+  local surfaces_file="$ARTIFACT_DIR/$prefix-surfaces.txt"
+  CMUX_QUIET=1 cmux list-pane-surfaces --workspace "$workspace" > "$surfaces_file" 2>/dev/null || true
+  while IFS= read -r surface; do
+    [ -n "$surface" ] || continue
+    CMUX_QUIET=1 cmux read-screen --workspace "$workspace" --surface "$surface" --scrollback --lines 5000 \
+      > "$ARTIFACT_DIR/$prefix-$surface.txt" 2>/dev/null || true
+  done < <(rg -o 'surface:[0-9]+' "$surfaces_file" || true)
+}
+
+send_file_to_cmux() {
+  local workspace="$1"
+  local surface="$2"
+  local file="$3"
+  local chunk_size="${ENV_SWITCH_CMUX_SEND_CHUNK_SIZE:-2000}"
+  local chunk=""
+  while IFS= read -r -n "$chunk_size" chunk || [ -n "$chunk" ]; do
+    CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "$chunk" >/dev/null
+    chunk=""
+  done < "$file"
+  CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "\n" >/dev/null
 }
 
 run_codex_prompt() {
@@ -168,11 +254,107 @@ run_codex_prompt() {
     return "$status"
   fi
 
-  start_heartbeat "codex attempt $(basename "$prompt_file")"
+  if ! command -v cmux >/dev/null 2>&1; then
+    echo "cmux is required for /goal autocompile but was not found on PATH" | tee "$output_file"
+    return 127
+  fi
+
+  local codex_bin="${CODEX_AUTOCOMPILE_CODEX_BIN:-}"
+  if [ -z "$codex_bin" ]; then
+    codex_bin="$(command -v codex || true)"
+  fi
+  if [ -z "$codex_bin" ]; then
+    echo "codex is required for /goal autocompile but was not found on PATH" | tee "$output_file"
+    return 127
+  fi
+
+  local attempt_name
+  attempt_name="$(basename "$prompt_file" .md)"
+  local workspace_name="env-switch-port-${TARGET_TAG}-${attempt_name}-${GITHUB_RUN_ID:-local}"
+  local workspace_file="$ARTIFACT_DIR/$attempt_name-workspace.txt"
+  local transcript_prefix="$attempt_name-cmux"
+  local codex_command="$codex_bin --sandbox danger-full-access --ask-for-approval never --no-alt-screen"
+
+  start_heartbeat "cmux /goal $attempt_name"
   set +e
-  codex --sandbox danger-full-access --ask-for-approval never exec - < "$prompt_file" \
-    2>&1 | tee "$output_file"
-  local status=${PIPESTATUS[0]}
+  {
+    echo "==> creating cmux workspace: $workspace_name"
+    CMUX_QUIET=1 cmux new-workspace \
+      --name "$workspace_name" \
+      --description "env_switch port coordinator for ${GITHUB_RUN_ID:-local}" \
+      --cwd "$REPO_ROOT" \
+      --command "$codex_command" \
+      --focus false
+  } 2>&1 | tee "$output_file"
+  local create_status=${PIPESTATUS[0]}
+  set -e
+  if [ "$create_status" -ne 0 ]; then
+    stop_heartbeat
+    return "$create_status"
+  fi
+
+  local workspace
+  workspace="$(rg -o 'workspace:[0-9]+' "$output_file" | tail -1 || true)"
+  if [ -z "$workspace" ]; then
+    echo "failed to determine cmux workspace ref" | tee -a "$output_file"
+    stop_heartbeat
+    return 1
+  fi
+  printf '%s\n' "$workspace" > "$workspace_file"
+
+  local surface
+  surface="$(resolve_cmux_surface "$workspace")"
+  if [ -z "$surface" ]; then
+    echo "failed to determine cmux surface for $workspace" | tee -a "$output_file"
+    stop_heartbeat
+    return 1
+  fi
+
+  prime_codex_surface "$workspace" "$surface"
+
+  local send_prompt_file="$ARTIFACT_DIR/$attempt_name-goal-one-line.txt"
+  tr '\n' ' ' < "$prompt_file" | sed -E 's/[[:space:]]+/ /g' > "$send_prompt_file"
+  echo "==> sending /goal prompt to $workspace $surface" | tee -a "$output_file"
+  send_file_to_cmux "$workspace" "$surface" "$send_prompt_file"
+
+  local deadline=$((SECONDS + CMUX_TIMEOUT_SECS))
+  local result=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    collect_cmux_transcripts "$workspace" "$transcript_prefix"
+    if rg -q '^ENV_SWITCH_PORT_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface:*.txt 2>/dev/null; then
+      if [ "${RUN_ENV_SWITCH_E2E:-true}" != "true" ] || rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface:*.txt 2>/dev/null; then
+        result="pass"
+        break
+      fi
+    fi
+    if rg -q '^ENV_SWITCH_PORT_FAIL$|^ENV_SWITCH_E2E_FAIL$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface:*.txt 2>/dev/null; then
+      result="fail"
+      break
+    fi
+    sleep "$CMUX_POLL_SECS"
+  done
+
+  collect_cmux_transcripts "$workspace" "$transcript_prefix"
+
+  local status=0
+  case "$result" in
+    pass)
+      echo "cmux /goal autocompile passed" | tee -a "$output_file"
+      ;;
+    fail)
+      echo "cmux /goal autocompile reported failure" | tee -a "$output_file"
+      status=1
+      ;;
+    *)
+      echo "cmux /goal autocompile timed out after ${CMUX_TIMEOUT_SECS}s" | tee -a "$output_file"
+      status=124
+      ;;
+  esac
+
+  if [ "$CMUX_KEEP_WORKSPACE" != "true" ]; then
+    CMUX_QUIET=1 cmux close-workspace --workspace "$workspace" >/dev/null 2>&1 || true
+  fi
+
   set -e
   stop_heartbeat
   return "$status"
@@ -198,13 +380,18 @@ validate_worktree() {
   fi
 
   if [ "${RUN_ENV_SWITCH_E2E:-true}" = "true" ]; then
-    run_logged "attempt-$attempt-e2e" "$E2E_SCRIPT" || return 1
+    if ! rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"attempt-$attempt-cmux"-surface:*.txt 2>/dev/null; then
+      echo "missing ENV_SWITCH_E2E_PASS in cmux transcripts" | tee "$LOG_DIR/attempt-$attempt-e2e-marker.log"
+      return 1
+    fi
   fi
 }
 
 git fetch --no-tags --prune origin \
   "+refs/heads/main:refs/remotes/origin/main" \
   "+refs/heads/$PREVIOUS_BRANCH:refs/remotes/origin/$PREVIOUS_BRANCH"
+git fetch --no-tags origin \
+  "+refs/heads/$NEW_BRANCH:refs/remotes/origin/$NEW_BRANCH" >/dev/null 2>&1 || true
 git fetch --no-tags upstream \
   "+refs/tags/$TARGET_TAG:refs/tags/$TARGET_TAG" \
   "+refs/tags/$PREVIOUS_TAG:refs/tags/$PREVIOUS_TAG"
@@ -226,15 +413,7 @@ fi
 git diff --binary "$PREVIOUS_TAG..$PREVIOUS_REF" > "$ARTIFACT_DIR/previous-env-switch.diff"
 git log --oneline --reverse "$PREVIOUS_TAG..$PREVIOUS_REF" > "$ARTIFACT_DIR/previous-env-switch-commits.txt"
 
-git switch -C "$NEW_BRANCH" "$PREVIOUS_REF"
-
-set +e
-git rebase --onto "$TARGET_TAG" "$PREVIOUS_TAG"
-rebase_status=$?
-set -e
-if [ "$rebase_status" -ne 0 ]; then
-  echo "Initial rebase stopped with conflicts; Codex will resolve them." | tee "$LOG_DIR/initial-rebase.log"
-fi
+git switch -C "$NEW_BRANCH" "$TARGET_TAG"
 
 success=false
 for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
@@ -301,6 +480,6 @@ Artifacts include:
 - previous env-switch diff and commit list
 - Codex attempt logs
 - test logs
-- E2E transcript
+- cmux coordinator and E2E tab transcripts
 - final diff patch and stat
 EOF
