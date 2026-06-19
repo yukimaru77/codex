@@ -114,6 +114,15 @@ the canonical feature behavior. Use that diff and commit list as the primary
 reference, but adapt the code to the current upstream APIs instead of blindly
 copying old code.
 
+Before editing:
+- Read and understand the relevant current upstream code paths first. Do not
+  start by mechanically applying the old patch.
+- Compare the previous env-switch diff against the current code and identify
+  where upstream APIs or ownership boundaries changed.
+- Use subagents when they help with parallel code reading, compatibility
+  investigation, or test failure triage. Keep their tasks scoped and verify
+  their conclusions before editing.
+
 Feature intent:
 - Runtime execution targets for local, SSH, Docker, and nested SSH > Docker environments.
 - env_switch registers targets and makes them the default for compatible tool calls.
