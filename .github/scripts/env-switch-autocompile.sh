@@ -89,6 +89,13 @@ run_logged_shell() {
   return "$status"
 }
 
+reset_ci_worktree() {
+  git rebase --abort >/dev/null 2>&1 || true
+  git merge --abort >/dev/null 2>&1 || true
+  git reset --hard
+  git clean -ffdx -e codex-rs/target/
+}
+
 latest_failure_context() {
   {
     echo "# Latest failure context"
@@ -624,7 +631,9 @@ fi
 git diff --binary "$PREVIOUS_TAG..$PREVIOUS_REF" > "$ARTIFACT_DIR/previous-env-switch.diff"
 git log --oneline --reverse "$PREVIOUS_TAG..$PREVIOUS_REF" > "$ARTIFACT_DIR/previous-env-switch-commits.txt"
 
-git switch -C "$NEW_BRANCH" "$TARGET_TAG"
+reset_ci_worktree
+git switch --discard-changes -C "$NEW_BRANCH" "$TARGET_TAG"
+git clean -ffdx -e codex-rs/target/
 
 success=false
 for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
