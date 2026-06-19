@@ -159,6 +159,20 @@ jobs:
 
       - name: Port and validate
         run: |
+          caffeinate_pid=""
+          cleanup() {
+            if [ -n "$caffeinate_pid" ]; then
+              kill "$caffeinate_pid" 2>/dev/null || true
+              wait "$caffeinate_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          if command -v caffeinate >/dev/null 2>&1; then
+            caffeinate -dimsu -w "$$" &
+            caffeinate_pid=$!
+          fi
+
           run_port_and_validate() {
             .github/scripts/env-switch-autocompile.sh \
               "${{ needs.detect.outputs.target_tag }}" \
@@ -167,11 +181,7 @@ jobs:
               "${{ needs.detect.outputs.previous_tag }}"
           }
 
-          if command -v caffeinate >/dev/null 2>&1; then
-            caffeinate -dimsu bash -c "$(declare -f run_port_and_validate); run_port_and_validate"
-          else
-            run_port_and_validate
-          fi
+          run_port_and_validate
 
       - name: Create or update PR
         if: success()
