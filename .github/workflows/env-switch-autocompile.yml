@@ -1,0 +1,188 @@
+name: env-switch-autocompile
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: "Target upstream rust tag, e.g. rust-v0.141.0. Leave empty for latest stable rust-v tag."
+        required: false
+        type: string
+      previous_branch:
+        description: "Previous env-switch branch to port from. Leave empty for latest origin/env-switch-v* below target."
+        required: false
+        type: string
+      run_e2e:
+        description: "Run the SSH/Docker nested remote E2E after unit/integration/TUI tests."
+        required: true
+        default: true
+        type: boolean
+      force:
+        description: "Run even if the target env-switch branch already exists."
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 18 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: env-switch-autocompile
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect new upstream rust tag
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.detect.outputs.should_run }}
+      target_tag: ${{ steps.detect.outputs.target_tag }}
+      target_series: ${{ steps.detect.outputs.target_series }}
+      previous_branch: ${{ steps.detect.outputs.previous_branch }}
+      previous_tag: ${{ steps.detect.outputs.previous_tag }}
+      new_branch: ${{ steps.detect.outputs.new_branch }}
+    steps:
+      - name: Detect target and previous env-switch branch
+        id: detect
+        env:
+          TARGET_TAG_INPUT: ${{ inputs.target_tag }}
+          PREVIOUS_BRANCH_INPUT: ${{ inputs.previous_branch }}
+          FORCE_INPUT: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          stable_tags="$(git ls-remote --tags https://github.com/openai/codex.git 'refs/tags/rust-v*' \
+            | awk '{print $2}' \
+            | sed 's#refs/tags/##' \
+            | grep -E '^rust-v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V)"
+
+          target_tag="${TARGET_TAG_INPUT:-}"
+          if [ -z "$target_tag" ]; then
+            target_tag="$(printf '%s\n' "$stable_tags" | tail -1)"
+          fi
+          if ! printf '%s\n' "$stable_tags" | grep -qx "$target_tag"; then
+            echo "Unknown stable upstream rust tag: $target_tag" >&2
+            exit 1
+          fi
+
+          version="${target_tag#rust-v}"
+          target_series="$(printf '%s\n' "$version" | awk -F. '{print $1 "." $2}')"
+          new_branch="env-switch-v${target_series}"
+
+          env_branches="$(git ls-remote --heads https://github.com/yukimaru77/codex.git 'refs/heads/env-switch-v*' \
+            | awk '{print $2}' \
+            | sed 's#refs/heads/##' \
+            | sort -V)"
+
+          previous_branch="${PREVIOUS_BRANCH_INPUT:-}"
+          if [ -z "$previous_branch" ]; then
+            previous_branch="$(printf '%s\n%s\n' "$env_branches" "$new_branch" \
+              | sort -V \
+              | awk -v target="$new_branch" '$0 == target {print previous; exit} {previous = $0}')"
+          fi
+          if [ -z "$previous_branch" ]; then
+            echo "Could not infer previous env-switch branch below $new_branch" >&2
+            exit 1
+          fi
+
+          previous_series="${previous_branch#env-switch-v}"
+          previous_tag="rust-v${previous_series}.0"
+
+          branch_exists=false
+          if printf '%s\n' "$env_branches" | grep -qx "$new_branch"; then
+            branch_exists=true
+          fi
+
+          force="${FORCE_INPUT:-false}"
+          should_run=true
+          if [ "$branch_exists" = true ] && [ "$force" != true ]; then
+            should_run=false
+          fi
+
+          {
+            echo "target_tag=$target_tag"
+            echo "target_series=$target_series"
+            echo "previous_branch=$previous_branch"
+            echo "previous_tag=$previous_tag"
+            echo "new_branch=$new_branch"
+            echo "should_run=$should_run"
+          } >> "$GITHUB_OUTPUT"
+
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          target tag: \`$target_tag\`
+          previous branch: \`$previous_branch\`
+          previous tag: \`$previous_tag\`
+          new branch: \`$new_branch\`
+          should run: \`$should_run\`
+          EOF
+
+  port-and-test:
+    name: Port env-switch and run tests
+    needs: detect
+    if: needs.detect.outputs.should_run == 'true'
+    runs-on: [self-hosted, env-switch-e2e]
+    timeout-minutes: 1440
+    env:
+      RUN_ENV_SWITCH_E2E: ${{ inputs.run_e2e || github.event_name == 'schedule' }}
+      CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          repository: yukimaru77/codex
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure remotes
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/openai/codex.git
+          git fetch --tags --prune origin
+          git fetch --tags --prune upstream
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Port and validate
+        run: |
+          .github/scripts/env-switch-autocompile.sh \
+            "${{ needs.detect.outputs.target_tag }}" \
+            "${{ needs.detect.outputs.previous_branch }}" \
+            "${{ needs.detect.outputs.new_branch }}" \
+            "${{ needs.detect.outputs.previous_tag }}"
+
+      - name: Create or update PR
+        if: success()
+        env:
+          TARGET_TAG: ${{ needs.detect.outputs.target_tag }}
+          NEW_BRANCH: ${{ needs.detect.outputs.new_branch }}
+          PREVIOUS_BRANCH: ${{ needs.detect.outputs.previous_branch }}
+        run: |
+          set -euo pipefail
+          if gh pr view "$NEW_BRANCH" --repo yukimaru77/codex >/dev/null 2>&1; then
+            gh pr edit "$NEW_BRANCH" \
+              --repo yukimaru77/codex \
+              --title "Port env_switch to ${TARGET_TAG}" \
+              --body-file "$RUNNER_TEMP/env-switch-autocompile/pr-body.md"
+          else
+            gh pr create \
+              --repo yukimaru77/codex \
+              --base main \
+              --head "$NEW_BRANCH" \
+              --title "Port env_switch to ${TARGET_TAG}" \
+              --body-file "$RUNNER_TEMP/env-switch-autocompile/pr-body.md"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-switch-autocompile-${{ needs.detect.outputs.new_branch }}
+          path: ${{ runner.temp }}/env-switch-autocompile
+          if-no-files-found: warn
