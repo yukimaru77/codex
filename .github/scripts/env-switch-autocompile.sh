@@ -18,6 +18,8 @@ LOG_DIR="$ARTIFACT_DIR/logs"
 MAX_ATTEMPTS="${ENV_SWITCH_CODEX_ATTEMPTS:-3}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_SCRIPT="$ARTIFACT_DIR/env-switch-e2e.sh"
+HEARTBEAT_SECONDS="${ENV_SWITCH_HEARTBEAT_SECONDS:-60}"
+HEARTBEAT_PID=""
 
 mkdir -p "$LOG_DIR"
 cp "$SCRIPT_DIR/env-switch-e2e.sh" "$E2E_SCRIPT"
@@ -25,15 +27,38 @@ chmod +x "$E2E_SCRIPT"
 
 cd "$REPO_ROOT"
 
+start_heartbeat() {
+  local label="$1"
+  (
+    while true; do
+      sleep "$HEARTBEAT_SECONDS"
+      printf '[env-switch-autocompile] heartbeat: %s still running at %s\n' \
+        "$label" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    done
+  ) &
+  HEARTBEAT_PID=$!
+}
+
+stop_heartbeat() {
+  local pid="$HEARTBEAT_PID"
+  HEARTBEAT_PID=""
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
 run_logged() {
   local name="$1"
   shift
   local logfile="$LOG_DIR/$name.log"
   echo "==> $name: $*" | tee "$logfile"
+  start_heartbeat "$name"
   set +e
   "$@" 2>&1 | tee -a "$logfile"
   local status=${PIPESTATUS[0]}
   set -e
+  stop_heartbeat
   echo "==> $name exit: $status" | tee -a "$logfile"
   return "$status"
 }
@@ -43,10 +68,12 @@ run_logged_shell() {
   shift
   local logfile="$LOG_DIR/$name.log"
   echo "==> $name: $*" | tee "$logfile"
+  start_heartbeat "$name"
   set +e
   bash -lc "$*" 2>&1 | tee -a "$logfile"
   local status=${PIPESTATUS[0]}
   set -e
+  stop_heartbeat
   echo "==> $name exit: $status" | tee -a "$logfile"
   return "$status"
 }
@@ -131,14 +158,24 @@ run_codex_prompt() {
   local output_file="$2"
 
   if [ -n "${CODEX_AUTOCOMPILE_CMD:-}" ]; then
+    start_heartbeat "codex autocompile command"
+    set +e
     CODEX_AUTOCOMPILE_PROMPT="$prompt_file" bash -lc "$CODEX_AUTOCOMPILE_CMD" \
       2>&1 | tee "$output_file"
-    return "${PIPESTATUS[0]}"
+    local status=${PIPESTATUS[0]}
+    set -e
+    stop_heartbeat
+    return "$status"
   fi
 
+  start_heartbeat "codex attempt $(basename "$prompt_file")"
+  set +e
   codex --sandbox danger-full-access --ask-for-approval never exec - < "$prompt_file" \
     2>&1 | tee "$output_file"
-  return "${PIPESTATUS[0]}"
+  local status=${PIPESTATUS[0]}
+  set -e
+  stop_heartbeat
+  return "$status"
 }
 
 validate_worktree() {

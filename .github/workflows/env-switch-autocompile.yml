@@ -159,11 +159,19 @@ jobs:
 
       - name: Port and validate
         run: |
-          .github/scripts/env-switch-autocompile.sh \
-            "${{ needs.detect.outputs.target_tag }}" \
-            "${{ needs.detect.outputs.previous_branch }}" \
-            "${{ needs.detect.outputs.new_branch }}" \
-            "${{ needs.detect.outputs.previous_tag }}"
+          run_port_and_validate() {
+            .github/scripts/env-switch-autocompile.sh \
+              "${{ needs.detect.outputs.target_tag }}" \
+              "${{ needs.detect.outputs.previous_branch }}" \
+              "${{ needs.detect.outputs.new_branch }}" \
+              "${{ needs.detect.outputs.previous_tag }}"
+          }
+
+          if command -v caffeinate >/dev/null 2>&1; then
+            caffeinate -dimsu bash -c "$(declare -f run_port_and_validate); run_port_and_validate"
+          else
+            run_port_and_validate
+          fi
 
       - name: Create or update PR
         if: success()
