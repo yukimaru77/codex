@@ -230,24 +230,15 @@ Required manual E2E as part of this same goal when RUN_ENV_SWITCH_E2E is true:
 - After the implementation builds, build the interactive Codex binary from this
   worktree with:
   cargo build --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex
-- In cmux, open a new tab/surface in this same workspace. Do not create a new
-  workspace for the E2E tab.
-  Use cmux's tab/surface commands such as \`cmux new-surface --type terminal\`
-  in the current workspace; do not use \`cmux new-workspace\` for this E2E.
-- In that new tab/surface, run the built binary:
-  $REPO_ROOT/codex-rs/target/debug/codex --sandbox danger-full-access --ask-for-approval never --enable env_switch --no-alt-screen
-- If Codex startup asks for a harmless confirmation or first-run prompt, answer
-  it appropriately and continue.
-- Before sending the E2E prompt, read the E2E surface and wait until Codex is
-  actually ready: it must show the OpenAI Codex UI, an input prompt, and it must
-  not show \`model: loading\` in the current screen. Do not treat the footer's
-  model label by itself as readiness if the status card still says loading.
-- If the prompt appears under "Queued follow-up inputs" for more than one
-  minute, that E2E surface is not executing the goal. Close or abandon that tab,
-  open a new tab in the same workspace, wait for the same readiness condition,
-  and resend the exact E2E prompt. This is still the required manual E2E; do not
-  replace it with \`codex exec\`.
-- Send this E2E prompt to that built Codex:
+- Run the cmux E2E helper from this same Codex session:
+  ENV_SWITCH_E2E_ARTIFACT_DIR=$ARTIFACT_DIR/e2e-attempt-\$(date +%s) \\
+    .github/scripts/env-switch-cmux-e2e.sh
+- The helper opens a new tab/surface in this same workspace, waits for the built
+  Codex TUI to become ready, sends the E2E /goal prompt, retries a stuck queued
+  surface by opening another tab in the same workspace, and records transcripts.
+  Do not use \`cmux new-workspace\` for this E2E. Do not replace this with
+  \`codex exec\`.
+- The helper sends this E2E prompt to the built Codex:
 
   /goal Validate env_switch end to end with subagents only. This E2E exists to prove that the goal command works, that subagents keep working after only the subagents switch environments, that SSH and Docker nesting work, and that the run is not merely passing by using raw shell ssh/docker wrappers. The main agent should coordinate and summarize but must not run remote SSH, Docker, or benchmark commands directly. Use exactly two subagents: Agent A targets ssh saitou, Agent B targets ssh saitou-h200. Each subagent must start by switching to its SSH target with env_switch; create or reuse a uniquely named GPU-capable Docker container on that SSH host; switch into the nested target with env_switch so subsequent commands run in an environment id shaped like ssh:<host>>docker:<container>; run a PyTorch CPU vs GPU matrix multiplication benchmark inside the nested Docker target; use the same matrix size, warmups, and repetitions for CPU and GPU on both hosts; and report transcript evidence including environment_id, container name/id, GPU model, PyTorch version, CUDA availability, benchmark parameters, CPU timing, and GPU timing. The pass condition is that /goal behavior, subagent delegation, SSH env_switch, nested Docker env_switch, remote provisioning, and environment-aware exec all work together through real work. If env_switch cannot register a target, report the exact fallback reason and fail instead of silently continuing with repeated raw ssh/docker wrappers. If raw ssh/docker shell wrappers are used to bypass env_switch, this E2E fails. When validation passes, finish with a line containing exactly ENV_SWITCH_E2E_PASS. If validation cannot pass, finish with a line containing exactly ENV_SWITCH_E2E_FAIL.
 
