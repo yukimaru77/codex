@@ -24,6 +24,12 @@ CMUX_CREATE_ATTEMPTS="${ENV_SWITCH_CMUX_CREATE_ATTEMPTS:-3}"
 CMUX_KEEP_WORKSPACE="${ENV_SWITCH_KEEP_CMUX_WORKSPACE:-false}"
 CMUX_WINDOW_REF="${ENV_SWITCH_CMUX_WINDOW:-}"
 CMUX_WINDOW_ARGS=()
+CMUX_BIN="${ENV_SWITCH_CMUX_BIN:-}"
+CMUX_USER_ID="${ENV_SWITCH_CMUX_USER_ID:-$(id -u)}"
+CMUX_USE_ASUSER="${ENV_SWITCH_CMUX_USE_ASUSER:-}"
+if [ -z "$CMUX_USE_ASUSER" ] && [ "$(uname -s)" = "Darwin" ]; then
+  CMUX_USE_ASUSER=true
+fi
 
 mkdir -p "$LOG_DIR"
 
@@ -93,6 +99,22 @@ latest_failure_context() {
   } > "$ARTIFACT_DIR/latest-failure-context.md"
 }
 
+cmux_cli() {
+  local cmux_bin="${CMUX_BIN:-cmux}"
+  if [ "$CMUX_USE_ASUSER" = "true" ]; then
+    launchctl asuser "$CMUX_USER_ID" /usr/bin/env \
+      CMUX_SOCKET_PATH="${CMUX_SOCKET_PATH:-}" \
+      CMUX_SOCKET_PASSWORD="${CMUX_SOCKET_PASSWORD:-}" \
+      CMUX_QUIET="${CMUX_QUIET:-}" \
+      "$cmux_bin" "$@"
+  else
+    CMUX_SOCKET_PATH="${CMUX_SOCKET_PATH:-}" \
+      CMUX_SOCKET_PASSWORD="${CMUX_SOCKET_PASSWORD:-}" \
+      CMUX_QUIET="${CMUX_QUIET:-}" \
+      "$cmux_bin" "$@"
+  fi
+}
+
 configure_cmux_context() {
   if [ -z "${CMUX_SOCKET_PATH:-}" ]; then
     local support_dir="$HOME/Library/Application Support/cmux"
@@ -113,7 +135,7 @@ configure_cmux_context() {
   fi
 
   if [ -z "$CMUX_WINDOW_REF" ]; then
-    CMUX_WINDOW_REF="$(CMUX_QUIET=1 cmux current-window 2>/dev/null || true)"
+    CMUX_WINDOW_REF="$(CMUX_QUIET=1 cmux_cli current-window 2>/dev/null || true)"
   fi
   if [ -n "$CMUX_WINDOW_REF" ]; then
     CMUX_WINDOW_ARGS=(--window "$CMUX_WINDOW_REF")
@@ -125,15 +147,17 @@ log_cmux_diagnostics() {
   local support_dir="$HOME/Library/Application Support/cmux"
   {
     echo "==> cmux diagnostics"
-    echo "cmux_bin=$(command -v cmux || true)"
-    cmux version || true
+    echo "cmux_bin=${CMUX_BIN:-$(command -v cmux || true)}"
+    echo "CMUX_USE_ASUSER=$CMUX_USE_ASUSER"
+    echo "CMUX_USER_ID=$CMUX_USER_ID"
+    cmux_cli version || true
     echo "CMUX_SOCKET_PATH=${CMUX_SOCKET_PATH:-}"
     echo "CMUX_WINDOW_REF=${CMUX_WINDOW_REF:-}"
     if [ -d "$support_dir" ]; then
       ls -la "$support_dir" | sed -n '1,80p'
     fi
-    CMUX_QUIET=1 cmux ping || true
-    CMUX_QUIET=1 cmux list-windows || true
+    CMUX_QUIET=1 cmux_cli ping || true
+    CMUX_QUIET=1 cmux_cli list-windows || true
   } 2>&1 | tee -a "$output_file"
 }
 
@@ -246,7 +270,7 @@ resolve_cmux_surface() {
   local workspace="$1"
   local surface=""
   for _ in $(seq 1 60); do
-    surface="$(CMUX_QUIET=1 cmux list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" 2>/dev/null | rg -o 'surface:[0-9]+' | head -1 || true)"
+    surface="$(CMUX_QUIET=1 cmux_cli list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" 2>/dev/null | rg -o 'surface:[0-9]+' | head -1 || true)"
     [ -n "$surface" ] && break
     sleep 1
   done
@@ -258,9 +282,9 @@ prime_codex_surface() {
   local surface="$2"
   local screen=""
   for _ in $(seq 1 8); do
-    screen="$(CMUX_QUIET=1 cmux read-screen --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" --scrollback --lines 80 2>/dev/null || true)"
+    screen="$(CMUX_QUIET=1 cmux_cli read-screen --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" --scrollback --lines 80 2>/dev/null || true)"
     if printf '%s\n' "$screen" | rg -qi 'press enter|continue|confirm|trust|first run|welcome'; then
-      CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "\n" >/dev/null 2>&1 || true
+      CMUX_QUIET=1 cmux_cli send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "\n" >/dev/null 2>&1 || true
     fi
     if printf '%s\n' "$screen" | rg -q 'Codex|codex|Type|ask|model|›|>'; then
       return 0
@@ -274,10 +298,10 @@ collect_cmux_transcripts() {
   local workspace="$1"
   local prefix="$2"
   local surfaces_file="$ARTIFACT_DIR/$prefix-surfaces.txt"
-  CMUX_QUIET=1 cmux list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" > "$surfaces_file" 2>/dev/null || true
+  CMUX_QUIET=1 cmux_cli list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" > "$surfaces_file" 2>/dev/null || true
   while IFS= read -r surface; do
     [ -n "$surface" ] || continue
-    CMUX_QUIET=1 cmux read-screen --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" --scrollback --lines 5000 \
+    CMUX_QUIET=1 cmux_cli read-screen --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" --scrollback --lines 5000 \
       > "$ARTIFACT_DIR/$prefix-$surface.txt" 2>/dev/null || true
   done < <(rg -o 'surface:[0-9]+' "$surfaces_file" || true)
 }
@@ -289,10 +313,10 @@ send_file_to_cmux() {
   local chunk_size="${ENV_SWITCH_CMUX_SEND_CHUNK_SIZE:-2000}"
   local chunk=""
   while IFS= read -r -n "$chunk_size" chunk || [ -n "$chunk" ]; do
-    CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "$chunk" >/dev/null
+    CMUX_QUIET=1 cmux_cli send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "$chunk" >/dev/null
     chunk=""
   done < "$file"
-  CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "\n" >/dev/null
+  CMUX_QUIET=1 cmux_cli send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "\n" >/dev/null
 }
 
 run_codex_prompt() {
@@ -310,7 +334,10 @@ run_codex_prompt() {
     return "$status"
   fi
 
-  if ! command -v cmux >/dev/null 2>&1; then
+  if [ -z "$CMUX_BIN" ]; then
+    CMUX_BIN="$(command -v cmux || true)"
+  fi
+  if [ -z "$CMUX_BIN" ]; then
     echo "cmux is required for /goal autocompile but was not found on PATH" | tee "$output_file"
     return 127
   fi
@@ -342,7 +369,7 @@ run_codex_prompt() {
     echo "==> creating cmux workspace (attempt $create_attempt/$CMUX_CREATE_ATTEMPTS): $workspace_name" | tee -a "$output_file"
     local create_output
     set +e
-    create_output="$(CMUX_QUIET=1 cmux workspace create \
+    create_output="$(CMUX_QUIET=1 cmux_cli workspace create \
       "${CMUX_WINDOW_ARGS[@]}" \
       --name "$workspace_name" \
       --description "env_switch port coordinator for ${GITHUB_RUN_ID:-local}" \
@@ -380,11 +407,11 @@ run_codex_prompt() {
 
   sleep 2
   echo "==> launching codex in $workspace $surface" | tee -a "$output_file"
-  if ! CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "$codex_command" >/dev/null ||
-    ! CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "\n" >/dev/null; then
+  if ! CMUX_QUIET=1 cmux_cli send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "$codex_command" >/dev/null ||
+    ! CMUX_QUIET=1 cmux_cli send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "\n" >/dev/null; then
     echo "failed to launch codex in $workspace $surface" | tee -a "$output_file"
     if [ "$CMUX_KEEP_WORKSPACE" != "true" ]; then
-      CMUX_QUIET=1 cmux close-workspace --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" >/dev/null 2>&1 || true
+      CMUX_QUIET=1 cmux_cli close-workspace --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" >/dev/null 2>&1 || true
     fi
     stop_heartbeat
     return 1
@@ -432,7 +459,7 @@ run_codex_prompt() {
   esac
 
   if [ "$CMUX_KEEP_WORKSPACE" != "true" ]; then
-    CMUX_QUIET=1 cmux close-workspace --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" >/dev/null 2>&1 || true
+    CMUX_QUIET=1 cmux_cli close-workspace --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" >/dev/null 2>&1 || true
   fi
 
   set -e
