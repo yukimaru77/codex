@@ -20,7 +20,6 @@ HEARTBEAT_SECONDS="${ENV_SWITCH_HEARTBEAT_SECONDS:-60}"
 HEARTBEAT_PID=""
 CMUX_POLL_SECS="${ENV_SWITCH_CMUX_POLL_SECS:-30}"
 CMUX_TIMEOUT_SECS="${ENV_SWITCH_CMUX_TIMEOUT_SECS:-21600}"
-CMUX_MODEL_LOADING_TIMEOUT_SECS="${ENV_SWITCH_CMUX_MODEL_LOADING_TIMEOUT_SECS:-180}"
 CMUX_CREATE_ATTEMPTS="${ENV_SWITCH_CMUX_CREATE_ATTEMPTS:-3}"
 CMUX_CODEX_READY_ATTEMPTS="${ENV_SWITCH_CMUX_CODEX_READY_ATTEMPTS:-120}"
 CMUX_KEEP_WORKSPACE="${ENV_SWITCH_KEEP_CMUX_WORKSPACE:-false}"
@@ -239,6 +238,15 @@ Required manual E2E as part of this same goal when RUN_ENV_SWITCH_E2E is true:
   $REPO_ROOT/codex-rs/target/debug/codex --sandbox danger-full-access --ask-for-approval never --enable env_switch --no-alt-screen
 - If Codex startup asks for a harmless confirmation or first-run prompt, answer
   it appropriately and continue.
+- Before sending the E2E prompt, read the E2E surface and wait until Codex is
+  actually ready: it must show the OpenAI Codex UI, an input prompt, and it must
+  not show \`model: loading\` in the current screen. Do not treat the footer's
+  model label by itself as readiness if the status card still says loading.
+- If the prompt appears under "Queued follow-up inputs" for more than one
+  minute, that E2E surface is not executing the goal. Close or abandon that tab,
+  open a new tab in the same workspace, wait for the same readiness condition,
+  and resend the exact E2E prompt. This is still the required manual E2E; do not
+  replace it with \`codex exec\`.
 - Send this E2E prompt to that built Codex:
 
   /goal Validate env_switch end to end with subagents only. This E2E exists to prove that the goal command works, that subagents keep working after only the subagents switch environments, that SSH and Docker nesting work, and that the run is not merely passing by using raw shell ssh/docker wrappers. The main agent should coordinate and summarize but must not run remote SSH, Docker, or benchmark commands directly. Use exactly two subagents: Agent A targets ssh saitou, Agent B targets ssh saitou-h200. Each subagent must start by switching to its SSH target with env_switch; create or reuse a uniquely named GPU-capable Docker container on that SSH host; switch into the nested target with env_switch so subsequent commands run in an environment id shaped like ssh:<host>>docker:<container>; run a PyTorch CPU vs GPU matrix multiplication benchmark inside the nested Docker target; use the same matrix size, warmups, and repetitions for CPU and GPU on both hosts; and report transcript evidence including environment_id, container name/id, GPU model, PyTorch version, CUDA availability, benchmark parameters, CPU timing, and GPU timing. The pass condition is that /goal behavior, subagent delegation, SSH env_switch, nested Docker env_switch, remote provisioning, and environment-aware exec all work together through real work. If env_switch cannot register a target, report the exact fallback reason and fail instead of silently continuing with repeated raw ssh/docker wrappers. If raw ssh/docker shell wrappers are used to bypass env_switch, this E2E fails. When validation passes, finish with a line containing exactly ENV_SWITCH_E2E_PASS. If validation cannot pass, finish with a line containing exactly ENV_SWITCH_E2E_FAIL.
@@ -502,7 +510,6 @@ run_codex_prompt() {
   send_file_to_cmux "$workspace" "$surface" "$send_prompt_file"
 
   local deadline=$((SECONDS + CMUX_TIMEOUT_SECS))
-  local model_loading_since=""
   local result=""
   while [ "$SECONDS" -lt "$deadline" ]; do
     if ! cmux_workspace_exists "$workspace"; then
@@ -515,17 +522,6 @@ run_codex_prompt() {
       echo "cmux /goal autocompile hit Codex usage limits" | tee -a "$output_file"
       result="usage_limited"
       break
-    fi
-    if cmux_transcripts_match "$transcript_prefix" 'model:[[:space:]]+loading'; then
-      if [ -z "$model_loading_since" ]; then
-        model_loading_since="$SECONDS"
-      elif [ $((SECONDS - model_loading_since)) -ge "$CMUX_MODEL_LOADING_TIMEOUT_SECS" ]; then
-        echo "cmux /goal autocompile stayed at model loading for ${CMUX_MODEL_LOADING_TIMEOUT_SECS}s" | tee -a "$output_file"
-        result="model_loading_timeout"
-        break
-      fi
-    else
-      model_loading_since=""
     fi
     if rg -q '^ENV_SWITCH_PORT_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-*.txt 2>/dev/null; then
       if [ "${RUN_ENV_SWITCH_E2E:-true}" != "true" ] || rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-*.txt 2>/dev/null; then
@@ -554,10 +550,6 @@ run_codex_prompt() {
     usage_limited)
       echo "cmux /goal autocompile stopped because Codex usage limits were reached" | tee -a "$output_file"
       status=75
-      ;;
-    model_loading_timeout)
-      echo "cmux /goal autocompile stopped because model loading did not complete" | tee -a "$output_file"
-      status=124
       ;;
     workspace_missing)
       echo "cmux /goal autocompile stopped because the cmux workspace disappeared" | tee -a "$output_file"
