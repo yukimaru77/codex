@@ -126,12 +126,6 @@ run_codex_prompt() {
     return "${PIPESTATUS[0]}"
   fi
 
-  if command -v gocdex >/dev/null 2>&1; then
-    gocdex exec --sandbox danger-full-access --ask-for-approval never - < "$prompt_file" \
-      2>&1 | tee "$output_file"
-    return "${PIPESTATUS[0]}"
-  fi
-
   codex exec --sandbox danger-full-access --ask-for-approval never - < "$prompt_file" \
     2>&1 | tee "$output_file"
   return "${PIPESTATUS[0]}"
