@@ -95,11 +95,21 @@ Feature intent:
 
 Required local verification:
 - Run just fmt from codex-rs after code changes.
-- Run targeted tests for changed crates, at minimum:
-  - just test -p codex-core
-  - just test -p codex-tui
+- Run the workflow's targeted unit/integration/TUI matrix. It intentionally
+  avoids the full codex-core suite because the self-hosted runner E2E gate is
+  the primary acceptance test and the complete core suite has unrelated local
+  helper-binary and timeout noise in this environment.
 - Do not run cargo test directly.
 - Follow AGENTS.md instructions in this repository.
+
+Compatibility notes from the rust-v0.141 port path:
+- ToolExecutor implementations use boxed futures rather than async_trait.
+- TurnEnvironment fields are private on newer upstreams; use constructors and
+  accessors rather than struct literals where required.
+- PathUri cwd values should be constructed through the upstream helpers.
+- Clone the EnvironmentManager Arc before moving it into per-thread state.
+- Remote shell handling may need to convert Option<Shell> to the expected path
+  or command representation before invoking upstream helpers.
 
 If the repository is in the middle of a rebase or has conflicts, resolve them and continue the port.
 Keep changes focused on env_switch and compatibility with the new upstream tag.
@@ -134,8 +144,21 @@ run_codex_prompt() {
 validate_worktree() {
   local attempt="$1"
   run_logged_shell "attempt-$attempt-just-fmt" "cd codex-rs && just fmt" || return 1
-  run_logged_shell "attempt-$attempt-test-core" "cd codex-rs && just test -p codex-core" || return 1
-  run_logged_shell "attempt-$attempt-test-tui" "cd codex-rs && just test -p codex-tui" || return 1
+  run_logged_shell "attempt-$attempt-test-apply-patch" "cd codex-rs && just test -p codex-apply-patch" || return 1
+  run_logged_shell "attempt-$attempt-test-app-server-protocol" "cd codex-rs && just test -p codex-app-server-protocol" || return 1
+  run_logged_shell "attempt-$attempt-test-exec-server-environment" "cd codex-rs && just test -p codex-exec-server environment" || return 1
+  run_logged_shell "attempt-$attempt-test-exec-server-provision" "cd codex-rs && just test -p codex-exec-server provision" || return 1
+  run_logged_shell "attempt-$attempt-test-core-env-switch" "cd codex-rs && just test -p codex-core env_switch" || return 1
+  run_logged_shell "attempt-$attempt-test-core-env-status" "cd codex-rs && just test -p codex-core env_status" || return 1
+  run_logged_shell "attempt-$attempt-test-core-environment-selection" "cd codex-rs && just test -p codex-core environment_selection" || return 1
+  run_logged_shell "attempt-$attempt-test-core-remote-advisory" "cd codex-rs && just test -p codex-core remote_command_advisory" || return 1
+  run_logged_shell "attempt-$attempt-test-core-unified-exec-env-switch" "cd codex-rs && just test -p codex-core unified_exec_advises_env_switch" || return 1
+  run_logged_shell "attempt-$attempt-test-tui-env-switch" "cd codex-rs && just test -p codex-tui env_switch" || return 1
+
+  if [ "${ENV_SWITCH_FULL_CRATE_TESTS:-false}" = "true" ]; then
+    run_logged_shell "attempt-$attempt-test-core-full" "cd codex-rs && just test -p codex-core" || return 1
+    run_logged_shell "attempt-$attempt-test-tui-full" "cd codex-rs && just test -p codex-tui" || return 1
+  fi
 
   if [ "${RUN_ENV_SWITCH_E2E:-true}" = "true" ]; then
     run_logged "attempt-$attempt-e2e" "$E2E_SCRIPT" || return 1
@@ -231,8 +254,9 @@ New branch: \`$NEW_BRANCH\`
 Validation performed by \`env-switch-autocompile\`:
 
 - \`cd codex-rs && just fmt\`
-- \`cd codex-rs && just test -p codex-core\`
-- \`cd codex-rs && just test -p codex-tui\`
+- targeted \`just test\` matrix for env_switch-affected crates:
+  \`codex-apply-patch\`, \`codex-app-server-protocol\`,
+  \`codex-exec-server\`, \`codex-core\`, and \`codex-tui\`
 - remote E2E: \`${RUN_ENV_SWITCH_E2E:-true}\`
 
 Artifacts include:
