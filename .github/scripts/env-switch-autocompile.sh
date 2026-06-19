@@ -126,7 +126,7 @@ run_codex_prompt() {
     return "${PIPESTATUS[0]}"
   fi
 
-  codex exec --sandbox danger-full-access --ask-for-approval never - < "$prompt_file" \
+  codex --sandbox danger-full-access --ask-for-approval never exec - < "$prompt_file" \
     2>&1 | tee "$output_file"
   return "${PIPESTATUS[0]}"
 }
