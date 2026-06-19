@@ -329,7 +329,7 @@ prime_codex_surface() {
     fi
     if printf '%s\n' "$screen" | rg -q 'OpenAI Codex' &&
       printf '%s\n' "$screen" | rg -q '^[[:space:]]*›' &&
-      ! printf '%s\n' "$screen" | rg -q 'Starting MCP servers'; then
+      ! printf '%s\n' "$screen" | rg -q 'Starting MCP servers|model:[[:space:]]+loading'; then
       return 0
     fi
     sleep 2
