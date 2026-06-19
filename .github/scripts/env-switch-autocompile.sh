@@ -142,8 +142,12 @@ validate_worktree() {
   fi
 }
 
-git fetch --tags --prune origin
-git fetch --tags --prune upstream
+git fetch --no-tags --prune origin \
+  "+refs/heads/main:refs/remotes/origin/main" \
+  "+refs/heads/$PREVIOUS_BRANCH:refs/remotes/origin/$PREVIOUS_BRANCH"
+git fetch --no-tags upstream \
+  "+refs/tags/$TARGET_TAG:refs/tags/$TARGET_TAG" \
+  "+refs/tags/$PREVIOUS_TAG:refs/tags/$PREVIOUS_TAG"
 
 PREVIOUS_REF="origin/$PREVIOUS_BRANCH"
 if ! git rev-parse --verify --quiet "$PREVIOUS_REF" >/dev/null; then
