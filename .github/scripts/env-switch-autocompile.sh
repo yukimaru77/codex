@@ -21,6 +21,7 @@ HEARTBEAT_PID=""
 CMUX_POLL_SECS="${ENV_SWITCH_CMUX_POLL_SECS:-30}"
 CMUX_TIMEOUT_SECS="${ENV_SWITCH_CMUX_TIMEOUT_SECS:-21600}"
 CMUX_CREATE_ATTEMPTS="${ENV_SWITCH_CMUX_CREATE_ATTEMPTS:-3}"
+CMUX_CODEX_READY_ATTEMPTS="${ENV_SWITCH_CMUX_CODEX_READY_ATTEMPTS:-120}"
 CMUX_KEEP_WORKSPACE="${ENV_SWITCH_KEEP_CMUX_WORKSPACE:-false}"
 CMUX_WINDOW_REF="${ENV_SWITCH_CMUX_WINDOW:-}"
 CMUX_WINDOW_ARGS=()
@@ -31,6 +32,7 @@ if [ -z "$CMUX_USE_ASUSER" ] && [ "$(uname -s)" = "Darwin" ]; then
   CMUX_USE_ASUSER=true
 fi
 
+rm -rf "$ARTIFACT_DIR"
 mkdir -p "$LOG_DIR"
 
 cd "$REPO_ROOT"
@@ -281,17 +283,19 @@ prime_codex_surface() {
   local workspace="$1"
   local surface="$2"
   local screen=""
-  for _ in $(seq 1 8); do
+  for _ in $(seq 1 "$CMUX_CODEX_READY_ATTEMPTS"); do
     screen="$(CMUX_QUIET=1 cmux_cli read-screen --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" --scrollback --lines 80 2>/dev/null || true)"
     if printf '%s\n' "$screen" | rg -qi 'press enter|continue|confirm|trust|first run|welcome'; then
       CMUX_QUIET=1 cmux_cli send --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" "\n" >/dev/null 2>&1 || true
     fi
-    if printf '%s\n' "$screen" | rg -q 'Codex|codex|Type|ask|model|›|>'; then
+    if printf '%s\n' "$screen" | rg -q 'OpenAI Codex' &&
+      printf '%s\n' "$screen" | rg -q '^[[:space:]]*›' &&
+      ! printf '%s\n' "$screen" | rg -q 'Starting MCP servers'; then
       return 0
     fi
     sleep 2
   done
-  return 0
+  return 1
 }
 
 collect_cmux_transcripts() {
@@ -301,8 +305,9 @@ collect_cmux_transcripts() {
   CMUX_QUIET=1 cmux_cli list-pane-surfaces --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" > "$surfaces_file" 2>/dev/null || true
   while IFS= read -r surface; do
     [ -n "$surface" ] || continue
+    local surface_file="${surface//:/-}"
     CMUX_QUIET=1 cmux_cli read-screen --workspace "$workspace" --surface "$surface" "${CMUX_WINDOW_ARGS[@]}" --scrollback --lines 5000 \
-      > "$ARTIFACT_DIR/$prefix-$surface.txt" 2>/dev/null || true
+      > "$ARTIFACT_DIR/$prefix-$surface_file.txt" 2>/dev/null || true
   done < <(rg -o 'surface:[0-9]+' "$surfaces_file" || true)
 }
 
@@ -417,7 +422,15 @@ run_codex_prompt() {
     return 1
   fi
 
-  prime_codex_surface "$workspace" "$surface"
+  if ! prime_codex_surface "$workspace" "$surface"; then
+    echo "codex did not become ready in $workspace $surface" | tee -a "$output_file"
+    collect_cmux_transcripts "$workspace" "$transcript_prefix"
+    if [ "$CMUX_KEEP_WORKSPACE" != "true" ]; then
+      CMUX_QUIET=1 cmux_cli close-workspace --workspace "$workspace" "${CMUX_WINDOW_ARGS[@]}" >/dev/null 2>&1 || true
+    fi
+    stop_heartbeat
+    return 1
+  fi
 
   local send_prompt_file="$ARTIFACT_DIR/$attempt_name-goal-one-line.txt"
   tr '\n' ' ' < "$prompt_file" | sed -E 's/[[:space:]]+/ /g' > "$send_prompt_file"
@@ -428,13 +441,13 @@ run_codex_prompt() {
   local result=""
   while [ "$SECONDS" -lt "$deadline" ]; do
     collect_cmux_transcripts "$workspace" "$transcript_prefix"
-    if rg -q '^ENV_SWITCH_PORT_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface:*.txt 2>/dev/null; then
-      if [ "${RUN_ENV_SWITCH_E2E:-true}" != "true" ] || rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface:*.txt 2>/dev/null; then
+    if rg -q '^ENV_SWITCH_PORT_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface-*.txt 2>/dev/null; then
+      if [ "${RUN_ENV_SWITCH_E2E:-true}" != "true" ] || rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface-*.txt 2>/dev/null; then
         result="pass"
         break
       fi
     fi
-    if rg -q '^ENV_SWITCH_PORT_FAIL$|^ENV_SWITCH_E2E_FAIL$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface:*.txt 2>/dev/null; then
+    if rg -q '^ENV_SWITCH_PORT_FAIL$|^ENV_SWITCH_E2E_FAIL$' "$ARTIFACT_DIR"/"$transcript_prefix"-surface-*.txt 2>/dev/null; then
       result="fail"
       break
     fi
@@ -487,7 +500,7 @@ validate_worktree() {
   fi
 
   if [ "${RUN_ENV_SWITCH_E2E:-true}" = "true" ]; then
-    if ! rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"attempt-$attempt-cmux"-surface:*.txt 2>/dev/null; then
+    if ! rg -q '^ENV_SWITCH_E2E_PASS$' "$ARTIFACT_DIR"/"attempt-$attempt-cmux"-surface-*.txt 2>/dev/null; then
       echo "missing ENV_SWITCH_E2E_PASS in cmux transcripts" | tee "$LOG_DIR/attempt-$attempt-e2e-marker.log"
       return 1
     fi
