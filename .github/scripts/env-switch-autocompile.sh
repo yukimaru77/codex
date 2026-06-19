@@ -20,6 +20,7 @@ HEARTBEAT_SECONDS="${ENV_SWITCH_HEARTBEAT_SECONDS:-60}"
 HEARTBEAT_PID=""
 CMUX_POLL_SECS="${ENV_SWITCH_CMUX_POLL_SECS:-30}"
 CMUX_TIMEOUT_SECS="${ENV_SWITCH_CMUX_TIMEOUT_SECS:-21600}"
+CMUX_CREATE_ATTEMPTS="${ENV_SWITCH_CMUX_CREATE_ATTEMPTS:-3}"
 CMUX_KEEP_WORKSPACE="${ENV_SWITCH_KEEP_CMUX_WORKSPACE:-false}"
 
 mkdir -p "$LOG_DIR"
@@ -284,26 +285,35 @@ run_codex_prompt() {
   local transcript_prefix="$attempt_name-cmux"
   local codex_command="$codex_bin --sandbox danger-full-access --ask-for-approval never --no-alt-screen"
 
+  : > "$output_file"
   start_heartbeat "cmux /goal $attempt_name"
-  set +e
-  {
-    echo "==> creating cmux workspace: $workspace_name"
-    CMUX_QUIET=1 cmux new-workspace \
+
+  local workspace=""
+  local create_status=1
+  for create_attempt in $(seq 1 "$CMUX_CREATE_ATTEMPTS"); do
+    echo "==> creating cmux workspace (attempt $create_attempt/$CMUX_CREATE_ATTEMPTS): $workspace_name" | tee -a "$output_file"
+    local create_output
+    set +e
+    create_output="$(CMUX_QUIET=1 cmux workspace create \
       --name "$workspace_name" \
       --description "env_switch port coordinator for ${GITHUB_RUN_ID:-local}" \
       --cwd "$REPO_ROOT" \
-      --command "$codex_command" \
-      --focus false
-  } 2>&1 | tee "$output_file"
-  local create_status=${PIPESTATUS[0]}
-  set -e
+      --focus false 2>&1)"
+    create_status=$?
+    set -e
+    printf '%s\n' "$create_output" | tee -a "$output_file"
+    workspace="$(printf '%s\n' "$create_output" | rg -o 'workspace:[0-9]+' | tail -1 || true)"
+    if [ "$create_status" -eq 0 ] && [ -n "$workspace" ]; then
+      break
+    fi
+    if [ "$create_attempt" -lt "$CMUX_CREATE_ATTEMPTS" ]; then
+      sleep 5
+    fi
+  done
   if [ "$create_status" -ne 0 ]; then
     stop_heartbeat
     return "$create_status"
   fi
-
-  local workspace
-  workspace="$(rg -o 'workspace:[0-9]+' "$output_file" | tail -1 || true)"
   if [ -z "$workspace" ]; then
     echo "failed to determine cmux workspace ref" | tee -a "$output_file"
     stop_heartbeat
@@ -315,6 +325,18 @@ run_codex_prompt() {
   surface="$(resolve_cmux_surface "$workspace")"
   if [ -z "$surface" ]; then
     echo "failed to determine cmux surface for $workspace" | tee -a "$output_file"
+    stop_heartbeat
+    return 1
+  fi
+
+  sleep 2
+  echo "==> launching codex in $workspace $surface" | tee -a "$output_file"
+  if ! CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "$codex_command" >/dev/null ||
+    ! CMUX_QUIET=1 cmux send --workspace "$workspace" --surface "$surface" "\n" >/dev/null; then
+    echo "failed to launch codex in $workspace $surface" | tee -a "$output_file"
+    if [ "$CMUX_KEEP_WORKSPACE" != "true" ]; then
+      CMUX_QUIET=1 cmux close-workspace --workspace "$workspace" >/dev/null 2>&1 || true
+    fi
     stop_heartbeat
     return 1
   fi
